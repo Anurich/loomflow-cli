@@ -1,0 +1,28 @@
+[project]
+name = "loom-code"
+version = "0.1.0"
+description = "loom-code — a loomflow-native terminal coding agent"
+requires-python = ">=3.11"
+dependencies = [
+    "loomflow>=0.10.1",
+    "rich>=13",
+    "anthropic",
+    "openai",
+]
+
+[project.scripts]
+loom-code = "loom_code.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["loom_code*"]
+
+[tool.ruff]
+line-length = 79
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
