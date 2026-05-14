@@ -19,15 +19,19 @@ import sys
 import anyio
 
 from .agent import DEFAULT_MODEL, build_agent
-from .approval import ApprovalGate
+from .approval import ApprovalGate, auto_approve
 from .project import detect_project
 from .render import StreamRenderer, banner, console
 from .repl import run_repl
 
 
-async def _run_once(prompt: str, model: str) -> int:
+async def _run_once(prompt: str, model: str, yes: bool) -> int:
     """Detect project, build agent, stream one run. Returns an
     exit code.
+
+    ``yes`` swaps the interactive approval gate for the
+    auto-approve handler — for unattended runs (CI, scripted use)
+    where there's no TTY to answer prompts.
 
     Consumed via :func:`anyio.run` (NOT ``asyncio.run``) — the
     streaming generator from ``Agent.stream`` opens internal
@@ -42,9 +46,9 @@ async def _run_once(prompt: str, model: str) -> int:
             f"{project.context_file.name}[/dim]\n"
         )
 
-    gate = ApprovalGate()
+    handler = auto_approve if yes else ApprovalGate().handler
     agent, workspace = build_agent(
-        project, model=model, approval_handler=gate.handler
+        project, model=model, approval_handler=handler
     )
     renderer = StreamRenderer()
     try:
@@ -99,17 +103,28 @@ def main() -> None:
         default=DEFAULT_MODEL,
         help=f"Model to use (default: {DEFAULT_MODEL}).",
     )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help=(
+            "Auto-approve all destructive tool calls — no prompts. "
+            "For unattended / scripted runs on a disposable tree. "
+            "One-shot mode only."
+        ),
+    )
     args = parser.parse_args()
 
     if not args.prompt:
-        # No task → interactive REPL.
+        # No task → interactive REPL. --yes is meaningless here
+        # (the REPL is interactive by definition); ignore it.
         project = detect_project()
         exit_code = anyio.run(run_repl, project, args.model)
         sys.exit(exit_code)
 
     # One-shot mode.
     prompt = " ".join(args.prompt)
-    exit_code = anyio.run(_run_once, prompt, args.model)
+    exit_code = anyio.run(_run_once, prompt, args.model, args.yes)
     sys.exit(exit_code)
 
 

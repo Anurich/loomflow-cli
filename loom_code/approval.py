@@ -24,6 +24,19 @@ from rich.text import Text
 from .render import console
 
 
+async def auto_approve(call: Any, user_id: str | None = None) -> bool:
+    """A non-interactive approval handler that allows everything.
+
+    For unattended runs — CI, scripted use — where there's no
+    human at a TTY to answer the y/n/a prompt and the working tree
+    is disposable. Wired in via ``loom-code --yes``.
+
+    NEVER point this at a repo you care about: it lets the agent
+    write / edit / run shell commands with no gate at all.
+    """
+    return True
+
+
 class ApprovalGate:
     """Stateful approval handler — remembers an 'allow all this
     session' choice so the user isn't asked twice for the same
