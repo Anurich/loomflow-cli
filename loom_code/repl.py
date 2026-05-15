@@ -47,6 +47,7 @@ Slash commands (handled here, never sent to the agent):
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from loomflow import new_id
 from prompt_toolkit import HTML, PromptSession
@@ -90,6 +91,9 @@ _SLASH_HELP = """\
   [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
   [cyan]/loominit[/cyan]        index this codebase → LOOM.md so the
                    agent can skip re-reading source on every task
+  [cyan]/resume[/cyan]          resume the last session — rehydrates prior
+                   turns from loomflow memory so you pick up where
+                   you left off
   [cyan]/clear[/cyan]           fresh conversation (new session)
   [cyan]/compress_token_length[/cyan] [N|auto|off]
                    show / set / disable the auto-compact threshold
@@ -138,6 +142,7 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/loominit", "index this codebase → LOOM.md"),
+    ("/resume", "resume the last session (rehydrate prior turns)"),
     ("/clear", "fresh conversation (new session)"),
     (
         "/compress_token_length",
@@ -258,8 +263,18 @@ class Repl:
         )
         console.print(
             "  [dim]▸ [cyan]/loominit[/cyan]      index this "
-            "codebase so future turns skip re-reading source[/dim]\n"
+            "codebase so future turns skip re-reading source[/dim]"
         )
+        # Show the resume hint ONLY when a prior session pointer
+        # exists — no point telling first-time users about a
+        # feature they can't use yet.
+        if self._load_session_pointer() is not None:
+            console.print(
+                "  [dim]▸ [cyan]/resume[/cyan]        pick up "
+                "the last session for this project (rehydrates "
+                "prior turns)[/dim]"
+            )
+        console.print()
 
         while True:
             # Persistent session status — printed before every prompt
@@ -416,6 +431,12 @@ class Repl:
             agent_output = str(result.get("output") or "")
         self._compact_exchanges.append((prompt, agent_output))
 
+        # Persist the current session_id to disk so /resume on the
+        # next REPL launch knows what to rehydrate. Done after EVERY
+        # turn (not just on /exit) so a crash doesn't lose the
+        # session pointer. Cheap — one short write to a small file.
+        self._save_session_pointer()
+
         if self._pending_slugs:
             console.print(
                 "  [dim]if that worked, just continue — or "
@@ -532,6 +553,12 @@ class Repl:
             self._compact_tokens = 0
             self._compact_exchanges.clear()
             reset_paste_stash()
+            # Move the on-disk pointer to the NEW session so a
+            # later /resume doesn't rewind into the conversation
+            # the user just told us to forget. /clear means "I
+            # want a fresh start," and that should survive a
+            # quit + relaunch.
+            self._save_session_pointer()
             console.print(
                 "  [dim]fresh conversation — prior turns "
                 "forgotten[/dim]"
@@ -544,6 +571,8 @@ class Repl:
             await self._handle_set_web()
         elif cmd == "/loominit":
             await self._handle_loominit()
+        elif cmd == "/resume":
+            await self._handle_resume()
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -902,6 +931,96 @@ class Repl:
         console.print(
             f"  [dim]web search: {state} — "
             "fresh conversation[/dim]"
+        )
+
+    # ---- /resume --------------------------------------------------------
+
+    def _session_pointer_path(self) -> Path:
+        """Where we stash the last-used session_id for this project.
+
+        Lives under ``.loom/`` (same dir loom-code already uses for
+        per-project state — notebook, memory db, LOOM.md index).
+        One file per project, single line: the session_id ULID.
+        """
+        return self.project.root / ".loom" / "last_session.txt"
+
+    def _save_session_pointer(self) -> None:
+        """Write the current ``session_id`` to the project's
+        ``.loom/last_session.txt``. Best-effort — a write failure
+        is logged once but never blocks a turn (the file is a
+        convenience; the agent's actual memory keys off
+        ``session_id`` in loomflow's Memory which we don't touch
+        here)."""
+        try:
+            p = self._session_pointer_path()
+            p.parent.mkdir(exist_ok=True)
+            p.write_text(self.session_id + "\n", encoding="utf-8")
+        except OSError:
+            # Silent failure: a read-only filesystem or perms
+            # issue would otherwise spam the chat with the same
+            # warning every turn.
+            pass
+
+    def _load_session_pointer(self) -> str | None:
+        """Read the last saved session_id for this project, or
+        ``None`` if no prior session has been recorded yet (first
+        run on this project)."""
+        try:
+            p = self._session_pointer_path()
+            if not p.exists():
+                return None
+            value = p.read_text(encoding="utf-8").strip()
+            return value or None
+        except OSError:
+            return None
+
+    async def _handle_resume(self) -> None:
+        """``/resume`` — point the REPL at the LAST session_id used
+        on this project.
+
+        loomflow's Memory keys episodes by ``(user_id, session_id)``;
+        when the agent's next ``run()`` reuses the same session_id,
+        loomflow rehydrates the prior turns into the conversation
+        context for free. We don't need to do any rehydration here
+        — just swap the id and let loomflow do its thing.
+
+        Edge case: the saved session_id might be from a /clear
+        boundary (i.e. the user explicitly told us to forget) or
+        from a different model. We don't try to guard against
+        either — /resume is a deliberate gesture the user owns.
+        """
+        prior = self._load_session_pointer()
+        if prior is None:
+            console.print(
+                "  [yellow]no prior session recorded for this "
+                "project — nothing to resume.[/yellow]"
+            )
+            console.print(
+                "  [dim](sessions are saved per project after each "
+                "turn — your first task here starts a fresh one.)"
+                "[/dim]"
+            )
+            return
+        if prior == self.session_id:
+            console.print(
+                "  [dim]you're already on the latest session "
+                f"({prior[:8]}…) — nothing to resume.[/dim]"
+            )
+            return
+        # Swap. Reset the compaction state so we don't blend the
+        # newly-resumed session with whatever happened in this
+        # REPL launch before /resume was called.
+        old = self.session_id
+        self.session_id = prior
+        self._compact_tokens = 0
+        self._compact_exchanges.clear()
+        console.print(
+            f"  [green]✓[/green] resumed session [cyan]{prior[:8]}…"
+            f"[/cyan] (was on {old[:8]}…)"
+        )
+        console.print(
+            "  [dim]loomflow will rehydrate prior turns from "
+            "memory on your next task.[/dim]"
         )
 
     # ---- /loominit ------------------------------------------------------
