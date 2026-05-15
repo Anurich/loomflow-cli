@@ -59,6 +59,7 @@ from rich.text import Text
 from .agent import build_agent
 from .approval import ApprovalGate
 from .compact import Compactor, default_compact_threshold
+from .credentials import ensure_key_for_model
 from .project import Project
 from .render import StreamRenderer, banner, console
 
@@ -438,6 +439,16 @@ class Repl:
         the new model too; ``_compact_threshold`` stays as-is so a
         user override survives a model switch (auto = -1 just
         recomputes against the new model on the next check)."""
+        # Ensure we have a key for the NEW model before
+        # constructing — otherwise build_agent crashes inside the
+        # provider SDK on a missing key. ensure_key_for_model
+        # prompts inline + saves so the switch just works.
+        if not ensure_key_for_model(model, console):
+            console.print(
+                "  [yellow]model switch cancelled — staying on "
+                f"{self.model}[/yellow]"
+            )
+            return
         self.model = model
         self.agent, self.workspace = build_agent(
             self.project,

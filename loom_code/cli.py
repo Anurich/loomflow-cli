@@ -21,6 +21,7 @@ import anyio
 
 from .agent import DEFAULT_MODEL, build_agent
 from .approval import ApprovalGate, auto_approve
+from .credentials import ensure_key_for_model, load_credentials
 from .project import Project, detect_project
 from .render import StreamRenderer, banner, console
 from .repl import run_repl
@@ -246,6 +247,17 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    # 1. Read ~/.loom-code/credentials so any keys saved on a
+    #    previous run are available without the user having to
+    #    `export` again.
+    # 2. If the chosen model still needs a key, prompt for it
+    #    inline (hidden input), save it, and continue.
+    # Both happen BEFORE any Agent is constructed — loomflow's
+    # model adapter would crash at init on a missing key otherwise.
+    load_credentials()
+    if not ensure_key_for_model(args.model, console):
+        sys.exit(1)
 
     if not args.prompt:
         # No task → interactive REPL. --yes is meaningless here
