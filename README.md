@@ -27,29 +27,64 @@ memory, the self-improvement notebook — is loomflow.
   notes the agent reads get credited when a turn goes well, so
   future runs surface what worked.
 
-## Usage
+## Install
+
+One command, no clone needed:
 
 ```bash
-# one-shot
+pipx install git+https://github.com/Anurich/loomflow-cli
+```
+
+`pipx` is the standard installer for Python CLIs (`aider`,
+`ruff`, `httpie` all ship this way). It clones the repo into its
+own isolated cache, creates a private venv, and puts `loom-code`
+on your PATH — globally. No `cd` into our repo, no venv to
+manage. If you don't have pipx: `brew install pipx` (macOS) or
+`python -m pip install --user pipx`.
+
+Then set one model key in your environment (or a local `.env`):
+
+```bash
+export OPENAI_API_KEY=sk-...        # OpenAI / gpt-4.1-mini default
+# or
+export ANTHROPIC_API_KEY=sk-ant-... # Anthropic / Claude
+```
+
+Ollama needs no key (it's local) — see [Models](#models) below.
+
+To update later: `pipx upgrade loom-code`. To remove:
+`pipx uninstall loom-code`.
+
+## Use it
+
+`loom-code` always operates on the **current working directory**
+— walks up to find `.git` and roots itself there. So:
+
+```bash
+cd ~/your-project
+
+# one-shot — agent does the task, prints a summary, exits
 loom-code "add a retry decorator to the http client"
 
-# interactive REPL
+# interactive REPL — chat, code, approve, repeat
 loom-code
 ```
 
-`loom-code` with no args drops into a REPL with slash commands
-(`/help`, `/plan`, `/cost`, `/good`, `/bad`, `/model`, `/clear`,
-`/exit`).
+The REPL ships with slash commands — type `/` and the menu pops
+with everything available (`/help`, `/plan`, `/cost`, `/good`,
+`/bad`, `/model`, `/clear`, `/compress_token_length`, `/exit`).
 
-## Install (development)
+## Install (for development)
+
+If you want to work *on* loom-code's own source:
 
 ```bash
+git clone https://github.com/Anurich/loomflow-cli
+cd loomflow-cli
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
+pytest -q
 ```
-
-Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in your environment
-(or a local `.env` — which is gitignored).
 
 ## Models
 
