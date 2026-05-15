@@ -88,6 +88,8 @@ _SLASH_HELP = """\
   [cyan]/model[/cyan] <name>    switch to a specific model by name
   [cyan]/set_model[/cyan]       pick OpenAI / Anthropic + save API key
   [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
+  [cyan]/loominit[/cyan]        index this codebase → LOOM.md so the
+                   agent can skip re-reading source on every task
   [cyan]/clear[/cyan]           fresh conversation (new session)
   [cyan]/compress_token_length[/cyan] [N|auto|off]
                    show / set / disable the auto-compact threshold
@@ -115,6 +117,7 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/model", "switch to a specific model by name"),
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
+    ("/loominit", "index this codebase → LOOM.md"),
     ("/clear", "fresh conversation (new session)"),
     (
         "/compress_token_length",
@@ -231,7 +234,11 @@ class Repl:
         )
         console.print(
             "  [dim]▸ [cyan]/set_web[/cyan]       enable web "
-            "search (Serper / DuckDuckGo)[/dim]\n"
+            "search (Serper / DuckDuckGo)[/dim]"
+        )
+        console.print(
+            "  [dim]▸ [cyan]/loominit[/cyan]      index this "
+            "codebase so future turns skip re-reading source[/dim]\n"
         )
 
         while True:
@@ -498,6 +505,8 @@ class Repl:
             await self._handle_set_model()
         elif cmd == "/set_web":
             await self._handle_set_web()
+        elif cmd == "/loominit":
+            await self._handle_loominit()
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -857,6 +866,119 @@ class Repl:
             f"  [dim]web search: {state} — "
             "fresh conversation[/dim]"
         )
+
+    # ---- /loominit ------------------------------------------------------
+
+    async def _handle_loominit(self) -> None:
+        """Run the full codebase-indexing pipeline.
+
+        Phase 1 (structural, sub-second): walk the repo, AST-parse
+        every .py, build the symbol + import graph, score by
+        PageRank, mine entry points, cluster by path. Writes
+        ``.loom/index.json``.
+
+        Phase 2 (LLM annotation, parallel): for the project as a
+        whole + each cluster, spawn a loomflow ``Agent`` (no tools,
+        ``output_schema``-validated JSON) that produces the
+        narrative chunk. Stitched into ``LOOM.md`` at the repo root.
+
+        Costs one model run per cluster + one for the overview —
+        bounded by ``annotator.DEFAULT_CONCURRENCY``. Re-run via
+        ``/loominit`` any time; surgical refresh / staleness
+        tracking lands in later slices.
+        """
+        # Imports kept local so a slim ``loom-code`` startup doesn't
+        # pull in the AST walker + pydantic models for users who
+        # never run /loominit.
+        from .loominit.annotator import annotate
+        from .loominit.extractor import build_index
+        from .loominit.persistence import (
+            markdown_path,
+            save_index,
+            write_markdown,
+        )
+
+        console.print()
+        console.print(
+            "  [dim]indexing codebase (this may take a few "
+            "seconds for the structural pass + 5-30s for the "
+            "LLM annotation)…[/dim]"
+        )
+        status = console.status(
+            "[dim]building structural index…[/dim]", spinner="dots"
+        )
+        status.start()
+        try:
+            index = build_index(self.project.root)
+            if not index.files:
+                status.stop()
+                console.print(
+                    "  [yellow]no indexable source files found — "
+                    "nothing to do[/yellow]"
+                )
+                return
+            save_index(self.project.root, index)
+            status.update(
+                f"[dim]annotating {len(index.clusters)} cluster(s) "
+                "via the model — this is the LLM-cost step…[/dim]"
+            )
+            metadata = _read_pyproject_metadata(self.project.root)
+            body = await annotate(
+                index,
+                model=self.model,
+                project_metadata=metadata,
+            )
+            write_markdown(self.project.root, body)
+        except Exception as exc:  # noqa: BLE001 — REPL must survive
+            status.stop()
+            console.print(
+                f"  [bold red]/loominit failed: {exc}[/bold red]"
+            )
+            return
+        finally:
+            status.stop()
+
+        n_symbols = len(index.symbols)
+        n_clusters = len(index.clusters)
+        n_files = len(index.files)
+        out_path = markdown_path(self.project.root)
+        console.print(
+            f"  [green]✓[/green] wrote [cyan]{out_path.name}[/cyan] "
+            f"— {n_files} files, {n_symbols} symbols, "
+            f"{n_clusters} cluster(s)"
+        )
+        console.print(
+            "  [dim]future turns will reference this file. Re-run "
+            "[cyan]/loominit[/cyan] after major refactors.[/dim]"
+        )
+
+
+def _read_pyproject_metadata(repo_root) -> dict[str, str]:
+    """Best-effort read of pyproject.toml ``[project]`` metadata —
+    feeds the annotator's overview prompt. Quiet failure mode:
+    returns ``{}`` on any read/parse error; the annotator handles
+    missing fields gracefully."""
+    import tomllib
+
+    pyproject = repo_root / "pyproject.toml"
+    if not pyproject.exists():
+        return {}
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+    project = data.get("project", {})
+    if not isinstance(project, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in ("name", "description"):
+        val = project.get(key)
+        if isinstance(val, str):
+            out[key] = val
+    req = project.get("requires-python")
+    if isinstance(req, str):
+        out["requires_python"] = req
+    return out
 
 
 async def run_repl(project: Project, model: str) -> int:
