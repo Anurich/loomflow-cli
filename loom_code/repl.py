@@ -108,6 +108,54 @@ the conversation continues with that summary as its only history.
 
 _USER_ID = "loom-code"
 
+# How many times we'll auto-continue a turn when the living plan
+# still has non-done steps after the agent emits a final answer.
+# This is the Ralph-loop / Cursor-judge-agent pattern: the model's
+# "I'm done" judgement is unreliable on multi-step plans, so the
+# REPL overrules it as long as the plan explicitly disagrees.
+# Cap at 5 to bound runaway cost — 5 continuations covers a
+# typical 6-step scaffold (1 initial run + 5 continues = 6 steps).
+_AUTO_CONTINUE_LIMIT = 5
+
+# Prompt fed in on each auto-continue iteration. Matches the
+# coordinator's own "LOOP" workflow step (step 5 in prompts.py)
+# so it lands as a natural next-instruction, not a directive
+# from outside its mental model.
+_AUTO_CONTINUE_PROMPT = (
+    "[auto-continue] Your living plan still has non-done steps. "
+    "Continue with the next `todo` or `doing` step right now. "
+    "Do NOT respond to the user yet — only respond when every "
+    "plan step is `done`, `skipped`, or `blocked`."
+)
+
+
+def _count_plan_remaining(plan_text: str | None) -> int:
+    """How many plan steps are NOT yet done/skipped/blocked?
+
+    Parses the markdown the living-plan tool renders as its
+    ``tool_result``. The plan body has a footer line like
+    ``**Progress:** 2/6 done`` we can read directly — no need to
+    parse the whole table.
+
+    Returns 0 if no plan exists, the progress line is missing, or
+    the plan is fully drained. Callers use this to decide whether
+    to auto-continue the turn (see ``_AUTO_CONTINUE_LIMIT``).
+    """
+    if not plan_text:
+        return 0
+    import re
+
+    match = re.search(
+        r"Progress:?\s*\*?\*?\s*(\d+)\s*/\s*(\d+)\s+done",
+        plan_text,
+    )
+    if not match:
+        return 0
+    done = int(match.group(1))
+    total = int(match.group(2))
+    remaining = total - done
+    return max(0, remaining)
+
 
 def _flatten_exception_group(
     eg: BaseExceptionGroup,
@@ -373,63 +421,117 @@ class Repl:
             set_status=set_status, pause_status=pause_status
         )
 
-        try:
-            async for event in self.agent.stream(
-                prompt,
-                user_id=_USER_ID,
-                session_id=self.session_id,
-            ):
-                renderer.handle(event)
-        except KeyboardInterrupt:
-            pause_status()
-            console.print("\n[yellow]interrupted — turn abandoned[/yellow]")
-            return
-        except BaseExceptionGroup as eg:
-            # anyio's task groups raise ``ExceptionGroup`` when any
-            # child task fails. The default str() reads
-            # "unhandled errors in a TaskGroup (1 sub-exception)" —
-            # uninformative. Unwrap to surface the REAL cause(s)
-            # so the user can act on them (missing key, model
-            # error, etc.) instead of staring at an opaque wrapper.
-            pause_status()
-            for inner in _flatten_exception_group(eg):
+        # The Ralph-loop wrapper: ReAct architectures exit when the
+        # model emits text without a tool call, even mid-plan. We
+        # check after each stream completes — if the living plan
+        # still has todo/doing steps, we feed an auto-continue
+        # prompt and run another iteration. Bounded by
+        # _AUTO_CONTINUE_LIMIT so a flaky model can't burn the
+        # user's budget unbounded.
+        current_prompt = prompt
+        auto_continues_used = 0
+        agent_output_last = ""
+
+        while True:
+            try:
+                async for event in self.agent.stream(
+                    current_prompt,
+                    user_id=_USER_ID,
+                    session_id=self.session_id,
+                ):
+                    renderer.handle(event)
+            except KeyboardInterrupt:
+                pause_status()
+                console.print(
+                    "\n[yellow]interrupted — turn abandoned[/yellow]"
+                )
+                return
+            except BaseExceptionGroup as eg:
+                # anyio's task groups raise ``ExceptionGroup`` when
+                # any child task fails. The default str() reads
+                # "unhandled errors in a TaskGroup (1 sub-exception)"
+                # — uninformative. Unwrap to surface the REAL
+                # cause(s) so the user can act on them.
+                pause_status()
+                for inner in _flatten_exception_group(eg):
+                    console.print(
+                        f"\n[bold red]error: "
+                        f"{type(inner).__name__}: {inner}[/bold red]"
+                    )
+                return
+            except Exception as exc:  # noqa: BLE001 — REPL must survive
+                pause_status()
                 console.print(
                     f"\n[bold red]error: "
-                    f"{type(inner).__name__}: {inner}[/bold red]"
+                    f"{type(exc).__name__}: {exc}[/bold red]"
                 )
-            return
-        except Exception as exc:  # noqa: BLE001 — REPL must survive
-            pause_status()
-            console.print(
-                f"\n[bold red]error: "
-                f"{type(exc).__name__}: {exc}[/bold red]"
-            )
-            return
-        finally:
-            pause_status()
+                return
 
-        if renderer.last_plan:
-            self.last_plan = renderer.last_plan
-        result = renderer.last_result
-        agent_output = ""
-        if result:
-            self.total_cost += float(result.get("cost_usd", 0.0))
-            tin = int(result.get("tokens_in", 0))
-            cached_in = int(result.get("cached_tokens_in", 0))
-            tout = int(result.get("tokens_out", 0))
-            self.total_in += tin + cached_in
-            self.total_cached_in += cached_in
-            self.total_out += tout
-            self.turns += int(result.get("turns", 0))
-            # Hold this turn's citations for the moved-on heuristic.
-            self._pending_slugs = list(
-                result.get("cited_slugs") or []
-            )
-            # Feed the auto-compactor: count tokens toward the
-            # threshold and stash the exchange in case we trigger.
-            self._compact_tokens += tin + cached_in + tout
-            agent_output = str(result.get("output") or "")
-        self._compact_exchanges.append((prompt, agent_output))
+            if renderer.last_plan:
+                self.last_plan = renderer.last_plan
+            result = renderer.last_result
+            agent_output = ""
+            if result:
+                self.total_cost += float(result.get("cost_usd", 0.0))
+                tin = int(result.get("tokens_in", 0))
+                cached_in = int(result.get("cached_tokens_in", 0))
+                tout = int(result.get("tokens_out", 0))
+                self.total_in += tin + cached_in
+                self.total_cached_in += cached_in
+                self.total_out += tout
+                self.turns += int(result.get("turns", 0))
+                # Hold this turn's citations for the moved-on
+                # heuristic. Updated on each iteration so the
+                # final pending_slugs reflect the LAST sub-turn.
+                self._pending_slugs = list(
+                    result.get("cited_slugs") or []
+                )
+                self._compact_tokens += tin + cached_in + tout
+                agent_output = str(result.get("output") or "")
+            agent_output_last = agent_output
+
+            # Decide whether to auto-continue: only if (a) the
+            # plan exists and has non-done steps, (b) we haven't
+            # blown the continue cap, and (c) the run actually
+            # produced output (a zero-event run usually means
+            # the agent crashed silently — don't retry that).
+            remaining = _count_plan_remaining(self.last_plan)
+            if (
+                remaining > 0
+                and auto_continues_used < _AUTO_CONTINUE_LIMIT
+                and result is not None
+            ):
+                auto_continues_used += 1
+                pause_status()
+                console.print(
+                    f"\n  [dim magenta]▸ plan has {remaining} step(s) "
+                    f"remaining — auto-continuing "
+                    f"({auto_continues_used}/"
+                    f"{_AUTO_CONTINUE_LIMIT})[/dim magenta]"
+                )
+                current_prompt = _AUTO_CONTINUE_PROMPT
+                # Restart the spinner for the next iteration.
+                set_status("loomflowing...")
+                continue
+
+            # Either plan is drained, no plan exists, or we've hit
+            # the auto-continue cap. Stop here, let the user see
+            # the final answer + decide.
+            if (
+                remaining > 0
+                and auto_continues_used >= _AUTO_CONTINUE_LIMIT
+            ):
+                console.print(
+                    f"\n  [yellow]plan still has {remaining} "
+                    f"step(s) but hit auto-continue cap "
+                    f"({_AUTO_CONTINUE_LIMIT}) — type 'continue' "
+                    "to push further, or accept the partial result"
+                    "[/yellow]"
+                )
+            break
+
+        pause_status()
+        self._compact_exchanges.append((prompt, agent_output_last))
 
         # Persist the current session_id to disk so /resume on the
         # next REPL launch knows what to rehydrate. Done after EVERY
