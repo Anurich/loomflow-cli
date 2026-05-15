@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "loom-code — a loomflow-native terminal coding agent"
 requires-python = ">=3.11"
 dependencies = [
-    "loomflow>=0.10.1",
+    # [litellm] extra pulls in LiteLLM so model strings prefixed
+    # with `ollama/`, `litellm/`, `together_ai/`, `groq/`, etc.
+    # route through loomflow's LiteLLMModel adapter automatically.
+    # The 0.10.5 floor is required for the sub-agent cost rollup
+    # in Team.supervisor — older versions silently under-counted.
+    "loomflow[litellm]>=0.10.5",
     "rich>=13",
     "anthropic",
     "openai",

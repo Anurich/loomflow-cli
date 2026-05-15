@@ -183,7 +183,14 @@ def main() -> None:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help=f"Model to use (default: {DEFAULT_MODEL}).",
+        help=(
+            f"Model to use (default: {DEFAULT_MODEL}). Accepts any "
+            "string loomflow's resolver routes: Anthropic names "
+            "(claude-sonnet-4-6, claude-opus-4-7, ...), OpenAI "
+            "names (gpt-4.1-mini, gpt-4.1, o4-mini, ...), local "
+            "Ollama (ollama/llama3, ollama/qwen2.5-coder), or "
+            "force LiteLLM with litellm/<anything>."
+        ),
     )
     parser.add_argument(
         "--yes",

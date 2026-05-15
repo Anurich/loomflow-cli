@@ -51,6 +51,27 @@ pip install -e .
 Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in your environment
 (or a local `.env` — which is gitignored).
 
+## Models
+
+`--model "<name>"` accepts any string loomflow's resolver routes.
+The common patterns:
+
+| flag value | provider | env you need |
+|---|---|---|
+| `claude-sonnet-4-6`, `claude-opus-4-7`, ... | Anthropic | `ANTHROPIC_API_KEY` |
+| `gpt-4.1-mini`, `gpt-4.1`, `o4-mini`, ... | OpenAI | `OPENAI_API_KEY` |
+| `ollama/llama3`, `ollama/qwen2.5-coder`, ... | local [Ollama](https://ollama.com) (free, private, offline) | (optional) `OLLAMA_API_BASE` — defaults to `http://localhost:11434` |
+| `litellm/<anything>` | force LiteLLM for any provider (`groq/`, `together_ai/`, `azure/`, `bedrock/`, `vertex_ai/`, ...) | provider's own env |
+
+The default is `gpt-4.1-mini` — override with `--model "<name>"` on
+the CLI, or `/model <name>` inside the REPL. Switching mid-REPL
+starts a fresh conversation (the previous model's history doesn't
+carry over).
+
+Ollama support comes from the `[litellm]` extra on the loomflow
+dependency, which is included by default — no extra install
+needed.
+
 ## Project context
 
 loom-code reads a `LOOM.md` / `CLAUDE.md` / `AGENTS.md` /
