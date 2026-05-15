@@ -46,9 +46,14 @@ Slash commands (handled here, never sent to the agent):
 
 from __future__ import annotations
 
-import anyio
 from loomflow import new_id
-from rich.prompt import Prompt
+from prompt_toolkit import HTML, PromptSession
+from prompt_toolkit.completion import (
+    CompleteEvent,
+    Completer,
+    Completion,
+)
+from prompt_toolkit.document import Document
 from rich.text import Text
 
 from .agent import build_agent
@@ -78,6 +83,49 @@ the conversation continues with that summary as its only history.
 """
 
 _USER_ID = "loom-code"
+
+# The single source of truth for slash commands the REPL accepts.
+# The autocomplete menu (popped the moment the user types '/')
+# reads off this list, so adding a new command here is enough —
+# no need to also update the autocomplete separately.
+_COMMAND_DEFS: list[tuple[str, str]] = [
+    ("/help", "show all commands"),
+    ("/plan", "show the current plan, or start one"),
+    ("/cost", "session cost + token totals"),
+    ("/good", "mark the last turn useful (credit notes)"),
+    ("/bad", "mark the last turn unhelpful"),
+    ("/model", "switch model (rebuilds the agent)"),
+    ("/clear", "fresh conversation (new session)"),
+    (
+        "/compress_token_length",
+        "auto-compact threshold: <N> | auto | off",
+    ),
+    ("/exit", "leave (Ctrl-D also works)"),
+]
+
+
+class _SlashCompleter(Completer):
+    """Pop the slash-command menu the moment the user types '/'.
+
+    Only fires when the line starts with '/' — typing a normal
+    task message stays clean, no popup. Filters as the user types
+    more characters, so '/co' narrows to /cost +
+    /compress_token_length.
+    """
+
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        for cmd, desc in _COMMAND_DEFS:
+            if cmd.startswith(text):
+                yield Completion(
+                    cmd,
+                    start_position=-len(text),
+                    display_meta=desc,
+                )
 
 
 class Repl:
@@ -118,6 +166,15 @@ class Repl:
         self._compact_threshold = -1  # auto
         self._compact_tokens = 0
         self._compact_exchanges: list[tuple[str, str]] = []
+        # prompt_toolkit drives the input line. complete_while_typing
+        # opens the autocomplete menu the moment the user types '/'
+        # without any extra keystroke (Tab also still works for
+        # explicit completion). History gives free up-arrow recall
+        # within the session.
+        self._prompt_session: PromptSession[str] = PromptSession(
+            completer=_SlashCompleter(),
+            complete_while_typing=True,
+        )
 
     async def run(self) -> int:
         """The REPL loop. Returns an exit code."""
@@ -138,7 +195,7 @@ class Repl:
             # the end-of-turn summary for visual consistency.
             self._print_status_line()
             try:
-                line = await anyio.to_thread.run_sync(self._read_line)
+                line = await self._read_line()
             except (EOFError, KeyboardInterrupt):
                 # Leaving satisfied — credit any pending turn.
                 await self._attribute_pending(success=True, quiet=True)
@@ -166,10 +223,17 @@ class Repl:
 
     # ---- input ----------------------------------------------------------
 
-    def _read_line(self) -> str:
-        """Blocking prompt — runs on a worker thread so the anyio
-        loop stays free."""
-        return Prompt.ask("[bold green]loom[/bold green]")
+    async def _read_line(self) -> str:
+        """Read one line from the user via prompt_toolkit.
+
+        Async because ``PromptSession.prompt_async`` integrates with
+        the asyncio event loop directly — no thread hop needed.
+        The slash-command autocomplete + history come from the
+        ``PromptSession`` configured in ``__init__``.
+        """
+        return await self._prompt_session.prompt_async(
+            HTML("<ansigreen><b>loom</b></ansigreen>: ")
+        )
 
     # ---- a task turn ----------------------------------------------------
 

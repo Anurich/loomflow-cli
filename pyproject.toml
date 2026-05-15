@@ -11,6 +11,11 @@ dependencies = [
     # in Team.supervisor — older versions silently under-counted.
     "loomflow[litellm]>=0.10.5",
     "rich>=13",
+    # prompt_toolkit drives the REPL line editor — gives us inline
+    # slash-command autocomplete (a menu pops the moment the user
+    # types '/'), history (up/down arrows), and emacs/vi keybinds.
+    # The de-facto standard for Python CLIs (Aider, IPython, etc.).
+    "prompt-toolkit>=3.0",
     "anthropic",
     "openai",
 ]
