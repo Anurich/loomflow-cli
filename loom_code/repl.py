@@ -312,7 +312,7 @@ class Repl:
         avoid the long blank stretches the old "drop on first event"
         scheme produced in Supervisor mode."""
         status = console.status(
-            "[dim]thinking...[/dim]", spinner="dots"
+            "[dim]loomflowing...[/dim]", spinner="dots"
         )
         status.start()
         status_running = True
