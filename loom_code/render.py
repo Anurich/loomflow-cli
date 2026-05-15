@@ -50,6 +50,11 @@ class StreamRenderer:
         # REPL-readable after the stream drains:
         self.last_plan: str | None = None
         self.last_result: dict[str, Any] | None = None
+        # Captured during the run so cli.py can build the end-of-run
+        # summary (files changed / verified / notes captured) without
+        # the agent having to report any of it itself.
+        self.bash_commands: list[str] = []
+        self.notes_written: list[tuple[str, str]] = []  # (kind, title)
 
     def handle(self, event: Any) -> None:
         """Render a single ``Event``. ``kind`` is a string enum;
@@ -97,6 +102,18 @@ class StreamRenderer:
         if call_id:
             self._call_names[str(call_id)] = str(tool)
         args = call.get("args") or {}
+        # Capture bash commands + note writes for the end-of-run
+        # summary cli.py builds. Done here (on the call event) so
+        # we have the args; tool_result only carries call_id.
+        if tool == "bash":
+            cmd = str(args.get("command") or "").strip()
+            if cmd:
+                self.bash_commands.append(cmd)
+        elif tool == "note":
+            title = str(args.get("title") or "").strip()
+            if title:
+                kind = str(args.get("kind") or "").strip()
+                self.notes_written.append((kind, title))
         arg_str = _summarise_args(args)
         console.print(
             Text.assemble(

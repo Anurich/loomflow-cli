@@ -14,15 +14,28 @@ just loops and adds slash commands.
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 
 import anyio
 
 from .agent import DEFAULT_MODEL, build_agent
 from .approval import ApprovalGate, auto_approve
-from .project import detect_project
+from .project import Project, detect_project
 from .render import StreamRenderer, banner, console
 from .repl import run_repl
+
+# Substrings we treat as "this bash call was a verify step." Hit
+# anywhere in the lowercased command. Detected, not declared by the
+# agent — we sniff the tool stream so the summary is honest about
+# what was actually run rather than what the agent claims.
+_VERIFY_PATTERNS = (
+    "pytest", "py.test", "jest", "vitest", "mocha",
+    "cargo test", "go test", "mvn test", "gradle test",
+    "rake test", "phpunit", "python -m unittest", "tox",
+    "make test", "make check", "npm test", "yarn test",
+    "pnpm test", "bundle exec",
+)
 
 
 async def _run_once(prompt: str, model: str, yes: bool) -> int:
@@ -80,7 +93,76 @@ async def _run_once(prompt: str, model: str, yes: bool) -> int:
                     )
             except Exception:  # noqa: BLE001 — best-effort
                 pass
+
+    # End-of-run summary — what changed on disk, what was verified,
+    # what the agent captured. Detected from the event stream + git;
+    # the agent doesn't have to report any of it itself.
+    _print_run_summary(project, renderer)
     return 0
+
+
+def _is_verify_command(cmd: str) -> bool:
+    """True for bash commands that look like a project's test /
+    build runner — what the agent's VERIFY step should produce."""
+    head = cmd.lstrip().lower()
+    return any(p in head for p in _VERIFY_PATTERNS)
+
+
+def _git_changes(project: Project) -> list[str]:
+    """Lines from ``git status --short`` for the user's repo, with
+    loom-code's own ``.loom/`` state filtered out (it's runtime
+    chatter, not part of what the agent changed for the user)."""
+    res = subprocess.run(
+        ["git", "-C", str(project.root), "status", "--short"],
+        capture_output=True, text=True,
+    )
+    out: list[str] = []
+    for raw in res.stdout.splitlines():
+        if not raw.strip():
+            continue
+        # Status lines are ``XY path`` — split off the path so we
+        # can filter on it.
+        parts = raw.split(maxsplit=1)
+        if len(parts) < 2:
+            continue
+        path = parts[1].strip().strip('"')
+        if path == ".loom" or path == ".loom/" or path.startswith(".loom/"):
+            continue
+        out.append(raw)
+    return out
+
+
+def _print_run_summary(
+    project: Project, renderer: StreamRenderer
+) -> None:
+    """Append a structured summary after the cost line."""
+    if project.is_git:
+        changes = _git_changes(project)
+        if changes:
+            console.print()
+            console.print("  [bold]Files changed:[/bold]")
+            for line in changes[:20]:  # cap noise on huge changesets
+                console.print(f"    [dim]{line}[/dim]")
+            if len(changes) > 20:
+                console.print(
+                    f"    [dim]... (+{len(changes) - 20} more)[/dim]"
+                )
+
+    verify = [c for c in renderer.bash_commands if _is_verify_command(c)]
+    if verify:
+        console.print()
+        console.print("  [bold]What was verified:[/bold]")
+        for cmd in verify[:5]:
+            short = cmd if len(cmd) <= 80 else cmd[:80] + "…"
+            console.print(f"    [dim]$[/dim] {short}")
+
+    if renderer.notes_written:
+        console.print()
+        console.print("  [bold]Notes captured:[/bold]")
+        for kind, title in renderer.notes_written[:5]:
+            tag = f"[dim]{kind}:[/dim] " if kind else ""
+            short = title if len(title) <= 80 else title[:80] + "…"
+            console.print(f"    • {tag}{short}")
 
 
 def main() -> None:

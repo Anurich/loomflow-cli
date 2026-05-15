@@ -27,3 +27,12 @@ def project(tmp_path: Path) -> Project:
         context_file=None,
         context_text="",
     )
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    """Async tests in this suite use ``pytest.mark.anyio`` (anyio's
+    own pytest plugin, auto-loaded with anyio). Pin the backend to
+    asyncio so we don't pull a trio dep just for tests. Sync tests
+    are unaffected — they just don't request this fixture."""
+    return "asyncio"
