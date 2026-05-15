@@ -214,19 +214,23 @@ class Repl:
                 f"{self.project.context_file.name}[/dim]"
             )
         # Brief getting-started hints right after the banner. Surfaces
-        # /set_model and /set_web so new users discover provider +
-        # web-search setup without reading docs; /help reveals the
-        # full menu for anyone curious.
+        # provider/web setup AND the bare /model command so users who
+        # already have an API key but want a different model name
+        # don't go hunting through /help. Ordering: most-common first.
         console.print(
             "  [dim]▸ type a task, or [cyan]/help[/cyan] "
             "for the command menu[/dim]"
         )
         console.print(
-            "  [dim]▸ [cyan]/set_model[/cyan]  pick "
+            "  [dim]▸ [cyan]/model <name>[/cyan]  switch to a "
+            "specific model by name (e.g. gpt-4.1, claude-opus-4-7)[/dim]"
+        )
+        console.print(
+            "  [dim]▸ [cyan]/set_model[/cyan]     pick "
             "OpenAI or Anthropic and save your API key[/dim]"
         )
         console.print(
-            "  [dim]▸ [cyan]/set_web[/cyan]    enable web "
+            "  [dim]▸ [cyan]/set_web[/cyan]       enable web "
             "search (Serper / DuckDuckGo)[/dim]\n"
         )
 

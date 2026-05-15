@@ -91,3 +91,86 @@ def test_completed_captures_result_dict() -> None:
     }
     r.handle(Event.completed("s", result))
     assert r.last_result == result
+
+
+def test_streamed_text_is_buffered_not_printed_per_chunk() -> None:
+    """Each chunk should accumulate into the buffer; nothing is
+    rendered until ``_end_text`` flushes it. We can't easily assert
+    "nothing was printed" but we can assert the buffer grew and
+    didn't reset between chunks."""
+    r = StreamRenderer()
+    r.handle(
+        Event.model_chunk("s", ModelChunk(kind="text", text="# Title\n"))
+    )
+    r.handle(
+        Event.model_chunk(
+            "s", ModelChunk(kind="text", text="and some text\n")
+        )
+    )
+    assert "".join(r._text_buffer) == "# Title\nand some text\n"
+    assert r._in_text is True
+
+
+def test_end_text_drains_buffer() -> None:
+    """``_end_text`` (triggered by a tool_call after prose, or by
+    a non-text chunk burst end) must flush the buffer + reset the
+    in_text flag so the next prose burst starts cleanly."""
+    r = StreamRenderer()
+    r.handle(
+        Event.model_chunk("s", ModelChunk(kind="text", text="hello"))
+    )
+    assert r._text_buffer == ["hello"]
+    r._end_text()
+    assert r._text_buffer == []
+    assert r._in_text is False
+
+
+def test_tool_call_after_text_flushes_buffer() -> None:
+    """A tool_call event coming after a text burst must trigger
+    `_end_text` automatically — otherwise the tool-call's print
+    line would interleave with un-rendered markdown."""
+    r = StreamRenderer()
+    r.handle(
+        Event.model_chunk(
+            "s", ModelChunk(kind="text", text="Let me grep.")
+        )
+    )
+    r.handle(
+        Event.tool_call(
+            "s", ToolCall(id="c1", tool="grep", args={"pattern": "x"})
+        )
+    )
+    assert r._text_buffer == []
+    assert r._in_text is False
+
+
+def test_truncate_preview_returns_short_unchanged() -> None:
+    from loom_code.render import _truncate_preview
+
+    assert _truncate_preview("short", char_cap=100, line_cap=10) == "short"
+
+
+def test_truncate_preview_caps_lines_first_when_smaller() -> None:
+    from loom_code.render import _truncate_preview
+
+    text = "\n".join(f"line{i}" for i in range(20))
+    out = _truncate_preview(text, char_cap=10_000, line_cap=5)
+    # Should have at most 5 source lines + the trailer
+    assert "+15 lines" in out
+    assert out.count("\n") <= 6  # 5 content + 1 trailer line
+
+
+def test_truncate_preview_caps_chars_when_smaller() -> None:
+    from loom_code.render import _truncate_preview
+
+    out = _truncate_preview("a" * 500, char_cap=50, line_cap=100)
+    assert "+450 chars" in out
+    # Trailer is on a new line; content body itself is ≤50 chars
+    body = out.split("\n")[0]
+    assert len(body) == 50
+
+
+def test_truncate_preview_empty_input() -> None:
+    from loom_code.render import _truncate_preview
+
+    assert _truncate_preview("", char_cap=10, line_cap=2) == ""

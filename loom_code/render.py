@@ -16,15 +16,60 @@ from collections.abc import Callable
 from typing import Any
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.text import Text
 
 console = Console()
 
 # Tools whose results are worth showing in full-ish; others get a
-# one-line summary so the terminal doesn't flood.
+# one-line summary so the terminal doesn't flood. We cap BOTH char
+# and line count — a single long line (jq output, minified JSON,
+# a big SQL row) blows past the char cap with no newlines, and a
+# multi-line directory listing exceeds the line cap before chars.
+# Truncate on whichever hits first; the trailer says how much was
+# elided in BOTH dimensions so the user knows the scale.
 _VERBOSE_RESULT_TOOLS = {"read", "grep", "ls", "find"}
-_RESULT_PREVIEW_CHARS = 600
+_RESULT_PREVIEW_CHARS = 300
+_RESULT_PREVIEW_LINES = 8
+# Verbose tools (read/grep/ls/find) get this multiplier — they
+# legitimately produce more useful long output.
+_VERBOSE_MULTIPLIER = 3
+
+
+def _truncate_preview(
+    text: str, *, char_cap: int, line_cap: int
+) -> str:
+    """Cap a tool-result preview at BOTH a character count AND a
+    line count — whichever hits first. Returns the truncated text
+    with a trailer naming what was elided.
+
+    Char cap alone is wrong: a one-line minified JSON blob hides
+    far less terminal real estate than 20 lines of grep output at
+    the same character count. Line cap alone is wrong: a single
+    unwrapped line can be thousands of characters. Use both."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    n_lines = len(lines)
+    n_chars = len(text)
+    # Decide which cap is more restrictive for this output.
+    line_truncated = n_lines > line_cap
+    char_truncated = n_chars > char_cap
+    if not line_truncated and not char_truncated:
+        return text
+    # Take the smaller of (line_cap lines, char_cap chars).
+    by_lines = "\n".join(lines[:line_cap])
+    capped = by_lines[:char_cap] if len(by_lines) > char_cap else by_lines
+    elided_lines = n_lines - capped.count("\n") - 1
+    elided_chars = n_chars - len(capped)
+    parts = []
+    if elided_lines > 0:
+        parts.append(f"+{elided_lines} lines")
+    if elided_chars > 0:
+        parts.append(f"+{elided_chars} chars")
+    trailer = ", ".join(parts) if parts else "truncated"
+    return f"{capped}\n    … ({trailer})"
 
 
 def _status_label_for(tool: str, args: dict[str, Any]) -> str:
@@ -76,6 +121,13 @@ class StreamRenderer:
         # the _on_completed fallback (print result["output"] only if
         # nothing streamed, so we never double-print).
         self._any_text = False
+        # Buffer for one prose burst — chunks accumulate here, then
+        # `_end_text` renders the whole thing as Markdown. We don't
+        # stream char-by-char because Markdown can't be rendered
+        # incrementally (headings / code-fences / list items need
+        # the surrounding context to format correctly). The spinner
+        # gives feedback during the wait.
+        self._text_buffer: list[str] = []
         # call_id -> tool name. loomflow's `tool_result` event only
         # carries `call_id` (ToolResult has no `tool` field) — the
         # tool NAME is only on the `tool_call` event. We bridge the
@@ -116,6 +168,13 @@ class StreamRenderer:
         # where ModelChunk is discriminated by ``kind`` — only the
         # "text" kind carries assistant prose; "tool_call"/"finish"
         # chunks have text=None and are surfaced by other handlers.
+        #
+        # We BUFFER chunks rather than printing incrementally — once
+        # the prose burst ends we render the whole thing as
+        # Markdown. Streaming raw text would mean the user sees
+        # half-formed markdown (`#`, `**`, etc.) flash by before
+        # the renderer kicks in, which is worse UX than the spinner
+        # holding for a few seconds while the response completes.
         chunk = payload.get("chunk") or {}
         if chunk.get("kind") != "text":
             return
@@ -123,24 +182,33 @@ class StreamRenderer:
         if not text:
             return
         if not self._in_text:
-            # The spinner shares the cursor's current line — writing
-            # streaming text on top of it corrupts both. Pause it
-            # for the duration of this prose burst; ``_end_text``
-            # resumes it.
-            self._pause_status()
-            console.print()  # blank line before a fresh assistant turn
             self._in_text = True
         self._any_text = True
-        console.print(text, end="", markup=False, highlight=False)
+        self._text_buffer.append(text)
 
     def _end_text(self) -> None:
-        if self._in_text:
+        if not self._in_text:
+            return
+        # Drain the buffer, render once. The spinner was running
+        # the whole time; pause it now so the markdown render
+        # doesn't fight for the cursor line.
+        full = "".join(self._text_buffer).strip()
+        self._text_buffer.clear()
+        self._in_text = False
+        if full:
+            self._pause_status()
             console.print()
-            self._in_text = False
-            # Prose burst over — bring the spinner back; the next
-            # tool_call will overwrite this label with something
-            # more specific.
-            self._set_status("thinking...")
+            try:
+                console.print(Markdown(full))
+            except Exception:  # noqa: BLE001 — must survive odd markdown
+                # Markdown rendering can throw on pathological input
+                # (unclosed fences, weird escapes). Fall back to
+                # plain print so we never lose the response.
+                console.print(full, markup=False, highlight=False)
+        # Prose burst over — bring the spinner back; the next
+        # tool_call will overwrite this label with something
+        # more specific.
+        self._set_status("thinking...")
 
     # ---- tools ----------------------------------------------------------
 
@@ -218,9 +286,11 @@ class StreamRenderer:
         is_verbose = any(
             v in str(tool) for v in _VERBOSE_RESULT_TOOLS
         )
-        cap = _RESULT_PREVIEW_CHARS * (3 if is_verbose else 1)
-        preview = text if len(text) <= cap else (
-            text[:cap] + f"\n    … (+{len(text) - cap} chars)"
+        mult = _VERBOSE_MULTIPLIER if is_verbose else 1
+        char_cap = _RESULT_PREVIEW_CHARS * mult
+        line_cap = _RESULT_PREVIEW_LINES * mult
+        preview = _truncate_preview(
+            text, char_cap=char_cap, line_cap=line_cap
         )
         indented = "\n".join(
             "    " + ln for ln in preview.splitlines()
