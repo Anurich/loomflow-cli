@@ -60,6 +60,11 @@ from .agent import build_agent
 from .approval import ApprovalGate
 from .compact import Compactor, default_compact_threshold
 from .credentials import ensure_key_for_model
+from .paste import (
+    build_paste_keybindings,
+    expand_pastes,
+    reset_paste_stash,
+)
 from .project import Project
 from .render import StreamRenderer, banner, console
 
@@ -171,10 +176,14 @@ class Repl:
         # opens the autocomplete menu the moment the user types '/'
         # without any extra keystroke (Tab also still works for
         # explicit completion). History gives free up-arrow recall
-        # within the session.
+        # within the session. The paste keybindings collapse large
+        # pastes into `[paste-N: <lines>, <chars>]` placeholders so
+        # the visible prompt stays readable; expand_pastes() restores
+        # the full content before the line goes to the agent.
         self._prompt_session: PromptSession[str] = PromptSession(
             completer=_SlashCompleter(),
             complete_while_typing=True,
+            key_bindings=build_paste_keybindings(),
         )
 
     async def run(self) -> int:
@@ -206,6 +215,13 @@ class Repl:
             line = line.strip()
             if not line:
                 continue
+
+            # Expand any [paste-N: ...] placeholders to the full
+            # stashed content BEFORE dispatch — slash commands
+            # generally won't contain pastes, but expanding here
+            # keeps a single canonical "what the user really said"
+            # point of truth and matches how Claude Code does it.
+            line = expand_pastes(line)
 
             if line.startswith("/"):
                 should_continue = await self._handle_slash(line)
@@ -419,6 +435,7 @@ class Repl:
             self.last_plan = None
             self._compact_tokens = 0
             self._compact_exchanges.clear()
+            reset_paste_stash()
             console.print(
                 "  [dim]fresh conversation — prior turns "
                 "forgotten[/dim]"
