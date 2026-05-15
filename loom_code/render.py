@@ -143,6 +143,13 @@ class StreamRenderer:
         )
         # REPL-readable after the stream drains:
         self.last_plan: str | None = None
+        # Structured plan steps captured from the most recent
+        # ``plan_write`` tool_call args. Used by the auto-continue
+        # logic in :mod:`repl` — a list of {description, status,
+        # finding} dicts is more reliable than regex-parsing the
+        # rendered markdown for progress (the rendering can change;
+        # the tool args shape is loomflow's stable API).
+        self.last_plan_steps: list[dict[str, Any]] | None = None
         self.last_result: dict[str, Any] | None = None
         # Captured during the run so cli.py can build the end-of-run
         # summary (files changed / verified / notes captured) without
@@ -233,6 +240,17 @@ class StreamRenderer:
             if title:
                 kind = str(args.get("kind") or "").strip()
                 self.notes_written.append((kind, title))
+        elif tool == "plan_write":
+            # Capture the structured plan steps so the REPL's
+            # auto-continue logic can read progress from a stable
+            # API instead of regex-parsing the rendered markdown.
+            # Lenient coercion: args["steps"] may be a JSON-string
+            # in some adapters; loomflow normalises on the tool
+            # side but the event we observe predates that. Fall
+            # back to the regex parser if shape is unexpected.
+            steps = _coerce_plan_steps(args.get("steps"))
+            if steps is not None:
+                self.last_plan_steps = steps
         arg_str = _summarise_args(args)
         console.print(
             Text.assemble(
@@ -355,6 +373,48 @@ class StreamRenderer:
         # shot run summary, so we don't duplicate them here.
         console.print()
         console.rule(style="dim")
+
+
+def _coerce_plan_steps(raw: Any) -> list[dict[str, Any]] | None:
+    """Normalise the ``plan_write`` ``steps`` arg into a list of dicts.
+
+    loomflow's plan tool accepts several shapes (native list, JSON
+    string, ``{"steps":[…]}`` wrapper) on the tool side, but the
+    ``tool_call`` event we observe carries whatever the model
+    emitted — usually a list of dicts. Be lenient about the shape;
+    return ``None`` for anything we can't interpret so the auto-
+    continue logic falls back to markdown parsing.
+    """
+    import json
+
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(raw, dict) and "steps" in raw:
+        raw = raw["steps"]
+    if not isinstance(raw, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        # Normalise the status field — lower-case, default todo.
+        status = item.get("status") or "todo"
+        if not isinstance(status, str):
+            status = "todo"
+        status = status.lower().strip()
+        if status not in {"todo", "doing", "done", "blocked", "skipped"}:
+            status = "todo"
+        out.append(
+            {
+                "description": str(item.get("description", "")).strip(),
+                "status": status,
+                "finding": str(item.get("finding") or "").strip() or None,
+            }
+        )
+    return out
 
 
 def _summarise_args(args: dict[str, Any]) -> str:

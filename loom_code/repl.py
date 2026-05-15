@@ -47,6 +47,7 @@ Slash commands (handled here, never sent to the agent):
 from __future__ import annotations
 
 import os
+from datetime import UTC
 from pathlib import Path
 
 from loomflow import new_id
@@ -129,18 +130,37 @@ _AUTO_CONTINUE_PROMPT = (
 )
 
 
-def _count_plan_remaining(plan_text: str | None) -> int:
+def _count_plan_remaining(
+    plan_steps: list[dict] | None = None,
+    plan_text: str | None = None,
+) -> int:
     """How many plan steps are NOT yet done/skipped/blocked?
 
-    Parses the markdown the living-plan tool renders as its
-    ``tool_result``. The plan body has a footer line like
-    ``**Progress:** 2/6 done`` we can read directly — no need to
-    parse the whole table.
+    Two input shapes, in preference order:
 
-    Returns 0 if no plan exists, the progress line is missing, or
-    the plan is fully drained. Callers use this to decide whether
-    to auto-continue the turn (see ``_AUTO_CONTINUE_LIMIT``).
+    1. ``plan_steps`` — structured list captured from the
+       ``plan_write`` tool_call args. Loomflow's stable API; no
+       parsing brittleness. Always prefer this when available.
+    2. ``plan_text`` — fallback. Regex-parses the rendered
+       markdown's ``**Progress:** X/Y done`` line. Used when the
+       renderer didn't observe a structured ``plan_write`` event
+       this run (e.g. the agent updated an existing plan via a
+       different path).
+
+    Returns 0 if neither is available, neither parses, or the
+    plan is fully drained. Used by the auto-continue logic in
+    ``_turn`` to decide whether to iterate.
     """
+    if plan_steps is not None:
+        # Structured path — exact, no regex. Steps in todo/doing
+        # state count as "remaining work"; done/skipped/blocked
+        # don't.
+        return sum(
+            1
+            for s in plan_steps
+            if isinstance(s, dict)
+            and s.get("status") in ("todo", "doing")
+        )
     if not plan_text:
         return 0
     import re
@@ -153,8 +173,77 @@ def _count_plan_remaining(plan_text: str | None) -> int:
         return 0
     done = int(match.group(1))
     total = int(match.group(2))
-    remaining = total - done
-    return max(0, remaining)
+    return max(0, total - done)
+
+
+def should_auto_continue(
+    *,
+    remaining: int,
+    previous_remaining: int | None,
+    iterations_used: int,
+    limit: int,
+) -> tuple[bool, str]:
+    """Decide whether to fire another auto-continue iteration.
+
+    Returns ``(continue?, reason)``. When ``continue=False`` the
+    reason is one of ``"plan_drained"`` / ``"cap_reached"`` /
+    ``"stalled"`` — useful for both UI (tell the user WHY we
+    stopped) and the telemetry log.
+
+    Stall detection: if the plan's remaining count did NOT
+    decrease between iterations, the model is talking but not
+    making progress. Bailing early saves cost — the next 3
+    iterations would almost certainly be the same.
+    """
+    if remaining <= 0:
+        return False, "plan_drained"
+    if iterations_used >= limit:
+        return False, "cap_reached"
+    if (
+        previous_remaining is not None
+        and remaining >= previous_remaining
+        and iterations_used > 0
+    ):
+        return False, "stalled"
+    return True, ""
+
+
+def _log_auto_continue(
+    *,
+    root: Path,
+    session_id: str,
+    iteration: int,
+    limit: int,
+    remaining: int,
+    previous_remaining: int | None,
+    decision: str,
+) -> None:
+    """Append one telemetry line to ``.loom/auto_continue.log``.
+
+    Used to tune the cap + diagnose stuck plans. One JSON object
+    per line so the file is append-only-safe and easy to grep /
+    parse later (``jq`` / ``cat`` both work). Best-effort: any
+    IO failure is silently swallowed — telemetry must never block
+    the agent."""
+    import json
+    from datetime import datetime
+
+    try:
+        target = root / ".loom" / "auto_continue.log"
+        target.parent.mkdir(exist_ok=True)
+        record = {
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+            "session_id": session_id,
+            "iter": iteration,
+            "limit": limit,
+            "remaining": remaining,
+            "previous_remaining": previous_remaining,
+            "decision": decision,
+        }
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
 
 
 def _flatten_exception_group(
@@ -421,16 +510,17 @@ class Repl:
             set_status=set_status, pause_status=pause_status
         )
 
-        # The Ralph-loop wrapper: ReAct architectures exit when the
-        # model emits text without a tool call, even mid-plan. We
-        # check after each stream completes — if the living plan
-        # still has todo/doing steps, we feed an auto-continue
-        # prompt and run another iteration. Bounded by
-        # _AUTO_CONTINUE_LIMIT so a flaky model can't burn the
-        # user's budget unbounded.
+        # The Ralph-loop wrapper: ReAct exits when the model emits
+        # text without a tool call, even mid-plan. We check after
+        # each stream completes — if the living plan still has
+        # todo/doing steps, we feed an auto-continue prompt and
+        # iterate. Bounded by _AUTO_CONTINUE_LIMIT, and we bail
+        # early if the plan didn't progress between iterations
+        # (model is talking but not making bookkeeping moves).
         current_prompt = prompt
         auto_continues_used = 0
         agent_output_last = ""
+        previous_remaining: int | None = None
 
         while True:
             try:
@@ -490,18 +580,39 @@ class Repl:
                 agent_output = str(result.get("output") or "")
             agent_output_last = agent_output
 
-            # Decide whether to auto-continue: only if (a) the
-            # plan exists and has non-done steps, (b) we haven't
-            # blown the continue cap, and (c) the run actually
-            # produced output (a zero-event run usually means
-            # the agent crashed silently — don't retry that).
-            remaining = _count_plan_remaining(self.last_plan)
-            if (
-                remaining > 0
-                and auto_continues_used < _AUTO_CONTINUE_LIMIT
-                and result is not None
-            ):
+            # Compute remaining from structured args FIRST (stable
+            # loomflow API), fall back to markdown parsing for
+            # cases where the renderer didn't observe a structured
+            # plan_write this iteration.
+            remaining = _count_plan_remaining(
+                plan_steps=renderer.last_plan_steps,
+                plan_text=self.last_plan,
+            )
+
+            # Skip auto-continue entirely if the run crashed
+            # silently (no result). Retrying would just crash again.
+            if result is None:
+                break
+
+            decision_continue, reason = should_auto_continue(
+                remaining=remaining,
+                previous_remaining=previous_remaining,
+                iterations_used=auto_continues_used,
+                limit=_AUTO_CONTINUE_LIMIT,
+            )
+            _log_auto_continue(
+                root=self.project.root,
+                session_id=self.session_id,
+                iteration=auto_continues_used,
+                limit=_AUTO_CONTINUE_LIMIT,
+                remaining=remaining,
+                previous_remaining=previous_remaining,
+                decision=("continue" if decision_continue else reason),
+            )
+
+            if decision_continue:
                 auto_continues_used += 1
+                previous_remaining = remaining
                 pause_status()
                 console.print(
                     f"\n  [dim magenta]▸ plan has {remaining} step(s) "
@@ -510,23 +621,27 @@ class Repl:
                     f"{_AUTO_CONTINUE_LIMIT})[/dim magenta]"
                 )
                 current_prompt = _AUTO_CONTINUE_PROMPT
-                # Restart the spinner for the next iteration.
                 set_status("loomflowing...")
                 continue
 
-            # Either plan is drained, no plan exists, or we've hit
-            # the auto-continue cap. Stop here, let the user see
-            # the final answer + decide.
-            if (
-                remaining > 0
-                and auto_continues_used >= _AUTO_CONTINUE_LIMIT
-            ):
+            # Stopped — tell the user WHY when the reason is
+            # actionable (cap hit / stalled). plan_drained =
+            # everything's fine; no message needed.
+            if reason == "cap_reached":
                 console.print(
                     f"\n  [yellow]plan still has {remaining} "
                     f"step(s) but hit auto-continue cap "
                     f"({_AUTO_CONTINUE_LIMIT}) — type 'continue' "
                     "to push further, or accept the partial result"
                     "[/yellow]"
+                )
+            elif reason == "stalled":
+                console.print(
+                    f"\n  [yellow]plan didn't progress between "
+                    f"iterations (still {remaining} step(s) "
+                    "remaining) — stopping. Type 'continue' to "
+                    "nudge the agent if you think it can recover, "
+                    "or /bad to flag the run.[/yellow]"
                 )
             break
 
