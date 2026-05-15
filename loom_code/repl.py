@@ -95,9 +95,14 @@ class Repl:
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
         self.session_id = new_id()
-        # Session accumulators.
+        # Session accumulators. ``total_in`` is *combined* input
+        # tokens (uncached + cached); ``total_cached_in`` is the
+        # cached subset, tracked separately so the status line can
+        # show the same split (``uncached+cached in``) that the
+        # end-of-turn summary uses.
         self.total_cost = 0.0
         self.total_in = 0
+        self.total_cached_in = 0
         self.total_out = 0
         self.turns = 0
         self.last_plan: str | None = None
@@ -127,6 +132,11 @@ class Repl:
         )
 
         while True:
+            # Persistent session status — printed before every prompt
+            # so the user always sees where they stand on cost/tokens,
+            # not just when they ask via /cost. Same split format as
+            # the end-of-turn summary for visual consistency.
+            self._print_status_line()
             try:
                 line = await anyio.to_thread.run_sync(self._read_line)
             except (EOFError, KeyboardInterrupt):
@@ -191,6 +201,7 @@ class Repl:
             cached_in = int(result.get("cached_tokens_in", 0))
             tout = int(result.get("tokens_out", 0))
             self.total_in += tin + cached_in
+            self.total_cached_in += cached_in
             self.total_out += tout
             self.turns += int(result.get("turns", 0))
             # Hold this turn's citations for the moved-on heuristic.
@@ -273,13 +284,14 @@ class Repl:
                     "`/plan <task>` to start one[/dim]"
                 )
         elif cmd == "/cost":
+            uncached = self.total_in - self.total_cached_in
             console.print(
                 Text.assemble(
                     ("  session: ", "dim"),
                     (f"{self.turns} turns", ""),
                     ("  ·  ", "dim"),
                     (
-                        f"{self.total_in:,} in / "
+                        f"{uncached:,}+{self.total_cached_in:,} in / "
                         f"{self.total_out:,} out",
                         "",
                     ),
@@ -349,6 +361,29 @@ class Repl:
         self.session_id = new_id()
         console.print(
             f"  [dim]switched to {model} — fresh conversation[/dim]"
+        )
+
+    # ---- persistent status line ----------------------------------------
+
+    def _print_status_line(self) -> None:
+        """One dim line printed before every prompt so cost/tokens
+        are always visible. Format mirrors the end-of-turn summary
+        (``uncached+cached in / out · $cost``) for consistency —
+        but represents cumulative SESSION totals here, not per-run."""
+        uncached = self.total_in - self.total_cached_in
+        console.print(
+            Text.assemble(
+                ("  ", ""),
+                (f"{self.turns} turns", "dim"),
+                ("  ·  ", "dim"),
+                (
+                    f"{uncached:,}+{self.total_cached_in:,} in / "
+                    f"{self.total_out:,} out",
+                    "dim",
+                ),
+                ("  ·  ", "dim"),
+                (f"${self.total_cost:.4f}", "dim green"),
+            )
         )
 
     # ---- automatic compaction ------------------------------------------
