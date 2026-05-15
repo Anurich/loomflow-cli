@@ -4,12 +4,15 @@ version = "0.1.0"
 description = "loom-code — a loomflow-native terminal coding agent"
 requires-python = ">=3.11"
 dependencies = [
-    # [litellm] extra pulls in LiteLLM so model strings prefixed
-    # with `ollama/`, `litellm/`, `together_ai/`, `groq/`, etc.
-    # route through loomflow's LiteLLMModel adapter automatically.
-    # The 0.10.5 floor is required for the sub-agent cost rollup
-    # in Team.supervisor — older versions silently under-counted.
-    "loomflow[litellm]>=0.10.5",
+    # [litellm] pulls in LiteLLM so model strings prefixed with
+    # `ollama/`, `litellm/`, `together_ai/`, `groq/`, etc. route
+    # through loomflow's LiteLLMModel adapter automatically.
+    # [web] pulls in httpx + duckduckgo-search for the web_tool
+    # backends — /set_web wires them at runtime, but the deps need
+    # to be installed up front. 0.10.7 floor: web_tool first shipped
+    # in that release; 0.10.5 had the Team.supervisor sub-agent
+    # cost-rollup fix loom-code also relies on.
+    "loomflow[litellm,web]>=0.10.7",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

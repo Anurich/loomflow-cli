@@ -179,6 +179,24 @@ in your report.
   report, so make it accurate.
 """
 
+_CODER_WEB_HINT = """\
+
+## When to reach for `web_search`
+
+You have `web_search(query=...)` for what the local codebase can't
+answer: external library APIs you're about to call, error messages
+from third-party tools, recent best practices, anything time-
+sensitive that your training cutoff wouldn't cover.
+
+- Keyword queries — `"asyncpg copy_records_to_table batch size"`,
+  not "what is the batch size for asyncpg's copy_records_to_table".
+- Read the project's own code FIRST. `web_search` answers questions
+  the repo can't — it's not a shortcut around `grep`/`read`.
+- One or two focused queries beat five generic ones. The tool
+  returns a markdown list (title + URL + snippet); cite the URL in
+  your report if you acted on what you found.
+"""
+
 _GIT_HINT = """\
 
 ## This is a git repository
@@ -240,8 +258,17 @@ def build_coordinator_instructions(project: Project) -> str:
     return _COORDINATOR + _project_context_block(project)
 
 
-def build_coder_prompt(project: Project) -> str:
+def build_coder_prompt(project: Project, *, has_web: bool = False) -> str:
     """The system prompt for the ``coder`` worker — the doer. Same
     project-context block as the coordinator so it codes to the
-    house rules."""
-    return _CODER + _project_context_block(project)
+    house rules.
+
+    ``has_web``: when True, append a section telling the model it
+    has ``web_search`` and when to use it. Promising a tool the
+    agent doesn't actually have wastes turns on failed tool calls,
+    so this is opt-in and matches the REPL's /set_web state."""
+    parts = [_CODER]
+    if has_web:
+        parts.append(_CODER_WEB_HINT)
+    parts.append(_project_context_block(project))
+    return "".join(parts)

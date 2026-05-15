@@ -46,6 +46,8 @@ Slash commands (handled here, never sent to the agent):
 
 from __future__ import annotations
 
+import os
+
 from loomflow import new_id
 from prompt_toolkit import HTML, PromptSession
 from prompt_toolkit.completion import (
@@ -59,7 +61,10 @@ from rich.text import Text
 from .agent import build_agent
 from .approval import ApprovalGate
 from .compact import Compactor, default_compact_threshold
-from .credentials import ensure_key_for_model
+from .credentials import (
+    ensure_key_for_model,
+    save_credential,
+)
 from .paste import (
     build_paste_keybindings,
     expand_pastes,
@@ -68,6 +73,11 @@ from .paste import (
 from .project import Project
 from .render import StreamRenderer, banner, console
 
+# Provider defaults for /set_model — picking a provider switches
+# to that provider's commonly-used model.
+_OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
+_ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
+
 _SLASH_HELP = """\
 [bold]loom-code commands[/bold]
   [cyan]/help[/cyan]            this list
@@ -75,7 +85,9 @@ _SLASH_HELP = """\
   [cyan]/cost[/cyan]            session cost + token totals
   [cyan]/good[/cyan]            mark the last turn useful (credits notes)
   [cyan]/bad[/cyan]             mark the last turn unhelpful
-  [cyan]/model[/cyan] <name>    switch model (rebuilds the agent)
+  [cyan]/model[/cyan] <name>    switch to a specific model by name
+  [cyan]/set_model[/cyan]       pick OpenAI / Anthropic + save API key
+  [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
   [cyan]/clear[/cyan]           fresh conversation (new session)
   [cyan]/compress_token_length[/cyan] [N|auto|off]
                    show / set / disable the auto-compact threshold
@@ -100,7 +112,9 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/cost", "session cost + token totals"),
     ("/good", "mark the last turn useful (credit notes)"),
     ("/bad", "mark the last turn unhelpful"),
-    ("/model", "switch model (rebuilds the agent)"),
+    ("/model", "switch to a specific model by name"),
+    ("/set_model", "pick OpenAI or Anthropic + save API key"),
+    ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/clear", "fresh conversation (new session)"),
     (
         "/compress_token_length",
@@ -172,6 +186,11 @@ class Repl:
         self._compact_threshold = -1  # auto
         self._compact_tokens = 0
         self._compact_exchanges: list[tuple[str, str]] = []
+        # Web-search backend: ``"serper"``, ``"duckduckgo"``, or
+        # ``None`` (off — default). Toggled via /set_web. Rebuilding
+        # the agent picks the new backend up by adding (or not
+        # adding) a ``web_tool`` to coder + explorer.
+        self._web_backend: str | None = None
         # prompt_toolkit drives the input line. complete_while_typing
         # opens the autocomplete menu the moment the user types '/'
         # without any extra keystroke (Tab also still works for
@@ -194,8 +213,21 @@ class Repl:
                 f"  [dim]loaded context: "
                 f"{self.project.context_file.name}[/dim]"
             )
+        # Brief getting-started hints right after the banner. Surfaces
+        # /set_model and /set_web so new users discover provider +
+        # web-search setup without reading docs; /help reveals the
+        # full menu for anyone curious.
         console.print(
-            "  [dim]type a task, or /help for commands[/dim]\n"
+            "  [dim]▸ type a task, or [cyan]/help[/cyan] "
+            "for the command menu[/dim]"
+        )
+        console.print(
+            "  [dim]▸ [cyan]/set_model[/cyan]  pick "
+            "OpenAI or Anthropic and save your API key[/dim]"
+        )
+        console.print(
+            "  [dim]▸ [cyan]/set_web[/cyan]    enable web "
+            "search (Serper / DuckDuckGo)[/dim]\n"
         )
 
         while True:
@@ -442,6 +474,10 @@ class Repl:
             )
         elif cmd == "/compress_token_length":
             self._handle_compress_command(arg)
+        elif cmd == "/set_model":
+            await self._handle_set_model()
+        elif cmd == "/set_web":
+            await self._handle_set_web()
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -467,18 +503,27 @@ class Repl:
             )
             return
         self.model = model
-        self.agent, self.workspace = build_agent(
-            self.project,
-            model=model,
-            approval_handler=self._gate.handler,
-        )
-        self._compactor = Compactor(model=model)
-        self._compact_tokens = 0
-        self._compact_exchanges.clear()
-        self.session_id = new_id()
+        self._rebuild_agent()
         console.print(
             f"  [dim]switched to {model} — fresh conversation[/dim]"
         )
+
+    def _rebuild_agent(self) -> None:
+        """Reconstruct the supervisor + workers using the current
+        ``self.model`` and ``self._web_backend``. Used by both
+        ``/model`` (changes the model) and ``/set_web`` (changes
+        the web backend) — same rebuild semantics, single source
+        of truth for what a "rebuild" entails."""
+        self.agent, self.workspace = build_agent(
+            self.project,
+            model=self.model,
+            approval_handler=self._gate.handler,
+            web_backend=self._web_backend,
+        )
+        self._compactor = Compactor(model=self.model)
+        self._compact_tokens = 0
+        self._compact_exchanges.clear()
+        self.session_id = new_id()
 
     # ---- persistent status line ----------------------------------------
 
@@ -624,6 +669,161 @@ class Repl:
         self._compact_threshold = n
         console.print(
             f"  [dim]threshold set to {n:,} tokens[/dim]"
+        )
+
+    # ---- /set_model + /set_web (interactive provider setup) ----------
+
+    async def _prompt_line(self, message: str) -> str | None:
+        """Read one line from the user via the existing
+        PromptSession — same autocomplete/history behavior, no
+        thread hop. Returns ``None`` on EOF / Ctrl-C so callers
+        can treat the cancel path uniformly."""
+        try:
+            return (
+                await self._prompt_session.prompt_async(message)
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    async def _prompt_secret(self, message: str) -> str | None:
+        """Same as ``_prompt_line`` but hides the input —
+        ``is_password=True`` makes prompt_toolkit redact keystrokes
+        (no terminal echo, no shell history)."""
+        try:
+            return (
+                await self._prompt_session.prompt_async(
+                    message, is_password=True
+                )
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    async def _handle_set_model(self) -> None:
+        """``/set_model`` — pick OpenAI / Anthropic, prompt for the
+        API key if not already set, save it to credentials, switch
+        to that provider's default model. Convenient for the
+        "first run on a new machine" flow."""
+        console.print()
+        console.print("  [bold]Pick a model provider:[/bold]")
+        console.print(
+            "    [cyan]1[/cyan]. OpenAI     "
+            "(gpt-4.1-mini, gpt-4.1, ...)"
+        )
+        console.print(
+            "    [cyan]2[/cyan]. Anthropic  "
+            "(claude-sonnet-4-6, claude-opus-4-7, ...)"
+        )
+        choice = await self._prompt_line("  Enter 1 or 2: ")
+        if choice is None:
+            console.print("  [dim]cancelled[/dim]")
+            return
+        if choice == "1":
+            env_name = "OPENAI_API_KEY"
+            target_model = _OPENAI_DEFAULT_MODEL
+            label = "OpenAI"
+        elif choice == "2":
+            env_name = "ANTHROPIC_API_KEY"
+            target_model = _ANTHROPIC_DEFAULT_MODEL
+            label = "Anthropic"
+        else:
+            console.print(
+                f"  [yellow]invalid choice {choice!r} — "
+                "enter 1 or 2[/yellow]"
+            )
+            return
+
+        if not os.environ.get(env_name):
+            console.print(
+                f"  [dim]No {env_name} set yet — paste one to "
+                f"save it for future sessions too.[/dim]"
+            )
+            key = await self._prompt_secret(
+                f"  Paste your {env_name}: "
+            )
+            if not key:
+                console.print(
+                    "  [yellow]no key entered — aborting[/yellow]"
+                )
+                return
+            save_credential(env_name, key)
+            os.environ[env_name] = key
+            console.print(
+                f"  [green]✓[/green] saved {env_name} "
+                "(future sessions pick it up automatically)"
+            )
+        else:
+            console.print(
+                f"  [dim]{env_name} already set — using it[/dim]"
+            )
+        console.print(
+            f"  [dim]switching to {label}'s default model "
+            f"({target_model})[/dim]"
+        )
+        self._switch_model(target_model)
+
+    async def _handle_set_web(self) -> None:
+        """``/set_web`` — pick a web-search backend (or disable).
+        Serper prompts for the API key on first use; DuckDuckGo
+        needs nothing. Rebuilds the agent so the new tool wiring
+        takes effect on the next turn."""
+        console.print()
+        console.print("  [bold]Web search backend:[/bold]")
+        console.print(
+            "    [cyan]1[/cyan]. Serper      "
+            "(Google, best quality, needs API key)"
+        )
+        console.print(
+            "    [cyan]2[/cyan]. DuckDuckGo  "
+            "(free, no key, lower quality)"
+        )
+        console.print(
+            "    [cyan]3[/cyan]. Off         (disable web search)"
+        )
+        choice = await self._prompt_line("  Enter 1, 2, or 3: ")
+        if choice is None:
+            console.print("  [dim]cancelled[/dim]")
+            return
+
+        if choice == "1":
+            # Serper needs SERPER_API_KEY. Prompt if missing,
+            # save it so future sessions pick it up.
+            if not os.environ.get("SERPER_API_KEY"):
+                console.print(
+                    "  [dim]Get a key at "
+                    "https://serper.dev "
+                    "(2,500 lifetime free searches).[/dim]"
+                )
+                key = await self._prompt_secret(
+                    "  Paste your SERPER_API_KEY: "
+                )
+                if not key:
+                    console.print(
+                        "  [yellow]no key entered — "
+                        "aborting[/yellow]"
+                    )
+                    return
+                save_credential("SERPER_API_KEY", key)
+                os.environ["SERPER_API_KEY"] = key
+                console.print(
+                    "  [green]✓[/green] saved SERPER_API_KEY"
+                )
+            self._web_backend = "serper"
+        elif choice == "2":
+            self._web_backend = "duckduckgo"
+        elif choice == "3":
+            self._web_backend = None
+        else:
+            console.print(
+                f"  [yellow]invalid choice {choice!r} — "
+                "enter 1, 2, or 3[/yellow]"
+            )
+            return
+
+        self._rebuild_agent()
+        state = self._web_backend or "off"
+        console.print(
+            f"  [dim]web search: {state} — "
+            "fresh conversation[/dim]"
         )
 
 

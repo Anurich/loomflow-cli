@@ -89,6 +89,28 @@ Be exhaustive on facts, terse on prose — wasted words cost the
 lead context.
 """
 
+# Appended onto _EXPLORER_PROMPT only when the explorer was built
+# with a web_tool — promising a tool the agent doesn't have wastes
+# turns on failed tool calls.
+_EXPLORER_WEB_HINT = """\
+
+You also have `web_search(query=...)` for investigation that goes
+*outside* the codebase — an upstream library's documented
+behaviour, an external API's contract, a CVE / errata page, the
+known cause of a third-party error message. Use it AFTER you've
+read the relevant project code, not instead. Keyword queries beat
+sentences. Cite the source URL in your finding note so the lead
+can verify it.
+"""
+
+
+def _explorer_prompt(has_web: bool) -> str:
+    """The explorer's system prompt. Web-search hint is opt-in so
+    the agent isn't told about a tool it doesn't have."""
+    if has_web:
+        return _EXPLORER_PROMPT + _EXPLORER_WEB_HINT
+    return _EXPLORER_PROMPT
+
 _AUDITOR_PROMPT = """\
 You are the AUDITOR on a loom-code team — a read-only inspector.
 A tech lead delegates a focus area and a lens (security,
@@ -170,13 +192,17 @@ def _build_coder(
     *,
     model: str,
     approval_handler: Callable[..., Awaitable[bool]] | None,
+    has_web: bool = False,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
-    (write / edit / bash) through the shared approval handler."""
+    (write / edit / bash) through the shared approval handler.
+    ``has_web`` toggles the `web_search` section in the prompt —
+    keep this in lockstep with whether ``build_workers`` actually
+    attaches the tool, else the prompt lies."""
     root = project.root
     return Agent(
-        build_coder_prompt(project),
+        build_coder_prompt(project, has_web=has_web),
         model=model,
         architecture=ReAct(),
         tools=[
@@ -195,11 +221,14 @@ def _build_coder(
     )
 
 
-def _build_explorer(project: Project, *, model: str) -> Agent:
+def _build_explorer(
+    project: Project, *, model: str, has_web: bool = False
+) -> Agent:
     """Read-only investigator — no permissions needed (none of its
-    tools are destructive)."""
+    tools are destructive). ``has_web`` toggles the `web_search`
+    section in the prompt — must match ``build_workers``' wiring."""
     return Agent(
-        _EXPLORER_PROMPT,
+        _explorer_prompt(has_web),
         model=model,
         architecture=ReAct(),
         tools=_read_only_tools(project),
@@ -249,6 +278,7 @@ def build_workers(
     *,
     model: str,
     approval_handler: Callable[..., Awaitable[bool]] | None = None,
+    web_backend: str | None = None,
 ) -> dict[str, Agent]:
     """Build the worker roster for ``Team.supervisor``.
 
@@ -261,14 +291,42 @@ def build_workers(
     Only ``coder`` and ``reviewer`` get a permissions policy +
     approval handler (they hold destructive tools); ``explorer``
     and ``auditor`` are purely read-only.
+
+    ``web_backend``: ``"serper"`` or ``"duckduckgo"`` to enable
+    ``loomflow.tools.web_tool`` on ``coder`` + ``explorer``. The
+    coder needs it to look up library APIs while implementing;
+    the explorer for investigation that goes beyond the codebase.
+    Auditor + reviewer stay read-only-and-local (no web access)
+    — keeps their cost predictable and their scope honest.
+    ``None`` (default) leaves web search off entirely.
     """
-    return {
+    has_web = web_backend is not None
+    workers: dict[str, Agent] = {
         "coder": _build_coder(
-            project, model=model, approval_handler=approval_handler
+            project,
+            model=model,
+            approval_handler=approval_handler,
+            has_web=has_web,
         ),
-        "explorer": _build_explorer(project, model=model),
+        "explorer": _build_explorer(
+            project, model=model, has_web=has_web
+        ),
         "auditor": _build_auditor(project, model=model),
         "reviewer": _build_reviewer(
             project, model=model, approval_handler=approval_handler
         ),
     }
+    if has_web:
+        # One shared web_tool instance — same Tool object on both
+        # workers. Cheap; nothing in the tool's lifecycle is per-
+        # worker. If the backend is misconfigured (e.g. serper
+        # without a key) ``web_tool`` raises ConfigError here; the
+        # caller (REPL's /set_web) is expected to validate first.
+        # ``has_web=True`` was already threaded into the prompts —
+        # the model knows the tool exists; here we actually attach
+        # it.
+        from loomflow.tools import web_tool
+        web = web_tool(backend=web_backend)  # type: ignore[arg-type]
+        workers["coder"].add_tool(web)
+        workers["explorer"].add_tool(web)
+    return workers

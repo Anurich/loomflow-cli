@@ -40,6 +40,7 @@ def build_agent(
     model: str = DEFAULT_MODEL,
     approval_handler: Callable[..., Awaitable[bool]] | None = None,
     max_turns: int = 100,
+    web_backend: str | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -84,7 +85,10 @@ def build_agent(
     memory_url = f"sqlite:{loom_dir / 'memory.db'}"
 
     workers = build_workers(
-        project, model=model, approval_handler=approval_handler
+        project,
+        model=model,
+        approval_handler=approval_handler,
+        web_backend=web_backend,
     )
 
     coordinator = Team.supervisor(
