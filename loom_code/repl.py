@@ -241,19 +241,44 @@ class Repl:
         """Stream one agent run for ``prompt``, reusing the
         session so conversation history carries forward."""
         renderer = StreamRenderer()
+        # "thinking..." spinner — runs from the moment the user
+        # hits enter until the first user-visible event from the
+        # agent. ``started`` is internal framing (the agent always
+        # emits it first and nothing renders); drop the spinner on
+        # the FIRST non-started event instead so the user has
+        # feedback even on tasks that take a beat before tool
+        # calls / text start arriving.
+        status = console.status(
+            "[dim]thinking...[/dim]", spinner="dots"
+        )
+        status.start()
+        spinner_dropped = False
+
+        def _drop_spinner() -> None:
+            nonlocal spinner_dropped
+            if not spinner_dropped:
+                status.stop()
+                spinner_dropped = True
+
         try:
             async for event in self.agent.stream(
                 prompt,
                 user_id=_USER_ID,
                 session_id=self.session_id,
             ):
+                if str(event.kind) != "started":
+                    _drop_spinner()
                 renderer.handle(event)
         except KeyboardInterrupt:
+            _drop_spinner()
             console.print("\n[yellow]interrupted — turn abandoned[/yellow]")
             return
         except Exception as exc:  # noqa: BLE001 — REPL must survive
+            _drop_spinner()
             console.print(f"\n[bold red]error: {exc}[/bold red]")
             return
+        finally:
+            _drop_spinner()
 
         if renderer.last_plan:
             self.last_plan = renderer.last_plan

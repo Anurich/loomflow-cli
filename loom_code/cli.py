@@ -64,15 +64,37 @@ async def _run_once(prompt: str, model: str, yes: bool) -> int:
         project, model=model, approval_handler=handler
     )
     renderer = StreamRenderer()
+    # "thinking..." spinner until the first user-visible event —
+    # same pattern as the REPL so one-shot mode has the same
+    # responsiveness feedback. ``started`` is internal framing;
+    # the spinner drops on the first non-started event.
+    status = console.status(
+        "[dim]thinking...[/dim]", spinner="dots"
+    )
+    status.start()
+    spinner_dropped = False
+
+    def _drop_spinner() -> None:
+        nonlocal spinner_dropped
+        if not spinner_dropped:
+            status.stop()
+            spinner_dropped = True
+
     try:
         async for event in agent.stream(prompt, user_id="loom-code"):
+            if str(event.kind) != "started":
+                _drop_spinner()
             renderer.handle(event)
     except KeyboardInterrupt:
+        _drop_spinner()
         console.print("\n[yellow]interrupted[/yellow]")
         return 130
     except Exception as exc:  # noqa: BLE001 — top-level guard
+        _drop_spinner()
         console.print(f"\n[bold red]fatal: {exc}[/bold red]")
         return 1
+    finally:
+        _drop_spinner()
 
     # Self-improvement loop: a clean one-shot completion is treated
     # as success — credit the notes the agent read so future runs
@@ -135,7 +157,28 @@ def _git_changes(project: Project) -> list[str]:
 def _print_run_summary(
     project: Project, renderer: StreamRenderer
 ) -> None:
-    """Append a structured summary after the cost line."""
+    """Append a structured summary after the agent finishes —
+    cost line (one-shot owns this since there's no REPL pre-prompt
+    status to show it), then files changed / verified / notes."""
+    result = renderer.last_result or {}
+    turns = result.get("turns", 0)
+    cost = float(result.get("cost_usd", 0.0))
+    tin = int(result.get("tokens_in", 0))
+    cached = int(result.get("cached_tokens_in", 0))
+    tout = int(result.get("tokens_out", 0))
+    if turns or cost or tin or tout:
+        from rich.text import Text  # local — keeps cli.py top tidy
+        console.print(
+            Text.assemble(
+                ("  ", ""),
+                (f"{turns} turns", "dim"),
+                ("  ·  ", "dim"),
+                (f"{tin:,}+{cached:,} in / {tout:,} out", "dim"),
+                ("  ·  ", "dim"),
+                (f"${cost:.4f}", "dim green"),
+            )
+        )
+
     if project.is_git:
         changes = _git_changes(project)
         if changes:

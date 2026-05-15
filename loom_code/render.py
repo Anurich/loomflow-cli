@@ -219,23 +219,12 @@ class StreamRenderer:
         if output and not self._any_text:
             console.print()
             console.print(output, markup=False, highlight=False)
-        turns = result.get("turns", "?")
-        cost = result.get("cost_usd", 0.0)
-        tin = result.get("tokens_in", 0)
-        cached = result.get("cached_tokens_in", 0)
-        tout = result.get("tokens_out", 0)
+        # Visual separator between turns. The cost / token numbers
+        # used to print here too — they're now owned by the REPL's
+        # pre-prompt status line (cumulative) and the CLI's one-
+        # shot run summary, so we don't duplicate them here.
         console.print()
         console.rule(style="dim")
-        console.print(
-            Text.assemble(
-                ("  ", ""),
-                (f"{turns} turns", "dim"),
-                ("  ·  ", "dim"),
-                (f"{tin:,}+{cached:,} in / {tout:,} out", "dim"),
-                ("  ·  ", "dim"),
-                (f"${cost:.4f}", "dim green"),
-            )
-        )
 
 
 def _summarise_args(args: dict[str, Any]) -> str:
