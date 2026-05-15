@@ -52,9 +52,12 @@ from .prompts import build_coder_prompt
 
 # The coder does real, multi-step work — it gets a generous turn
 # budget. Read-only specialists answer a scoped question and exit,
-# so they're capped tighter.
+# so they're capped tighter; the reviewer sits in the middle
+# because running a test suite + iterating on failures legitimately
+# takes more turns than answering one question.
 _CODER_MAX_TURNS = 60
-_SPECIALIST_MAX_TURNS = 30
+_SPECIALIST_MAX_TURNS = 20  # explorer + auditor — one scoped question
+_REVIEWER_MAX_TURNS = 30  # tests can iterate
 
 _EXPLORER_PROMPT = """\
 You are the EXPLORER on a loom-code team — a read-only
@@ -224,7 +227,7 @@ def _build_reviewer(
         permissions=StandardPermissions(),
         approval_handler=approval_handler,
         prompt_caching=True,
-        max_turns=_SPECIALIST_MAX_TURNS,
+        max_turns=_REVIEWER_MAX_TURNS,
     )
 
 
