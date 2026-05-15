@@ -70,6 +70,24 @@ loom-code "add a retry decorator to the http client"
 loom-code
 ```
 
+Works on **existing code** (fix a bug, add a feature, refactor)
+and on **brand-new projects from an empty directory**:
+
+```bash
+mkdir ~/my-new-app && cd ~/my-new-app
+loom-code "scaffold a FastAPI backend with a /users endpoint and SQLite"
+# or
+loom-code "create a Vite + React + Tailwind app with a login screen"
+# or
+loom-code "create a loomflow Agent that summarises markdown files"
+```
+
+Scaffolding involves a lot of `write` and `bash` calls. The
+approval gate asks once per call by default — pick `a` on the
+first prompt to allow the whole session through. For unattended
+runs on a disposable tree, `loom-code --yes "task"` skips the
+gate entirely.
+
 The REPL ships with slash commands — type `/` and the menu pops
 with everything available (`/help`, `/plan`, `/cost`, `/good`,
 `/bad`, `/model`, `/clear`, `/compress_token_length`, `/exit`).

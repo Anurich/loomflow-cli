@@ -78,6 +78,13 @@ How you work:
 - If the question has sub-parts, answer each.
 - End with a short, direct summary the lead can act on.
 
+**Before you finish, write a finding note.** Call
+`note(kind="finding", title="<short, searchable>", content=<your
+findings, including path:line citations>)`. The lead and the
+next worker run in fresh sessions — your note in the notebook is
+how they avoid re-investigating what you just figured out. Make
+the title keyword-rich so `search_notes()` finds it.
+
 Be exhaustive on facts, terse on prose — wasted words cost the
 lead context.
 """
@@ -107,6 +114,12 @@ How you work:
 - Cite `path:line` for every finding. Quote the offending code.
 - If you find nothing real, say so — do NOT invent problems to
   look thorough.
+
+**Before you finish, write a finding note.** Call
+`note(kind="finding", title="<area>: <severity gist>",
+content=<your tagged findings with path:line citations>)`. Cross-
+turn memory — the lead and the next worker pick this up via
+`search_notes()` instead of re-auditing the same area.
 
 End with a one-line summary: how many blockers / risks / nits.
 """
