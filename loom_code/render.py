@@ -12,6 +12,7 @@ slightly-uglier line instead of a crash.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from rich.console import Console
@@ -26,6 +27,27 @@ _VERBOSE_RESULT_TOOLS = {"read", "grep", "ls", "find"}
 _RESULT_PREVIEW_CHARS = 600
 
 
+def _status_label_for(tool: str, args: dict[str, Any]) -> str:
+    """Pick a human spinner label for an in-flight tool call.
+
+    delegate gets the worker name (loom-code's main workflow shape
+    so it's worth a custom label); bash gets a short clip of the
+    actual command; web_search shows the query; everything else
+    falls back to ``running <tool>...``."""
+    if tool == "delegate":
+        target = str(args.get("target") or args.get("agent") or "?")
+        return f"delegating to {target}..."
+    if tool == "bash":
+        cmd = str(args.get("command") or "").strip().splitlines()[0:1]
+        first = cmd[0] if cmd else ""
+        clip = first[:40] + ("…" if len(first) > 40 else "")
+        return f"running: {clip}" if clip else "running bash..."
+    if tool == "web_search":
+        q = str(args.get("query") or "").strip()
+        return f"searching: {q[:40]}..." if q else "searching the web..."
+    return f"running {tool}..."
+
+
 class StreamRenderer:
     """Stateful renderer for one ``Agent.stream`` run.
 
@@ -36,7 +58,19 @@ class StreamRenderer:
     re-parsing the stream.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        set_status: Callable[[str], None] | None = None,
+        pause_status: Callable[[], None] | None = None,
+    ) -> None:
+        """``set_status(label)`` / ``pause_status()`` are optional
+        callbacks the REPL wires to a Rich ``console.status``
+        spinner. The renderer pauses the spinner while assistant
+        prose is streaming (it would corrupt the same line) and
+        sets a new label on each tool boundary so the user has
+        something to read between events. Both default to no-op so
+        non-REPL callers (one-shot CLI) keep working unchanged."""
         self._in_text = False
         # Whether ANY assistant prose has been shown this run — drives
         # the _on_completed fallback (print result["output"] only if
@@ -47,6 +81,14 @@ class StreamRenderer:
         # tool NAME is only on the `tool_call` event. We bridge the
         # two so result rendering can tell which tool ran.
         self._call_names: dict[str, str] = {}
+        # Spinner callbacks (see __init__ docstring). Default to
+        # no-ops so all the event handlers can call them unconditionally.
+        self._set_status: Callable[[str], None] = (
+            set_status if set_status is not None else (lambda _t: None)
+        )
+        self._pause_status: Callable[[], None] = (
+            pause_status if pause_status is not None else (lambda: None)
+        )
         # REPL-readable after the stream drains:
         self.last_plan: str | None = None
         self.last_result: dict[str, Any] | None = None
@@ -81,6 +123,11 @@ class StreamRenderer:
         if not text:
             return
         if not self._in_text:
+            # The spinner shares the cursor's current line — writing
+            # streaming text on top of it corrupts both. Pause it
+            # for the duration of this prose burst; ``_end_text``
+            # resumes it.
+            self._pause_status()
             console.print()  # blank line before a fresh assistant turn
             self._in_text = True
         self._any_text = True
@@ -90,6 +137,10 @@ class StreamRenderer:
         if self._in_text:
             console.print()
             self._in_text = False
+            # Prose burst over — bring the spinner back; the next
+            # tool_call will overwrite this label with something
+            # more specific.
+            self._set_status("thinking...")
 
     # ---- tools ----------------------------------------------------------
 
@@ -122,8 +173,17 @@ class StreamRenderer:
                 (f"  {arg_str}", "dim"),
             )
         )
+        # Update the spinner label so the user has something to
+        # read while this tool runs. delegate is loom-code's
+        # workhorse — name the worker; bash gets a clipped command;
+        # everything else just shows the tool name.
+        self._set_status(_status_label_for(tool, args))
 
     def _on_tool_result(self, payload: dict[str, Any]) -> None:
+        # Tool came back — model is now picking the next move.
+        # Reset to the generic label until the next tool_call (or
+        # text stream) overrides it.
+        self._set_status("thinking...")
         result = payload.get("result") or {}
         # ToolResult has no `tool` field — only `call_id`. Resolve
         # the tool name via the id->name map built from tool_call

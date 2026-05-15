@@ -288,26 +288,44 @@ class Repl:
 
     async def _turn(self, prompt: str) -> None:
         """Stream one agent run for ``prompt``, reusing the
-        session so conversation history carries forward."""
-        renderer = StreamRenderer()
-        # "thinking..." spinner — runs from the moment the user
-        # hits enter until the first user-visible event from the
-        # agent. ``started`` is internal framing (the agent always
-        # emits it first and nothing renders); drop the spinner on
-        # the FIRST non-started event instead so the user has
-        # feedback even on tasks that take a beat before tool
-        # calls / text start arriving.
+        session so conversation history carries forward.
+
+        Spinner UX: Rich's ``console.status`` runs continuously for
+        the whole turn. The renderer drives its label via two
+        callbacks — ``set_status(label)`` updates the text,
+        ``pause_status()`` stops it (used while assistant prose is
+        streaming, since the spinner shares the cursor line). Labels
+        come from the in-flight event: "delegating to coder...",
+        "running: pytest -q", "searching: openpyxl write_only", or
+        a generic "thinking..." between events. The point is to
+        avoid the long blank stretches the old "drop on first event"
+        scheme produced in Supervisor mode."""
         status = console.status(
             "[dim]thinking...[/dim]", spinner="dots"
         )
         status.start()
-        spinner_dropped = False
+        status_running = True
 
-        def _drop_spinner() -> None:
-            nonlocal spinner_dropped
-            if not spinner_dropped:
+        def set_status(label: str) -> None:
+            """Update the spinner label, restarting it if it was
+            paused for a prose burst."""
+            nonlocal status_running
+            if not status_running:
+                status.start()
+                status_running = True
+            status.update(f"[dim]{label}[/dim]")
+
+        def pause_status() -> None:
+            """Stop the spinner so streamed text can use the cursor
+            line cleanly. ``set_status`` restarts it later."""
+            nonlocal status_running
+            if status_running:
                 status.stop()
-                spinner_dropped = True
+                status_running = False
+
+        renderer = StreamRenderer(
+            set_status=set_status, pause_status=pause_status
+        )
 
         try:
             async for event in self.agent.stream(
@@ -315,19 +333,17 @@ class Repl:
                 user_id=_USER_ID,
                 session_id=self.session_id,
             ):
-                if str(event.kind) != "started":
-                    _drop_spinner()
                 renderer.handle(event)
         except KeyboardInterrupt:
-            _drop_spinner()
+            pause_status()
             console.print("\n[yellow]interrupted — turn abandoned[/yellow]")
             return
         except Exception as exc:  # noqa: BLE001 — REPL must survive
-            _drop_spinner()
+            pause_status()
             console.print(f"\n[bold red]error: {exc}[/bold red]")
             return
         finally:
-            _drop_spinner()
+            pause_status()
 
         if renderer.last_plan:
             self.last_plan = renderer.last_plan
@@ -674,13 +690,22 @@ class Repl:
     # ---- /set_model + /set_web (interactive provider setup) ----------
 
     async def _prompt_line(self, message: str) -> str | None:
-        """Read one line from the user via the existing
-        PromptSession — same autocomplete/history behavior, no
-        thread hop. Returns ``None`` on EOF / Ctrl-C so callers
-        can treat the cancel path uniformly."""
+        """Read one line from the user with a fresh PromptSession.
+
+        We deliberately do NOT reuse ``self._prompt_session`` here.
+        prompt_toolkit's PromptSession holds state on its instance
+        (``is_password``, completers, key bindings) and even though
+        ``prompt_async`` is supposed to save/restore per-call,
+        empirically the redact-mode leaked into the next main-loop
+        prompt after the secret prompt returned. A throwaway
+        session per inline question keeps the main REPL's session
+        pristine.
+
+        Returns ``None`` on EOF / Ctrl-C so callers can treat the
+        cancel path uniformly."""
         try:
             return (
-                await self._prompt_session.prompt_async(message)
+                await PromptSession().prompt_async(message)
             ).strip()
         except (EOFError, KeyboardInterrupt):
             return None
@@ -688,10 +713,13 @@ class Repl:
     async def _prompt_secret(self, message: str) -> str | None:
         """Same as ``_prompt_line`` but hides the input —
         ``is_password=True`` makes prompt_toolkit redact keystrokes
-        (no terminal echo, no shell history)."""
+        (no terminal echo, no shell history). Same fresh-session
+        rationale as ``_prompt_line`` — and ESPECIALLY important
+        here, because this is the prompt whose state was leaking
+        back into the main REPL."""
         try:
             return (
-                await self._prompt_session.prompt_async(
+                await PromptSession().prompt_async(
                     message, is_password=True
                 )
             ).strip()
