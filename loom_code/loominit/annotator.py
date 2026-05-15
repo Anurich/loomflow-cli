@@ -33,6 +33,7 @@ from typing import Any
 
 import anyio
 from loomflow import Agent
+from loomflow.core import OutputValidationError
 
 from ._prompts import (
     CLUSTER_ANNOTATION_INSTRUCTIONS,
@@ -157,13 +158,28 @@ async def _annotate_project(
         prompt_caching=True,
         output_schema=_ProjectOverviewOutput,
     )
-    result = await project_agent.run(user_msg, user_id="loom-code")
-    parsed = result.parsed
-    if isinstance(parsed, _ProjectOverviewOutput):
+    # Two failure modes to handle:
+    #
+    # 1. ``OutputValidationError`` — loomflow raises this after
+    #    exhausting ``output_validation_retries`` if the model
+    #    keeps returning unparseable JSON (markdown fences,
+    #    prose before/after the JSON, etc.). Was originally
+    #    treated as ``parsed=None`` here — but that branch never
+    #    fires because the exception aborts the run first.
+    #    Without this catch, /loominit crashes on a single
+    #    malformed response.
+    # 2. Other exceptions (network blip, key missing, adapter
+    #    bug) — same fallback. Better to ship a placeholder
+    #    overview than crash a 30-second pipeline.
+    parsed: _ProjectOverviewOutput | None = None
+    try:
+        result = await project_agent.run(user_msg, user_id="loom-code")
+        if isinstance(result.parsed, _ProjectOverviewOutput):
+            parsed = result.parsed
+    except (OutputValidationError, Exception):  # noqa: BLE001
+        parsed = None
+    if parsed is not None:
         return parsed
-    # Defensive fallback — if structured output is silently
-    # disabled by an unfamiliar model backend, ``result.parsed`` is
-    # None. Emit a minimal overview from the metadata we have.
     return _ProjectOverviewOutput(
         overview=(description or f"{project_name} — see source.").strip(),
         tech_stack=[],
@@ -231,11 +247,20 @@ async def _annotate_one_cluster(
         prompt_caching=True,
         output_schema=_ClusterAnnotationOutput,
     )
-    result = await cluster_agent.run(prompt, user_id="loom-code")
-    parsed = result.parsed
-    if isinstance(parsed, _ClusterAnnotationOutput):
+    # Same defensive shape as :func:`_annotate_project`: catch
+    # OutputValidationError + everything else, fall back to a
+    # placeholder annotation rather than aborting the pipeline.
+    # One bad cluster shouldn't kill /loominit for the rest of
+    # the codebase.
+    parsed: _ClusterAnnotationOutput | None = None
+    try:
+        result = await cluster_agent.run(prompt, user_id="loom-code")
+        if isinstance(result.parsed, _ClusterAnnotationOutput):
+            parsed = result.parsed
+    except (OutputValidationError, Exception):  # noqa: BLE001
+        parsed = None
+    if parsed is not None:
         return _filter_hallucinated_citations(parsed, syms_in_cluster)
-    # Fallback — return an empty annotation rather than abort.
     return _ClusterAnnotationOutput(
         narrative="(annotation unavailable)",
         data_flow=[],

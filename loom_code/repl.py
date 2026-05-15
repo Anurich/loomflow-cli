@@ -104,6 +104,26 @@ the conversation continues with that summary as its only history.
 
 _USER_ID = "loom-code"
 
+
+def _flatten_exception_group(
+    eg: BaseExceptionGroup,
+) -> list[BaseException]:
+    """Recursively unwrap nested ``BaseExceptionGroup`` into a flat
+    list of the underlying exceptions.
+
+    anyio task groups raise an ``ExceptionGroup`` whose default
+    ``str()`` is "unhandled errors in a TaskGroup (N sub-exception)"
+    — useless for the user. Flatten to surface what ACTUALLY went
+    wrong (the wrapper might nest more wrappers if multiple groups
+    were involved)."""
+    out: list[BaseException] = []
+    for inner in eg.exceptions:
+        if isinstance(inner, BaseExceptionGroup):
+            out.extend(_flatten_exception_group(inner))
+        else:
+            out.append(inner)
+    return out
+
 # The single source of truth for slash commands the REPL accepts.
 # The autocomplete menu (popped the moment the user types '/')
 # reads off this list, so adding a new command here is enough —
@@ -349,9 +369,26 @@ class Repl:
             pause_status()
             console.print("\n[yellow]interrupted — turn abandoned[/yellow]")
             return
+        except BaseExceptionGroup as eg:
+            # anyio's task groups raise ``ExceptionGroup`` when any
+            # child task fails. The default str() reads
+            # "unhandled errors in a TaskGroup (1 sub-exception)" —
+            # uninformative. Unwrap to surface the REAL cause(s)
+            # so the user can act on them (missing key, model
+            # error, etc.) instead of staring at an opaque wrapper.
+            pause_status()
+            for inner in _flatten_exception_group(eg):
+                console.print(
+                    f"\n[bold red]error: "
+                    f"{type(inner).__name__}: {inner}[/bold red]"
+                )
+            return
         except Exception as exc:  # noqa: BLE001 — REPL must survive
             pause_status()
-            console.print(f"\n[bold red]error: {exc}[/bold red]")
+            console.print(
+                f"\n[bold red]error: "
+                f"{type(exc).__name__}: {exc}[/bold red]"
+            )
             return
         finally:
             pause_status()
