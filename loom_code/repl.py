@@ -53,6 +53,7 @@ from rich.text import Text
 
 from .agent import build_agent
 from .approval import ApprovalGate
+from .compact import Compactor, default_compact_threshold
 from .project import Project
 from .render import StreamRenderer, banner, console
 
@@ -65,11 +66,15 @@ _SLASH_HELP = """\
   [cyan]/bad[/cyan]             mark the last turn unhelpful
   [cyan]/model[/cyan] <name>    switch model (rebuilds the agent)
   [cyan]/clear[/cyan]           fresh conversation (new session)
+  [cyan]/compress_token_length[/cyan] [N|auto|off]
+                   show / set / disable the auto-compact threshold
+                   (default: 80% of the model's context window)
   [cyan]/exit[/cyan]            leave (Ctrl-D also works)
 
 Anything else is a task — loom-code plans, codes, and verifies it.
-Notes the agent reads get credited when a turn goes well, so it
-gets sharper at THIS repo over time.
+Long sessions auto-compact: when cumulative tokens cross the
+threshold, a compactor agent writes a dense summary to memory and
+the conversation continues with that summary as its only history.
 """
 
 _USER_ID = "loom-code"
@@ -99,6 +104,15 @@ class Repl:
         # Self-improvement: cited slugs from the last turn, awaiting
         # a success/failure judgement (the moved-on heuristic).
         self._pending_slugs: list[str] = []
+        # Automatic compaction state. ``_compact_threshold = -1``
+        # means "auto, recompute from model"; ``0`` means "off";
+        # any positive int is an explicit user override. The
+        # exchange list is what the compactor sees on trigger; the
+        # cumulative-tokens counter is what fires the trigger.
+        self._compactor = Compactor(model=model)
+        self._compact_threshold = -1  # auto
+        self._compact_tokens = 0
+        self._compact_exchanges: list[tuple[str, str]] = []
 
     async def run(self) -> int:
         """The REPL loop. Returns an exit code."""
@@ -170,22 +184,36 @@ class Repl:
         if renderer.last_plan:
             self.last_plan = renderer.last_plan
         result = renderer.last_result
+        agent_output = ""
         if result:
             self.total_cost += float(result.get("cost_usd", 0.0))
-            self.total_in += int(result.get("tokens_in", 0))
-            self.total_in += int(result.get("cached_tokens_in", 0))
-            self.total_out += int(result.get("tokens_out", 0))
+            tin = int(result.get("tokens_in", 0))
+            cached_in = int(result.get("cached_tokens_in", 0))
+            tout = int(result.get("tokens_out", 0))
+            self.total_in += tin + cached_in
+            self.total_out += tout
             self.turns += int(result.get("turns", 0))
             # Hold this turn's citations for the moved-on heuristic.
             self._pending_slugs = list(
                 result.get("cited_slugs") or []
             )
+            # Feed the auto-compactor: count tokens toward the
+            # threshold and stash the exchange in case we trigger.
+            self._compact_tokens += tin + cached_in + tout
+            agent_output = str(result.get("output") or "")
+        self._compact_exchanges.append((prompt, agent_output))
+
         if self._pending_slugs:
             console.print(
                 "  [dim]if that worked, just continue — or "
                 "/bad if it didn't[/dim]"
             )
         console.print()
+
+        # Maybe compact. Done AFTER the turn renders + the
+        # pending-slugs hint prints so the user sees the natural
+        # turn boundary before any compaction status appears.
+        await self._maybe_compact()
 
     # ---- self-improvement attribution -----------------------------------
 
@@ -287,10 +315,14 @@ class Repl:
         elif cmd == "/clear":
             self.session_id = new_id()
             self.last_plan = None
+            self._compact_tokens = 0
+            self._compact_exchanges.clear()
             console.print(
                 "  [dim]fresh conversation — prior turns "
                 "forgotten[/dim]"
             )
+        elif cmd == "/compress_token_length":
+            self._handle_compress_command(arg)
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -301,16 +333,145 @@ class Repl:
     def _switch_model(self, model: str) -> None:
         """Rebuild the agent on a new model. Keeps the project +
         approval gate; starts a fresh conversation since the new
-        model has no history of the old one."""
+        model has no history of the old one. The compactor uses
+        the new model too; ``_compact_threshold`` stays as-is so a
+        user override survives a model switch (auto = -1 just
+        recomputes against the new model on the next check)."""
         self.model = model
         self.agent, self.workspace = build_agent(
             self.project,
             model=model,
             approval_handler=self._gate.handler,
         )
+        self._compactor = Compactor(model=model)
+        self._compact_tokens = 0
+        self._compact_exchanges.clear()
         self.session_id = new_id()
         console.print(
             f"  [dim]switched to {model} — fresh conversation[/dim]"
+        )
+
+    # ---- automatic compaction ------------------------------------------
+
+    def _active_threshold(self) -> int:
+        """Resolve the live threshold:
+
+        * positive int  → explicit user override (set via
+          ``/compress_token_length N``)
+        * 0             → user disabled compaction (``... off``)
+        * -1 (sentinel) → recompute from the active model
+        """
+        if self._compact_threshold >= 0:
+            return self._compact_threshold
+        return default_compact_threshold(self.model)
+
+    async def _maybe_compact(self) -> None:
+        """If cumulative tokens have crossed the active threshold,
+        run the compactor, write its summary to the agent's memory
+        as a working block (auto-injected into every subsequent
+        system prompt), and reset the conversation thread."""
+        threshold = self._active_threshold()
+        if threshold == 0:
+            return  # explicitly disabled
+        if self._compact_tokens < threshold:
+            return
+        if not self._compact_exchanges:
+            return
+
+        before_tokens = self._compact_tokens
+        console.print(
+            f"  [dim]compacting {before_tokens:,} tokens of "
+            f"history (threshold {threshold:,})...[/dim]"
+        )
+        try:
+            summary = await self._compactor.compact(
+                self._compact_exchanges
+            )
+        except Exception as exc:  # noqa: BLE001 — never fatal
+            console.print(
+                f"  [yellow]compaction failed: {exc} — continuing "
+                "without it (use /clear if you hit context "
+                "limits)[/yellow]"
+            )
+            return
+
+        if not summary:
+            return
+
+        # Land the summary as a working block. loomflow auto-
+        # injects working blocks into every subsequent system
+        # prompt, so the next turn starts on a fresh session_id
+        # but immediately "remembers" the session via this block.
+        try:
+            await self.agent.memory.update_block(
+                "session_summary", summary, user_id=_USER_ID
+            )
+        except Exception as exc:  # noqa: BLE001 — never fatal
+            console.print(
+                f"  [yellow]could not write summary to memory: "
+                f"{exc}[/yellow]"
+            )
+            return
+
+        self.session_id = new_id()
+        self._compact_tokens = 0
+        self._compact_exchanges.clear()
+        console.print(
+            f"  [dim]compacted into {len(summary)}-char summary "
+            f"in memory; new conversation thread.[/dim]"
+        )
+
+    def _handle_compress_command(self, arg: str) -> None:
+        """Dispatch ``/compress_token_length`` — view, set, auto, off."""
+        arg = arg.strip().lower()
+        if not arg:
+            current = self._active_threshold()
+            mode = (
+                "off (disabled)"
+                if self._compact_threshold == 0
+                else (
+                    f"user-set ({current:,})"
+                    if self._compact_threshold > 0
+                    else f"auto ({current:,}, "
+                    f"80% of {self.model}'s context window)"
+                )
+            )
+            console.print(
+                f"  [dim]compaction threshold: {mode}[/dim]\n"
+                f"  [dim]used this session so far: "
+                f"{self._compact_tokens:,} tokens[/dim]"
+            )
+            return
+        if arg == "auto":
+            self._compact_threshold = -1
+            console.print(
+                f"  [dim]threshold: auto "
+                f"({self._active_threshold():,})[/dim]"
+            )
+            return
+        if arg == "off":
+            self._compact_threshold = 0
+            console.print(
+                "  [dim]auto-compaction disabled[/dim]"
+            )
+            return
+        try:
+            n = int(arg.replace(",", "").replace("_", ""))
+        except ValueError:
+            console.print(
+                "  [yellow]usage: /compress_token_length <N> | "
+                "auto | off[/yellow]"
+            )
+            return
+        if n <= 0:
+            console.print(
+                "  [yellow]threshold must be positive (use 'off' "
+                "to disable)[/yellow]"
+            )
+            return
+        self._compact_threshold = n
+        console.print(
+            f"  [dim]threshold set to {n:,} tokens[/dim]"
         )
 
 
