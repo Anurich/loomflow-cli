@@ -9,10 +9,11 @@ dependencies = [
     # through loomflow's LiteLLMModel adapter automatically.
     # [web] pulls in httpx + duckduckgo-search for the web_tool
     # backends — /set_web wires them at runtime, but the deps need
-    # to be installed up front. 0.10.7 floor: web_tool first shipped
-    # in that release; 0.10.5 had the Team.supervisor sub-agent
-    # cost-rollup fix loom-code also relies on.
-    "loomflow[litellm,web]>=0.10.8",
+    # to be installed up front. 0.10.10 floor: persistent subagents
+    # (workers carry memory across delegations + runs) plus
+    # ``stop_hooks=`` / ``max_stop_hook_iterations=`` forwarded through
+    # ``Team.supervisor`` — both consumed directly by ``build_agent``.
+    "loomflow[litellm,web]>=0.10.10",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

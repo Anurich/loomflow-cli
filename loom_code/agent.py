@@ -78,6 +78,15 @@ def build_agent(
     kwarg, so the coordinator runs without prompt caching. The
     workers DO cache (built as plain Agents in
     :mod:`loom_code.workers`). A loomflow gap worth closing later.
+
+    Persistent subagents (loomflow 0.10.10+) is default-on. Each
+    worker gets a stable ``worker_<role>_<ULID>`` id + session_id
+    so the same researcher/coder/reviewer carries conversation
+    memory across delegations and across multiple ``run()`` calls
+    inside one REPL session. The ``send_message(to=<worker_id>,
+    content=...)`` tool is auto-wired into the coordinator's tool
+    surface, letting the model follow up with a specific worker
+    instead of always re-delegating from scratch.
     """
     loom_dir = project.root / LOOM_DIR
     loom_dir.mkdir(exist_ok=True)
@@ -92,6 +101,12 @@ def build_agent(
         web_backend=web_backend,
     )
 
+    # ``max_stop_hook_iterations`` bounds the framework Ralph loop —
+    # ``living_plan=True`` auto-registers a StopHook that re-prompts
+    # the coordinator when any plan step is still ``doing``/``todo``
+    # after a final answer. ``/set_continue_cap`` exposes the knob.
+    # Forwarded directly through ``Team.supervisor`` since
+    # loomflow 0.10.10.
     coordinator = Team.supervisor(
         workers=workers,
         instructions=build_coordinator_instructions(project),
@@ -101,19 +116,8 @@ def build_agent(
         workspace=workspace,
         living_plan=True,
         max_turns=max_turns,
+        max_stop_hook_iterations=max_stop_hook_iterations,
     )
-    # Framework Ralph loop — living_plan=True auto-registers a
-    # StopHook that re-prompts when any plan step is still
-    # `doing`/`todo` after the coordinator emits a final answer.
-    # Bound the loop here; /set_continue_cap exposes this knob.
-    #
-    # Set post-construction because Team.supervisor doesn't
-    # forward this kwarg yet (same limitation as prompt_caching).
-    # Future loomflow release should accept it directly in
-    # Team.supervisor(...). The attribute IS public-shaped on
-    # Agent (no leading underscore on the kwarg) — we just don't
-    # have a setter through the builder.
-    coordinator._max_stop_hook_iterations = max_stop_hook_iterations
     return coordinator, workspace
 
 
