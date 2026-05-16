@@ -12,7 +12,7 @@ dependencies = [
     # to be installed up front. 0.10.7 floor: web_tool first shipped
     # in that release; 0.10.5 had the Team.supervisor sub-agent
     # cost-rollup fix loom-code also relies on.
-    "loomflow[litellm,web]>=0.10.7",
+    "loomflow[litellm,web]>=0.10.8",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

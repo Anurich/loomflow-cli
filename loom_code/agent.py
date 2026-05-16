@@ -41,6 +41,7 @@ def build_agent(
     approval_handler: Callable[..., Awaitable[bool]] | None = None,
     max_turns: int = 100,
     web_backend: str | None = None,
+    max_stop_hook_iterations: int = 15,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -101,6 +102,18 @@ def build_agent(
         living_plan=True,
         max_turns=max_turns,
     )
+    # Framework Ralph loop — living_plan=True auto-registers a
+    # StopHook that re-prompts when any plan step is still
+    # `doing`/`todo` after the coordinator emits a final answer.
+    # Bound the loop here; /set_continue_cap exposes this knob.
+    #
+    # Set post-construction because Team.supervisor doesn't
+    # forward this kwarg yet (same limitation as prompt_caching).
+    # Future loomflow release should accept it directly in
+    # Team.supervisor(...). The attribute IS public-shaped on
+    # Agent (no leading underscore on the kwarg) — we just don't
+    # have a setter through the builder.
+    coordinator._max_stop_hook_iterations = max_stop_hook_iterations
     return coordinator, workspace
 
 

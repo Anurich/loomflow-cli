@@ -47,7 +47,6 @@ Slash commands (handled here, never sent to the agent):
 from __future__ import annotations
 
 import os
-from datetime import UTC
 from pathlib import Path
 
 from loomflow import new_id
@@ -128,132 +127,6 @@ _USER_ID = "loom-code"
 # ``/set_continue_cap N`` for power users who want more or less.
 _AUTO_CONTINUE_LIMIT_DEFAULT = 15
 
-# Prompt fed in on each auto-continue iteration. Matches the
-# coordinator's own "LOOP" workflow step (step 5 in prompts.py)
-# so it lands as a natural next-instruction, not a directive
-# from outside its mental model.
-_AUTO_CONTINUE_PROMPT = (
-    "[auto-continue] Your living plan still has non-done steps. "
-    "Continue with the next `todo` or `doing` step right now. "
-    "Do NOT respond to the user yet — only respond when every "
-    "plan step is `done`, `skipped`, or `blocked`."
-)
-
-
-def _count_plan_remaining(
-    plan_steps: list[dict] | None = None,
-    plan_text: str | None = None,
-) -> int:
-    """How many plan steps are NOT yet done/skipped/blocked?
-
-    Two input shapes, in preference order:
-
-    1. ``plan_steps`` — structured list captured from the
-       ``plan_write`` tool_call args. Loomflow's stable API; no
-       parsing brittleness. Always prefer this when available.
-    2. ``plan_text`` — fallback. Regex-parses the rendered
-       markdown's ``**Progress:** X/Y done`` line. Used when the
-       renderer didn't observe a structured ``plan_write`` event
-       this run (e.g. the agent updated an existing plan via a
-       different path).
-
-    Returns 0 if neither is available, neither parses, or the
-    plan is fully drained. Used by the auto-continue logic in
-    ``_turn`` to decide whether to iterate.
-    """
-    if plan_steps is not None:
-        # Structured path — exact, no regex. Steps in todo/doing
-        # state count as "remaining work"; done/skipped/blocked
-        # don't.
-        return sum(
-            1
-            for s in plan_steps
-            if isinstance(s, dict)
-            and s.get("status") in ("todo", "doing")
-        )
-    if not plan_text:
-        return 0
-    import re
-
-    match = re.search(
-        r"Progress:?\s*\*?\*?\s*(\d+)\s*/\s*(\d+)\s+done",
-        plan_text,
-    )
-    if not match:
-        return 0
-    done = int(match.group(1))
-    total = int(match.group(2))
-    return max(0, total - done)
-
-
-def should_auto_continue(
-    *,
-    remaining: int,
-    previous_remaining: int | None,
-    iterations_used: int,
-    limit: int,
-) -> tuple[bool, str]:
-    """Decide whether to fire another auto-continue iteration.
-
-    Returns ``(continue?, reason)``. When ``continue=False`` the
-    reason is one of ``"plan_drained"`` / ``"cap_reached"`` /
-    ``"stalled"`` — useful for both UI (tell the user WHY we
-    stopped) and the telemetry log.
-
-    Stall detection: if the plan's remaining count did NOT
-    decrease between iterations, the model is talking but not
-    making progress. Bailing early saves cost — the next 3
-    iterations would almost certainly be the same.
-    """
-    if remaining <= 0:
-        return False, "plan_drained"
-    if iterations_used >= limit:
-        return False, "cap_reached"
-    if (
-        previous_remaining is not None
-        and remaining >= previous_remaining
-        and iterations_used > 0
-    ):
-        return False, "stalled"
-    return True, ""
-
-
-def _log_auto_continue(
-    *,
-    root: Path,
-    session_id: str,
-    iteration: int,
-    limit: int,
-    remaining: int,
-    previous_remaining: int | None,
-    decision: str,
-) -> None:
-    """Append one telemetry line to ``.loom/auto_continue.log``.
-
-    Used to tune the cap + diagnose stuck plans. One JSON object
-    per line so the file is append-only-safe and easy to grep /
-    parse later (``jq`` / ``cat`` both work). Best-effort: any
-    IO failure is silently swallowed — telemetry must never block
-    the agent."""
-    import json
-    from datetime import datetime
-
-    try:
-        target = root / ".loom" / "auto_continue.log"
-        target.parent.mkdir(exist_ok=True)
-        record = {
-            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
-            "session_id": session_id,
-            "iter": iteration,
-            "limit": limit,
-            "remaining": remaining,
-            "previous_remaining": previous_remaining,
-            "decision": decision,
-        }
-        with target.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record) + "\n")
-    except OSError:
-        pass
 
 
 def _flatten_exception_group(
@@ -333,8 +206,12 @@ class Repl:
         # ApprovalGate persists across turns so 'allow all' sticks
         # for the whole session.
         self._gate = ApprovalGate()
+        self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
         self.agent, self.workspace = build_agent(
-            project, model=model, approval_handler=self._gate.handler
+            project,
+            model=model,
+            approval_handler=self._gate.handler,
+            max_stop_hook_iterations=self._auto_continue_limit,
         )
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
@@ -367,13 +244,10 @@ class Repl:
         # the agent picks the new backend up by adding (or not
         # adding) a ``web_tool`` to coder + explorer.
         self._web_backend: str | None = None
-        # Auto-continue cap. Mutable per session via
-        # /set_continue_cap so users can dial it up for very large
-        # scaffolds or down to disable. Stall detection still kicks
-        # in regardless of this value, so a higher cap doesn't
-        # mean "burn money on a stuck plan" — it means "give a
-        # progressing plan more headroom before we bail."
-        self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
+        # ``self._auto_continue_limit`` is initialised earlier in
+        # __init__ (before build_agent is called) so the framework
+        # gets the right ``max_stop_hook_iterations`` on construction.
+        # See the build_agent call above.
         # prompt_toolkit drives the input line. complete_while_typing
         # opens the autocomplete menu the moment the user types '/'
         # without any extra keystroke (Tab also still works for
@@ -528,144 +402,81 @@ class Repl:
             set_status=set_status, pause_status=pause_status
         )
 
-        # The Ralph-loop wrapper: ReAct exits when the model emits
-        # text without a tool call, even mid-plan. We check after
-        # each stream completes — if the living plan still has
-        # todo/doing steps, we feed an auto-continue prompt and
-        # iterate. Bounded by _AUTO_CONTINUE_LIMIT, and we bail
-        # early if the plan didn't progress between iterations
-        # (model is talking but not making bookkeeping moves).
-        current_prompt = prompt
-        auto_continues_used = 0
-        agent_output_last = ""
-        previous_remaining: int | None = None
-
-        while True:
-            try:
-                async for event in self.agent.stream(
-                    current_prompt,
-                    user_id=_USER_ID,
-                    session_id=self.session_id,
-                ):
-                    renderer.handle(event)
-            except KeyboardInterrupt:
-                pause_status()
-                console.print(
-                    "\n[yellow]interrupted — turn abandoned[/yellow]"
-                )
-                return
-            except BaseExceptionGroup as eg:
-                # anyio's task groups raise ``ExceptionGroup`` when
-                # any child task fails. The default str() reads
-                # "unhandled errors in a TaskGroup (1 sub-exception)"
-                # — uninformative. Unwrap to surface the REAL
-                # cause(s) so the user can act on them.
-                pause_status()
-                for inner in _flatten_exception_group(eg):
-                    console.print(
-                        f"\n[bold red]error: "
-                        f"{type(inner).__name__}: {inner}[/bold red]"
-                    )
-                return
-            except Exception as exc:  # noqa: BLE001 — REPL must survive
-                pause_status()
+        # The Ralph loop now lives in loomflow itself (>=0.10.8) via
+        # the StopHook protocol — Agent(living_plan=True) auto-
+        # registers a hook that re-prompts when any plan step is
+        # still `doing`/`todo` after the architecture exits. We just
+        # consume the agent's stream; the framework handles
+        # continuation, bounded by ``max_stop_hook_iterations``.
+        try:
+            async for event in self.agent.stream(
+                prompt,
+                user_id=_USER_ID,
+                session_id=self.session_id,
+            ):
+                renderer.handle(event)
+        except KeyboardInterrupt:
+            pause_status()
+            console.print(
+                "\n[yellow]interrupted — turn abandoned[/yellow]"
+            )
+            return
+        except BaseExceptionGroup as eg:
+            # anyio's task groups raise ``ExceptionGroup`` when any
+            # child task fails. Unwrap to surface the REAL cause(s)
+            # instead of the opaque wrapper message.
+            pause_status()
+            for inner in _flatten_exception_group(eg):
                 console.print(
                     f"\n[bold red]error: "
-                    f"{type(exc).__name__}: {exc}[/bold red]"
+                    f"{type(inner).__name__}: {inner}[/bold red]"
                 )
-                return
-
-            if renderer.last_plan:
-                self.last_plan = renderer.last_plan
-            result = renderer.last_result
-            agent_output = ""
-            if result:
-                self.total_cost += float(result.get("cost_usd", 0.0))
-                tin = int(result.get("tokens_in", 0))
-                cached_in = int(result.get("cached_tokens_in", 0))
-                tout = int(result.get("tokens_out", 0))
-                self.total_in += tin + cached_in
-                self.total_cached_in += cached_in
-                self.total_out += tout
-                self.turns += int(result.get("turns", 0))
-                # Hold this turn's citations for the moved-on
-                # heuristic. Updated on each iteration so the
-                # final pending_slugs reflect the LAST sub-turn.
-                self._pending_slugs = list(
-                    result.get("cited_slugs") or []
-                )
-                self._compact_tokens += tin + cached_in + tout
-                agent_output = str(result.get("output") or "")
-            agent_output_last = agent_output
-
-            # Compute remaining from structured args FIRST (stable
-            # loomflow API), fall back to markdown parsing for
-            # cases where the renderer didn't observe a structured
-            # plan_write this iteration.
-            remaining = _count_plan_remaining(
-                plan_steps=renderer.last_plan_steps,
-                plan_text=self.last_plan,
+            return
+        except Exception as exc:  # noqa: BLE001 — REPL must survive
+            pause_status()
+            console.print(
+                f"\n[bold red]error: "
+                f"{type(exc).__name__}: {exc}[/bold red]"
             )
+            return
 
-            # Skip auto-continue entirely if the run crashed
-            # silently (no result). Retrying would just crash again.
-            if result is None:
-                break
-
-            decision_continue, reason = should_auto_continue(
-                remaining=remaining,
-                previous_remaining=previous_remaining,
-                iterations_used=auto_continues_used,
-                limit=self._auto_continue_limit,
+        if renderer.last_plan:
+            self.last_plan = renderer.last_plan
+        result = renderer.last_result
+        agent_output = ""
+        if result:
+            self.total_cost += float(result.get("cost_usd", 0.0))
+            tin = int(result.get("tokens_in", 0))
+            cached_in = int(result.get("cached_tokens_in", 0))
+            tout = int(result.get("tokens_out", 0))
+            self.total_in += tin + cached_in
+            self.total_cached_in += cached_in
+            self.total_out += tout
+            self.turns += int(result.get("turns", 0))
+            self._pending_slugs = list(
+                result.get("cited_slugs") or []
             )
-            _log_auto_continue(
-                root=self.project.root,
-                session_id=self.session_id,
-                iteration=auto_continues_used,
-                limit=self._auto_continue_limit,
-                remaining=remaining,
-                previous_remaining=previous_remaining,
-                decision=("continue" if decision_continue else reason),
-            )
+            self._compact_tokens += tin + cached_in + tout
+            agent_output = str(result.get("output") or "")
 
-            if decision_continue:
-                auto_continues_used += 1
-                previous_remaining = remaining
-                pause_status()
+            # Surface framework-level stop-hook exhaustion so the
+            # user knows the cap was hit (and can raise it with
+            # /set_continue_cap N).
+            if result.get("interrupted") and (
+                result.get("interruption_reason")
+                == "stop_hook_iterations_exhausted"
+            ):
                 console.print(
-                    f"\n  [dim magenta]▸ plan has {remaining} step(s) "
-                    f"remaining — auto-continuing "
-                    f"({auto_continues_used}/"
-                    f"{self._auto_continue_limit})[/dim magenta]"
-                )
-                current_prompt = _AUTO_CONTINUE_PROMPT
-                set_status("loomflowing...")
-                continue
-
-            # Stopped — tell the user WHY when the reason is
-            # actionable (cap hit / stalled). plan_drained =
-            # everything's fine; no message needed.
-            if reason == "cap_reached":
-                console.print(
-                    f"\n  [yellow]plan still has {remaining} "
-                    f"step(s) but hit auto-continue cap "
+                    "\n  [yellow]plan still had work but the agent "
+                    f"hit the auto-continue cap "
                     f"({self._auto_continue_limit}) — type "
                     "'continue' to push further, raise the cap "
                     "with /set_continue_cap N, or accept the "
                     "partial result[/yellow]"
                 )
-            elif reason == "stalled":
-                console.print(
-                    f"\n  [yellow]plan didn't progress between "
-                    f"iterations (still {remaining} step(s) "
-                    "remaining) — stopping. Type 'continue' to "
-                    "nudge the agent if you think it can recover, "
-                    "or /bad to flag the run.[/yellow]"
-                )
-            break
 
         pause_status()
-        self._compact_exchanges.append((prompt, agent_output_last))
+        self._compact_exchanges.append((prompt, agent_output))
 
         # Persist the current session_id to disk so /resume on the
         # next REPL launch knows what to rehydrate. Done after EVERY
@@ -852,6 +663,7 @@ class Repl:
             model=self.model,
             approval_handler=self._gate.handler,
             web_backend=self._web_backend,
+            max_stop_hook_iterations=self._auto_continue_limit,
         )
         self._compactor = Compactor(model=self.model)
         self._compact_tokens = 0
@@ -993,6 +805,11 @@ class Repl:
             n = 100
         old = self._auto_continue_limit
         self._auto_continue_limit = n
+        # The cap is a construction-time kwarg on loomflow's Agent
+        # (max_stop_hook_iterations). Rebuild so the new value
+        # takes effect; this also resets the conversation, which
+        # matches the rebuild semantics of /model and /set_web.
+        self._rebuild_agent()
         if n == 0:
             console.print(
                 f"  [dim]auto-continue [b red]disabled[/b red]  "
