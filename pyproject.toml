@@ -9,12 +9,16 @@ dependencies = [
     # through loomflow's LiteLLMModel adapter automatically.
     # [web] pulls in httpx + duckduckgo-search for the web_tool
     # backends — /set_web wires them at runtime, but the deps need
-    # to be installed up front. 0.10.12 floor: ``prompt_caching=``
-    # now forwarded through ``Team.supervisor`` (the coordinator was
-    # the only piece without caching before — workers always had it).
-    # Older floors covered persistent subagents (0.10.10) and the
-    # Windows charmap + bash_tool fixes (0.10.11).
-    "loomflow[litellm,web]>=0.10.12",
+    # to be installed up front. 0.10.13 floor unlocks the full
+    # token-optimization trio: ``snip_window=`` (free list-slicing),
+    # ``auto_compact_at_tokens=`` (LLM-summarised conversation
+    # compaction at framework level), and the opt-in
+    # ``tool_result_summarizer=`` (LLM-summarised tool outputs).
+    # Also brings 4-of-4 Anthropic cache breakpoints (memory blocks
+    # cached independently), Model.count_tokens helper, subagent
+    # parent-attribution metadata, and the prior 0.10.10+ persistent
+    # subagents / Windows compat / Team builder kwarg fixes.
+    "loomflow[litellm,web]>=0.10.13",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

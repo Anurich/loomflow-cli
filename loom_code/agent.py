@@ -42,6 +42,9 @@ def build_agent(
     max_turns: int = 100,
     web_backend: str | None = None,
     max_stop_hook_iterations: int = 15,
+    snip_window: int = 12,
+    auto_compact: bool = True,
+    tool_result_summarizer: str | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -92,6 +95,30 @@ def build_agent(
     content=...)`` tool is auto-wired into the coordinator's tool
     surface, letting the model follow up with a specific worker
     instead of always re-delegating from scratch.
+
+    Three context-budget controls (loomflow 0.10.13 framework
+    features), all opt-in but defaulted to safe values:
+
+    * ``snip_window=12`` — the coordinator keeps the last 12
+      user-anchored turn groups in conversation history; older
+      ones drop before each model call. Pure list-slicing; no
+      LLM call. Catches very long REPL sessions where the
+      coordinator's delegate-result-integrate cycle accumulates
+      a lot of intermediate turns.
+    * ``auto_compact=True`` — when conversation tokens exceed
+      80% of the model's context window mid-run, the older half
+      is collapsed into a single summary system message via an
+      LLM call. The summariser is the same model (no extra
+      provider setup); on Anthropic/OpenAI Opus-class models the
+      threshold is ~160k tokens.
+    * ``tool_result_summarizer=<model>`` — opt-IN; when provided,
+      large tool results (>500 chars by default) get summarised
+      via the named model before entering conversation history.
+      Trades 1 extra LLM call per oversized result for ~10x
+      reduction in subsequent-turn input tokens. The win-loss
+      depends on how often tool results live more than one
+      additional turn; loom-code defaults this OFF and lets
+      operators opt in per-model based on observed usage.
     """
     loom_dir = project.root / LOOM_DIR
     loom_dir.mkdir(exist_ok=True)
@@ -112,6 +139,26 @@ def build_agent(
     # after a final answer. ``/set_continue_cap`` exposes the knob.
     # Forwarded directly through ``Team.supervisor`` since
     # loomflow 0.10.10.
+    #
+    # Auto-compact threshold — 80% of the model's context window.
+    # The framework helper ``context_window_for`` does substring
+    # lookup against known model families; unknown models fall
+    # back to the conservative 8k cap (which would fire compaction
+    # aggressively — user can override by passing
+    # ``auto_compact=False`` at construction).
+    auto_compact_at_tokens: int | None = None
+    if auto_compact:
+        from loomflow.agent.auto_compact import context_window_for
+        window = context_window_for(model)
+        auto_compact_at_tokens = int(window * 0.8)
+
+    # ``tool_result_summarizer`` forwards cleanly through
+    # ``Team.supervisor`` since loomflow 0.10.13. ``snip_window``
+    # and ``auto_compact_at_tokens`` are NOT yet forwarded
+    # through the Team.* builders (the same papercut pattern that
+    # ``max_stop_hook_iterations`` had before 0.10.10) — we set
+    # them post-construction on the returned coordinator until a
+    # loomflow release adds the Team forwarding.
     coordinator = Team.supervisor(
         workers=workers,
         instructions=build_coordinator_instructions(project),
@@ -123,6 +170,17 @@ def build_agent(
         max_turns=max_turns,
         max_stop_hook_iterations=max_stop_hook_iterations,
         prompt_caching=True,
+        tool_result_summarizer=tool_result_summarizer,
+    )
+    # Post-construction stamping for the two knobs Team.supervisor
+    # doesn't accept yet. The attributes ARE Agent's runtime state —
+    # snip_window > 0 flips ``fast_snip`` False at the next deps
+    # build; auto_compact_at_tokens > 0 + a summariser triggers
+    # the Ralph-loop compactor.
+    coordinator._snip_window = snip_window
+    coordinator._auto_compact_at_tokens = auto_compact_at_tokens
+    coordinator._auto_compact_summariser = (
+        coordinator._model if auto_compact_at_tokens is not None else None
     )
     return coordinator, workspace
 

@@ -241,6 +241,20 @@ class Repl:
         # cache writes).
         self.total_cache_write = 0
         self.total_out = 0
+        # Framework-event counters (loomflow 0.10.13+):
+        # ``total_summaries`` ticks each time
+        # ``tool_result_summarized`` fires (per-tool-result LLM
+        # compression — only when ``tool_result_summarizer=`` is
+        # wired). ``total_compacts`` ticks each
+        # ``auto_compacted`` event (mid-Ralph-loop conversation
+        # summarisation when tokens cross the budget threshold).
+        # ``total_snips`` ticks each ``messages_snipped`` event
+        # (free list-slicing trim of older user-anchored turn
+        # groups). All three surface in ``/cost`` so the user can
+        # see the token-optimisation tiers actually firing.
+        self.total_summaries = 0
+        self.total_compacts = 0
+        self.total_snips = 0
         self.turns = 0
         self.last_plan: str | None = None
         # Self-improvement: cited slugs from the last turn, awaiting
@@ -461,6 +475,27 @@ class Repl:
                 session_id=self.session_id,
             ):
                 renderer.handle(event)
+                # Tick the token-optimisation counters (loomflow
+                # 0.10.13+). The renderer doesn't surface
+                # architecture_events to the user — we
+                # opportunistically inspect them here to drive
+                # the /cost display. ``kind`` and ``payload``
+                # come straight off the Event; the name lives
+                # under payload["name"].
+                kind = getattr(event, "kind", None)
+                payload = getattr(event, "payload", None)
+                if (
+                    payload is not None
+                    and kind is not None
+                    and str(kind).endswith("architecture_event")
+                ):
+                    name = payload.get("name")
+                    if name == "tool_result_summarized":
+                        self.total_summaries += 1
+                    elif name == "auto_compacted":
+                        self.total_compacts += 1
+                    elif name == "messages_snipped":
+                        self.total_snips += 1
         except KeyboardInterrupt:
             pause_status()
             console.print(
@@ -652,6 +687,36 @@ class Repl:
                         ]
                     )
                 console.print(Text.assemble(*segments))
+            # Third line: token-optimisation tier counters. Each
+            # entry only renders when its counter is non-zero —
+            # opted-out features stay invisible. The three counters
+            # map 1:1 to the three opt-in framework knobs in
+            # build_agent (snip_window, auto_compact_at_tokens,
+            # tool_result_summarizer) — seeing zeros across the
+            # board means "the conversation never got large enough
+            # to need any of them," which is a useful diagnostic
+            # signal on its own.
+            opt_segments: list[tuple[str, str]] = []
+            if self.total_snips > 0:
+                opt_segments.append(
+                    (f"{self.total_snips} snip", "dim")
+                )
+            if self.total_compacts > 0:
+                if opt_segments:
+                    opt_segments.append(("  ·  ", "dim"))
+                opt_segments.append(
+                    (f"{self.total_compacts} compact", "dim")
+                )
+            if self.total_summaries > 0:
+                if opt_segments:
+                    opt_segments.append(("  ·  ", "dim"))
+                opt_segments.append(
+                    (f"{self.total_summaries} tool-summary", "dim")
+                )
+            if opt_segments:
+                console.print(
+                    Text.assemble(("  optim:   ", "dim"), *opt_segments)
+                )
         elif cmd == "/good":
             if self._pending_slugs:
                 await self._attribute_pending(
