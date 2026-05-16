@@ -152,13 +152,11 @@ def build_agent(
         window = context_window_for(model)
         auto_compact_at_tokens = int(window * 0.8)
 
-    # ``tool_result_summarizer`` forwards cleanly through
-    # ``Team.supervisor`` since loomflow 0.10.13. ``snip_window``
-    # and ``auto_compact_at_tokens`` are NOT yet forwarded
-    # through the Team.* builders (the same papercut pattern that
-    # ``max_stop_hook_iterations`` had before 0.10.10) — we set
-    # them post-construction on the returned coordinator until a
-    # loomflow release adds the Team forwarding.
+    # All three token-optimisation knobs forward cleanly through
+    # ``Team.supervisor`` since loomflow 0.10.14 (tool_result_summarizer
+    # since 0.10.13; snip_window + auto_compact_* added in 0.10.14's
+    # comprehensive Team-kwarg-forwarding sweep). No more post-
+    # construction monkey-patching.
     coordinator = Team.supervisor(
         workers=workers,
         instructions=build_coordinator_instructions(project),
@@ -171,16 +169,8 @@ def build_agent(
         max_stop_hook_iterations=max_stop_hook_iterations,
         prompt_caching=True,
         tool_result_summarizer=tool_result_summarizer,
-    )
-    # Post-construction stamping for the two knobs Team.supervisor
-    # doesn't accept yet. The attributes ARE Agent's runtime state —
-    # snip_window > 0 flips ``fast_snip`` False at the next deps
-    # build; auto_compact_at_tokens > 0 + a summariser triggers
-    # the Ralph-loop compactor.
-    coordinator._snip_window = snip_window
-    coordinator._auto_compact_at_tokens = auto_compact_at_tokens
-    coordinator._auto_compact_summariser = (
-        coordinator._model if auto_compact_at_tokens is not None else None
+        snip_window=snip_window,
+        auto_compact_at_tokens=auto_compact_at_tokens,
     )
     return coordinator, workspace
 
