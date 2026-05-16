@@ -95,6 +95,12 @@ _SLASH_HELP = """\
   [cyan]/resume[/cyan]          resume the last session — rehydrates prior
                    turns from loomflow memory so you pick up where
                    you left off
+  [cyan]/set_continue_cap[/cyan] [N]
+                   show / set the auto-continue cap. When the plan
+                   has non-done steps after the agent emits a final
+                   answer, the REPL auto-runs up to N more
+                   iterations. Default 15. ``/set_continue_cap 0``
+                   disables auto-continue.
   [cyan]/clear[/cyan]           fresh conversation (new session)
   [cyan]/compress_token_length[/cyan] [N|auto|off]
                    show / set / disable the auto-compact threshold
@@ -109,14 +115,18 @@ the conversation continues with that summary as its only history.
 
 _USER_ID = "loom-code"
 
-# How many times we'll auto-continue a turn when the living plan
-# still has non-done steps after the agent emits a final answer.
-# This is the Ralph-loop / Cursor-judge-agent pattern: the model's
-# "I'm done" judgement is unreliable on multi-step plans, so the
-# REPL overrules it as long as the plan explicitly disagrees.
-# Cap at 5 to bound runaway cost — 5 continuations covers a
-# typical 6-step scaffold (1 initial run + 5 continues = 6 steps).
-_AUTO_CONTINUE_LIMIT = 5
+# DEFAULT cap on auto-continue iterations per turn. This is the
+# Ralph-loop / Cursor-judge-agent pattern: the model's "I'm done"
+# judgement is unreliable on multi-step plans, so the REPL
+# overrules it as long as the plan explicitly disagrees.
+#
+# Bumped from 5 → 15 after empirical observation: real scaffold
+# tasks the user threw at us had 6-12 plan steps, and 5 left them
+# stuck mid-stream. 15 gives headroom; stall detection still kicks
+# in early on genuinely-runaway loops so the higher cap doesn't
+# inflate worst-case cost. Per-session overridable via
+# ``/set_continue_cap N`` for power users who want more or less.
+_AUTO_CONTINUE_LIMIT_DEFAULT = 15
 
 # Prompt fed in on each auto-continue iteration. Matches the
 # coordinator's own "LOOP" workflow step (step 5 in prompts.py)
@@ -280,6 +290,7 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/loominit", "index this codebase → LOOM.md"),
     ("/resume", "resume the last session (rehydrate prior turns)"),
+    ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
     ("/clear", "fresh conversation (new session)"),
     (
         "/compress_token_length",
@@ -356,6 +367,13 @@ class Repl:
         # the agent picks the new backend up by adding (or not
         # adding) a ``web_tool`` to coder + explorer.
         self._web_backend: str | None = None
+        # Auto-continue cap. Mutable per session via
+        # /set_continue_cap so users can dial it up for very large
+        # scaffolds or down to disable. Stall detection still kicks
+        # in regardless of this value, so a higher cap doesn't
+        # mean "burn money on a stuck plan" — it means "give a
+        # progressing plan more headroom before we bail."
+        self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
         # prompt_toolkit drives the input line. complete_while_typing
         # opens the autocomplete menu the moment the user types '/'
         # without any extra keystroke (Tab also still works for
@@ -598,13 +616,13 @@ class Repl:
                 remaining=remaining,
                 previous_remaining=previous_remaining,
                 iterations_used=auto_continues_used,
-                limit=_AUTO_CONTINUE_LIMIT,
+                limit=self._auto_continue_limit,
             )
             _log_auto_continue(
                 root=self.project.root,
                 session_id=self.session_id,
                 iteration=auto_continues_used,
-                limit=_AUTO_CONTINUE_LIMIT,
+                limit=self._auto_continue_limit,
                 remaining=remaining,
                 previous_remaining=previous_remaining,
                 decision=("continue" if decision_continue else reason),
@@ -618,7 +636,7 @@ class Repl:
                     f"\n  [dim magenta]▸ plan has {remaining} step(s) "
                     f"remaining — auto-continuing "
                     f"({auto_continues_used}/"
-                    f"{_AUTO_CONTINUE_LIMIT})[/dim magenta]"
+                    f"{self._auto_continue_limit})[/dim magenta]"
                 )
                 current_prompt = _AUTO_CONTINUE_PROMPT
                 set_status("loomflowing...")
@@ -631,9 +649,10 @@ class Repl:
                 console.print(
                     f"\n  [yellow]plan still has {remaining} "
                     f"step(s) but hit auto-continue cap "
-                    f"({_AUTO_CONTINUE_LIMIT}) — type 'continue' "
-                    "to push further, or accept the partial result"
-                    "[/yellow]"
+                    f"({self._auto_continue_limit}) — type "
+                    "'continue' to push further, raise the cap "
+                    "with /set_continue_cap N, or accept the "
+                    "partial result[/yellow]"
                 )
             elif reason == "stalled":
                 console.print(
@@ -790,6 +809,8 @@ class Repl:
             await self._handle_loominit()
         elif cmd == "/resume":
             await self._handle_resume()
+        elif cmd == "/set_continue_cap":
+            self._handle_set_continue_cap(arg)
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -929,6 +950,61 @@ class Repl:
             f"  [dim]compacted into {len(summary)}-char summary "
             f"in memory; new conversation thread.[/dim]"
         )
+
+    def _handle_set_continue_cap(self, arg: str) -> None:
+        """``/set_continue_cap [N]`` — view or set the auto-continue cap.
+
+        Bare ``/set_continue_cap`` shows the current value. ``N=0``
+        disables auto-continue entirely (turns become single-shot
+        again — useful when debugging a model's behaviour and you
+        want to see exactly what it does on its own). Otherwise N
+        is the new cap; we clamp at 100 to prevent typos like
+        ``/set_continue_cap 1000`` from costing the user real money.
+        """
+        arg = arg.strip()
+        if not arg:
+            console.print(
+                f"  [dim]auto-continue cap: "
+                f"[b]{self._auto_continue_limit}[/b]  "
+                f"(default {_AUTO_CONTINUE_LIMIT_DEFAULT}, "
+                "0 disables)[/dim]"
+            )
+            return
+        try:
+            n = int(arg)
+        except ValueError:
+            console.print(
+                "  [yellow]usage: /set_continue_cap <N> — N is "
+                "an integer ≥ 0 (0 disables)[/yellow]"
+            )
+            return
+        if n < 0:
+            console.print(
+                "  [yellow]cap must be non-negative (use 0 to "
+                "disable auto-continue)[/yellow]"
+            )
+            return
+        if n > 100:
+            console.print(
+                "  [yellow]cap clamped to 100 to prevent runaway "
+                "cost on a typo. Use /set_continue_cap 100 if you "
+                "really meant that.[/yellow]"
+            )
+            n = 100
+        old = self._auto_continue_limit
+        self._auto_continue_limit = n
+        if n == 0:
+            console.print(
+                f"  [dim]auto-continue [b red]disabled[/b red]  "
+                f"(was {old}). Multi-step plans now stop after "
+                "their first ReAct exit; type 'continue' to nudge "
+                "manually.[/dim]"
+            )
+        else:
+            console.print(
+                f"  [dim]auto-continue cap: [b]{old}[/b] → "
+                f"[b green]{n}[/b green][/dim]"
+            )
 
     def _handle_compress_command(self, arg: str) -> None:
         """Dispatch ``/compress_token_length`` — view, set, auto, off."""

@@ -17,7 +17,7 @@ so a regression doesn't slip past unit coverage.
 from __future__ import annotations
 
 from loom_code.repl import (
-    _AUTO_CONTINUE_LIMIT,
+    _AUTO_CONTINUE_LIMIT_DEFAULT,
     _count_plan_remaining,
     should_auto_continue,
 )
@@ -175,6 +175,10 @@ def test_progress_keeps_loop_going() -> None:
 
 
 def test_default_limit_is_reasonable() -> None:
-    """Sanity check: the default cap should cover a typical 6-step
-    scaffold task (1 initial run + 5 continues = 6 steps)."""
-    assert _AUTO_CONTINUE_LIMIT == 5
+    """Sanity check: the default cap should cover real scaffold
+    tasks (we observed 6-12 plan steps in practice with the
+    earlier cap of 5 leaving them stuck mid-stream). 15 gives
+    headroom; stall detection still kicks in early on genuinely
+    runaway loops so the higher cap doesn't inflate worst-case
+    cost."""
+    assert _AUTO_CONTINUE_LIMIT_DEFAULT == 15
