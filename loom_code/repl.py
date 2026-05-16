@@ -213,6 +213,15 @@ class Repl:
             approval_handler=self._gate.handler,
             max_stop_hook_iterations=self._auto_continue_limit,
         )
+        # LOOM.md retrieval. ``LoomRetriever.from_repo_root`` returns
+        # ``None`` when LOOM.md is missing or empty — we treat that as
+        # "no per-turn injection, fall back to whatever the static
+        # context block in project.context_text already wired." When
+        # the retriever loads, the per-turn ``_inject_loom_context``
+        # call before ``_turn`` updates the ``loom_index`` working
+        # block with BM25-picked sections.
+        from .loominit.injection import LoomRetriever
+        self._loom_retriever = LoomRetriever.from_repo_root(project.root)
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
         self.session_id = new_id()
@@ -224,6 +233,13 @@ class Repl:
         self.total_cost = 0.0
         self.total_in = 0
         self.total_cached_in = 0
+        # ``total_cache_write`` is Anthropic-only — the cache CREATION
+        # tokens (1.25x base price on 5m TTL, 2x on 1h). Tracked
+        # separately from cached_in (which is the cache READ — cheap)
+        # so /cost can surface both directions of the cache
+        # accounting. OpenAI returns 0 here (no separate billing for
+        # cache writes).
+        self.total_cache_write = 0
         self.total_out = 0
         self.turns = 0
         self.last_plan: str | None = None
@@ -343,6 +359,11 @@ class Repl:
             # A new task with no prior complaint → the previous
             # turn must have been fine. Credit it, then run.
             await self._attribute_pending(success=True, quiet=False)
+            # Per-turn LOOM.md retrieval — populates the
+            # ``loom_index`` working block with sections BM25-relevant
+            # to ``line``. Loomflow auto-injects working blocks into
+            # the next system prompt.
+            await self._inject_loom_context(line)
             await self._turn(line)
 
     # ---- input ----------------------------------------------------------
@@ -360,6 +381,31 @@ class Repl:
         )
 
     # ---- a task turn ----------------------------------------------------
+
+    async def _inject_loom_context(self, prompt: str) -> None:
+        """Update the ``loom_index`` working block with the top-N
+        LOOM.md sections most relevant to ``prompt``.
+
+        No-op when there's no retriever (LOOM.md absent) or when BM25
+        scores no overlap with the prompt — in both cases we leave
+        the prior block untouched (loomflow keeps the last written
+        value), so a follow-up turn like ``"why?"`` still has the
+        previous turn's context to lean on.
+
+        Failures are swallowed (never let memory I/O kill a turn) —
+        the same defensive pattern the session-summary writer uses.
+        """
+        if self._loom_retriever is None:
+            return
+        body = self._loom_retriever.relevant(prompt)
+        if not body:
+            return
+        try:
+            await self.agent.memory.update_block(
+                "loom_index", body, user_id=_USER_ID
+            )
+        except Exception:  # noqa: BLE001 — injection is best-effort
+            pass
 
     async def _turn(self, prompt: str) -> None:
         """Stream one agent run for ``prompt``, reusing the
@@ -448,9 +494,11 @@ class Repl:
             self.total_cost += float(result.get("cost_usd", 0.0))
             tin = int(result.get("tokens_in", 0))
             cached_in = int(result.get("cached_tokens_in", 0))
+            cache_write = int(result.get("cache_write_tokens", 0))
             tout = int(result.get("tokens_out", 0))
             self.total_in += tin + cached_in
             self.total_cached_in += cached_in
+            self.total_cache_write += cache_write
             self.total_out += tout
             self.turns += int(result.get("turns", 0))
             self._pending_slugs = list(
@@ -545,6 +593,7 @@ class Repl:
                 await self._attribute_pending(
                     success=True, quiet=False
                 )
+                await self._inject_loom_context(arg)
                 await self._turn(arg)
             elif self.last_plan:
                 console.print(Text(self.last_plan, style="dim"))
@@ -555,6 +604,16 @@ class Repl:
                 )
         elif cmd == "/cost":
             uncached = self.total_in - self.total_cached_in
+            # Cache-hit ratio over total input tokens. The ratio
+            # tells the user whether their prompt-caching investment
+            # is actually paying off — a low ratio means the system
+            # prompt is changing turn-to-turn (cache-bust) or the
+            # provider doesn't expose cache reads.
+            hit_pct = (
+                (self.total_cached_in / self.total_in * 100.0)
+                if self.total_in > 0
+                else 0.0
+            )
             console.print(
                 Text.assemble(
                     ("  session: ", "dim"),
@@ -569,6 +628,30 @@ class Repl:
                     (f"${self.total_cost:.4f}", "green"),
                 )
             )
+            # Second line: cache breakdown. Only render when there's
+            # something to report — keeps the empty-session output
+            # uncluttered. ``cache_write`` only fires on Anthropic
+            # (5m TTL = +25%, 1h = +100%); on OpenAI it stays 0.
+            if self.total_cached_in > 0 or self.total_cache_write > 0:
+                cache_color = (
+                    "green" if hit_pct >= 50 else "yellow"
+                    if hit_pct >= 20 else "dim"
+                )
+                segments: list[tuple[str, str]] = [
+                    ("  cache:   ", "dim"),
+                    (f"{hit_pct:.1f}% hit", cache_color),
+                ]
+                if self.total_cache_write > 0:
+                    segments.extend(
+                        [
+                            ("  ·  ", "dim"),
+                            (
+                                f"{self.total_cache_write:,} write",
+                                "dim",
+                            ),
+                        ]
+                    )
+                console.print(Text.assemble(*segments))
         elif cmd == "/good":
             if self._pending_slugs:
                 await self._attribute_pending(

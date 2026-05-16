@@ -8,9 +8,19 @@ answers two questions cheaply, once, at startup:
    ``.git`` dir (fall back to cwd if none — loom-code still works
    on a loose folder of files).
 2. **What are the project's conventions?** Read the first context
-   file we find — ``CLAUDE.md`` / ``AGENTS.md`` / ``LOOM.md`` /
-   ``.loom/context.md`` — and hand it to the system prompt so the
-   agent starts already knowing the house rules.
+   file we find — ``CLAUDE.md`` / ``AGENTS.md`` / ``.loom/context.md``
+   — and hand it to the system prompt so the agent starts already
+   knowing the house rules.
+
+Note: ``LOOM.md`` is intentionally NOT in the static-bake candidate
+list. It's the loominit-generated codebase INDEX (large, sectioned,
+covers the whole repo), and as of loominit slice 3 it gets per-turn
+BM25 retrieval into the ``loom_index`` working block via
+:class:`loom_code.loominit.injection.LoomRetriever`. Baking it
+statically here would double-ship: once verbatim every turn, once
+as retrieved sections. ``CLAUDE.md`` / ``AGENTS.md`` stay as
+static bake because they encode "house rules" (small, every-turn
+relevant) — a different role from the codebase index.
 """
 
 from __future__ import annotations
@@ -20,10 +30,10 @@ from pathlib import Path
 
 # Context-file names checked in priority order. CLAUDE.md first
 # because it's the de-facto standard a lot of repos already have;
-# AGENTS.md is the cross-tool convention; LOOM.md / .loom/context.md
-# are loom-code-native if a project wants a dedicated file.
+# AGENTS.md is the cross-tool convention; .loom/context.md is the
+# loom-code-native opt-in for a dedicated house-rules file.
+# LOOM.md is deliberately absent — see module docstring.
 _CONTEXT_FILENAMES = (
-    "LOOM.md",
     "CLAUDE.md",
     "AGENTS.md",
     ".loom/context.md",

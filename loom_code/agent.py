@@ -74,10 +74,15 @@ def build_agent(
     ``reviewer`` workers (they hold the destructive tools); the
     coordinator only delegates, so it needs no permissions policy.
 
-    NOTE: ``Team.supervisor`` does not forward a ``prompt_caching``
-    kwarg, so the coordinator runs without prompt caching. The
-    workers DO cache (built as plain Agents in
-    :mod:`loom_code.workers`). A loomflow gap worth closing later.
+    Prompt caching is on for BOTH the coordinator (via
+    loomflow 0.10.12's ``Team.supervisor(prompt_caching=)`` kwarg)
+    and every worker (each built as a plain ``Agent`` in
+    :mod:`loom_code.workers` with ``prompt_caching=True``). On
+    Anthropic models that pins a ``cache_control`` marker on the
+    last system block + last tool def, so the system prompt + tool
+    schemas hit the cache on every turn after the first; on OpenAI
+    models caching is automatic, the flag just enables cache-aware
+    token accounting.
 
     Persistent subagents (loomflow 0.10.10+) is default-on. Each
     worker gets a stable ``worker_<role>_<ULID>`` id + session_id
@@ -117,6 +122,7 @@ def build_agent(
         living_plan=True,
         max_turns=max_turns,
         max_stop_hook_iterations=max_stop_hook_iterations,
+        prompt_caching=True,
     )
     return coordinator, workspace
 

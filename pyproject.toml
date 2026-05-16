@@ -9,11 +9,12 @@ dependencies = [
     # through loomflow's LiteLLMModel adapter automatically.
     # [web] pulls in httpx + duckduckgo-search for the web_tool
     # backends — /set_web wires them at runtime, but the deps need
-    # to be installed up front. 0.10.10 floor: persistent subagents
-    # (workers carry memory across delegations + runs) plus
-    # ``stop_hooks=`` / ``max_stop_hook_iterations=`` forwarded through
-    # ``Team.supervisor`` — both consumed directly by ``build_agent``.
-    "loomflow[litellm,web]>=0.10.10",
+    # to be installed up front. 0.10.12 floor: ``prompt_caching=``
+    # now forwarded through ``Team.supervisor`` (the coordinator was
+    # the only piece without caching before — workers always had it).
+    # Older floors covered persistent subagents (0.10.10) and the
+    # Windows charmap + bash_tool fixes (0.10.11).
+    "loomflow[litellm,web]>=0.10.12",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user
