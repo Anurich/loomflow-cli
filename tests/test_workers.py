@@ -50,3 +50,24 @@ def test_bash_only_where_it_earns_its_keep(project: Project) -> None:
 def test_every_worker_has_the_read_kernel(project: Project) -> None:
     for name, agent in build_workers(project, model="echo").items():
         assert _READ_KERNEL <= _tool_names(agent), name
+
+
+def test_every_worker_has_web_fetch(project: Project) -> None:
+    # web_fetch closes the URL-fetch gap. It's read-only by
+    # construction (no disk write, no shell), so giving it to the
+    # read-only specialists doesn't weaken the sole-writer
+    # invariant pinned in test_coder_is_the_sole_writer.
+    for name, agent in build_workers(project, model="echo").items():
+        assert "web_fetch" in _tool_names(agent), name
+
+
+def test_every_worker_persists_tool_transcripts(project: Project) -> None:
+    # loomflow 0.10.15+ persists the per-delegation tool transcript
+    # (read/edit/bash results) on each worker's Episode rows so the
+    # NEXT delegation rehydrates them via session_messages() — the
+    # worker quotes prior reads instead of re-running them. We pin
+    # this so future edits to ``workers.py`` don't silently drop the
+    # flag and regress to the pre-0.10.15 re-read pattern that
+    # leaked tokens on every long session.
+    for name, agent in build_workers(project, model="echo").items():
+        assert agent._persist_tool_transcripts is True, name

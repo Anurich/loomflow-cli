@@ -18,7 +18,7 @@ dependencies = [
     # 4-of-4 Anthropic cache breakpoints, count_tokens helper)
     # and the 0.10.10+ persistent subagents / Windows compat /
     # earlier Team kwarg fixes.
-    "loomflow[litellm,web]>=0.10.14",
+    "loomflow[litellm,web]>=0.10.16",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

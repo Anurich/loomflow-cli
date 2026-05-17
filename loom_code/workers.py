@@ -28,6 +28,17 @@ Workers inherit the shared notebook (``workspace=``) and the
 coordinator's memory via loomflow's ambient propagation — they
 are NOT given their own, so there's one notebook and one memory
 db for the whole team.
+
+Memory propagation became real in loomflow 0.10.15 (before that,
+``Team.supervisor(memory=...)`` propagated to the coordinator
+only and workers silently fell back to ephemeral
+``InMemoryMemory``). Combined with ``persist_tool_transcripts=True``
+on each worker (also 0.10.15+), the worker's ``read`` / ``edit`` /
+``bash`` results land in the coordinator's sqlite memory keyed
+by the worker's stable session_id — so the same worker delegated
+to twice no longer re-reads the same file. See the per-worker
+constructors below for the wiring and the ``BUILD_LOG`` for the
+diagnosis that led to this.
 """
 
 from __future__ import annotations
@@ -48,7 +59,8 @@ from loomflow.tools import (
 )
 
 from .project import Project
-from .prompts import build_coder_prompt
+from .prompts import build_coder_prompt, build_simple_coder_prompt
+from .web_fetch import web_fetch_tool
 
 # The coder does real, multi-step work — it gets a generous turn
 # budget. Read-only specialists answer a scoped question and exit,
@@ -65,14 +77,23 @@ investigator. A tech lead delegates ONE question about the
 codebase to you. You answer it thoroughly and hand the answer
 back.
 
-You have read-only tools: `read`, `grep`, `find`, `ls`. You have
-NO write/edit/bash — you cannot change anything, and must not try.
+You have read-only tools: `read`, `grep`, `find`, `ls` (all
+scoped to the project root) and `web_fetch` (for HTTPS URLs and
+raw GitHub files). You have NO write/edit/bash — you cannot
+change anything, and must not try.
 
 How you work:
 - Start broad (`find` / `ls` / `grep` for the relevant symbols),
   then `read` the files that matter.
 - Follow the actual wiring — imports, call sites, config — don't
   guess.
+- For URLs the lead names (a GitHub link, README, doc page,
+  spec), use `web_fetch(url=...)` — never substitute a local
+  file for a remote source you were asked to inspect. GitHub
+  blob URLs auto-rewrite to raw, so you can paste the human URL.
+  If you need a full repo (not a single file), say so in your
+  report — full clones need `bash git clone`, which only `coder`
+  has; the lead can re-route.
 - Answer concretely. Cite `path:line` for every claim. Quote the
   key code, don't paraphrase it away.
 - If the question has sub-parts, answer each.
@@ -175,15 +196,23 @@ You are the last line before the user sees the work. Be skeptical.
 
 
 def _read_only_tools(project: Project) -> list[Any]:
-    """The read-only inspection kernel — `read`/`grep`/`find`/`ls`,
-    all scoped to the project root. Shared by explorer + auditor;
-    the reviewer adds `bash` on top."""
+    """The read-only inspection kernel — `read`/`grep`/`find`/`ls`
+    scoped to the project root, plus `web_fetch` for reaching URLs
+    and GitHub raw files (read-only by construction — no disk write,
+    no shell). Shared by explorer + auditor; the reviewer adds
+    `bash` on top.
+
+    ``web_fetch`` closes the URL-fetch gap that previously forced
+    the read-only specialists to silently substitute local files
+    for remote sources; preserves the sole-writer invariant because
+    the tool literally cannot write."""
     root = project.root
     return [
         read_tool(root),
         grep_tool(root),
         find_tool(root),
         ls_tool(root),
+        web_fetch_tool(),
     ]
 
 
@@ -213,11 +242,21 @@ def _build_coder(
             find_tool(root),
             ls_tool(root),
             bash_tool(root, timeout=300.0),
+            web_fetch_tool(),
         ],
         permissions=StandardPermissions(),
         approval_handler=approval_handler,
         prompt_caching=True,
         max_turns=_CODER_MAX_TURNS,
+        # Persistent tool-transcripts (loomflow 0.10.15+) — without
+        # this the coder forgets every file read / edit / bash
+        # output between delegations, even though its session_id
+        # is preserved. Re-reading the same file 5x per task is
+        # the single biggest token leak in long sessions; flipping
+        # this on makes session_messages() rehydrate the prior
+        # tool transcript so the coder QUOTES what it read instead
+        # of re-running `read`.
+        persist_tool_transcripts=True,
     )
 
 
@@ -234,6 +273,11 @@ def _build_explorer(
         tools=_read_only_tools(project),
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
+        # See ``_build_coder`` for the rationale. Explorer benefits
+        # too: a question like "how does X work, then check Y" no
+        # longer re-greps + re-reads X's files when Y comes in as
+        # a follow-up via ``send_message``.
+        persist_tool_transcripts=True,
     )
 
 
@@ -247,6 +291,10 @@ def _build_auditor(project: Project, *, model: str) -> Agent:
         tools=_read_only_tools(project),
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
+        # Same rationale as explorer — auditor accumulates context
+        # about the focus area across rounds when its findings get
+        # iterated on.
+        persist_tool_transcripts=True,
     )
 
 
@@ -270,6 +318,73 @@ def _build_reviewer(
         approval_handler=approval_handler,
         prompt_caching=True,
         max_turns=_REVIEWER_MAX_TURNS,
+        # Reviewer benefits too: re-review cycles ("you flagged X,
+        # the coder fixed it, recheck") no longer re-read every
+        # changed file from scratch.
+        persist_tool_transcripts=True,
+    )
+
+
+def build_simple_coder(
+    project: Project,
+    *,
+    model: str,
+    approval_handler: Callable[..., Awaitable[bool]] | None,
+    memory_url: str,
+    web_backend: str | None = None,
+) -> Agent:
+    """Build the SIMPLE-mode loom-code agent — single coder, no team.
+
+    Used by the router (``Team.router`` in :mod:`loom_code.agent`)
+    when the classifier judges the user's request to be a single-
+    file change / focused question / quick fix. Strips the entire
+    team apparatus:
+
+    * No ``delegate`` / ``forward_message`` / ``send_message`` —
+      this agent talks to the user directly.
+    * No ``living_plan`` — plan tracking is overhead the simple
+      path doesn't need.
+    * No ``workspace`` notebook — single-agent doesn't need a
+      shared scratchpad. (Cross-mode notebook continuity comes
+      from the team-mode agent when the router picks complex.)
+    * Tool surface: full file-and-shell kernel
+      (read/write/edit/grep/find/ls/bash) + web_fetch — same as
+      the ``coder`` worker, just plumbed directly to the user
+      instead of through a coordinator delegation.
+
+    ``memory_url`` is the SAME sqlite path the team uses, so
+    sessions opened in simple mode and follow-ups answered in
+    team mode share recall across the boundary. Persistent
+    transcripts on so re-asks within the same session don't
+    re-read files.
+    """
+    root = project.root
+    has_web = web_backend is not None
+    tools: list[Any] = [
+        read_tool(root),
+        write_tool(root),
+        edit_tool(root),
+        grep_tool(root),
+        find_tool(root),
+        ls_tool(root),
+        bash_tool(root, timeout=300.0),
+        web_fetch_tool(),
+    ]
+    if has_web:
+        from loomflow.tools import web_tool
+        tools.append(web_tool(backend=web_backend))  # type: ignore[arg-type]
+
+    return Agent(
+        build_simple_coder_prompt(project, has_web=has_web),
+        model=model,
+        architecture=ReAct(),
+        tools=tools,
+        memory=memory_url,
+        permissions=StandardPermissions(),
+        approval_handler=approval_handler,
+        prompt_caching=True,
+        max_turns=_CODER_MAX_TURNS,
+        persist_tool_transcripts=True,
     )
 
 
