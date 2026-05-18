@@ -19,6 +19,7 @@ from pathlib import Path
 
 from loomflow import Agent
 from loomflow.architecture.router import RouterRoute
+from loomflow.mcp import MCPRegistry
 from loomflow.team import Team
 from loomflow.workspace import LocalDiskWorkspace
 
@@ -46,6 +47,7 @@ def build_agent(
     snip_window: int = 8,
     auto_compact: bool = True,
     tool_result_summarizer: str | None = None,
+    mcp_registry: MCPRegistry | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -204,6 +206,22 @@ def build_agent(
     # persist_tool_transcripts + tool_transcript_max_bytes since
     # 0.10.16's Team-kwarg-forwarding sweep). No more post-
     # construction monkey-patching.
+    # MCP tool surface for the coordinator. When ``mcp_registry``
+    # is provided (typically a graphify stdio server — see the
+    # README quickstart), the registry's tools surface in the
+    # coordinator's tool list alongside ``delegate`` /
+    # ``forward_message`` / ``send_message``. The supervisor
+    # architecture wraps whatever ``tools=`` we pass with an
+    # ``ExtendedToolHost`` that adds its own delegate-family
+    # tools — passing MCPRegistry as the base means both layers
+    # coexist (MCP tools + delegate-family) without surgery.
+    #
+    # Caller owns the registry lifecycle (``async with
+    # mcp_registry:``) — we just wire the reference. v1 limitation:
+    # MCP tools only reach the COMPLEX route (supervisor); the
+    # SIMPLE coder doesn't have MCP yet (would need
+    # ExtendedToolHost composition of local kernel + MCP, follow-
+    # up phase).
     supervisor = Team.supervisor(
         workers=workers,
         instructions=build_coordinator_instructions(project),
@@ -212,6 +230,7 @@ def build_agent(
         auto_consolidate=True,
         workspace=workspace,
         living_plan=True,
+        tools=mcp_registry,
         max_turns=max_turns,
         max_stop_hook_iterations=max_stop_hook_iterations,
         prompt_caching=True,

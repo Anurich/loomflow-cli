@@ -47,8 +47,11 @@ Slash commands (handled here, never sent to the agent):
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
+import anyio
 from loomflow import new_id
 from prompt_toolkit import HTML, PromptSession
 from prompt_toolkit.completion import (
@@ -91,6 +94,11 @@ _SLASH_HELP = """\
   [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
   [cyan]/loominit[/cyan]        index this codebase → LOOM.md so the
                    agent can skip re-reading source on every task
+  [cyan]/graphify[/cyan] [on|off]
+                   on  → install graphifyy if needed, build the
+                         knowledge graph, enable graph queries
+                   off → disable + kill the MCP subprocess
+                   (bare) → status report
   [cyan]/resume[/cyan]          resume the last session — rehydrates prior
                    turns from loomflow memory so you pick up where
                    you left off
@@ -162,6 +170,10 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/loominit", "index this codebase → LOOM.md"),
+    (
+        "/graphify",
+        "on | off | status — graphify knowledge-graph MCP wiring",
+    ),
     ("/resume", "resume the last session (rehydrate prior turns)"),
     ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
     ("/clear", "fresh conversation (new session)"),
@@ -207,6 +219,15 @@ class Repl:
         # for the whole session.
         self._gate = ApprovalGate()
         self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
+        # Optional graphify MCP server — disabled at startup, the
+        # user opts in with ``/graphify on``. When toggled on we
+        # construct the registry, call ``await connect()`` (spawns
+        # graphify subprocess), and rebuild the agent so the new
+        # tool host wires in. ``/graphify off`` reverses it.
+        # Subprocess lifecycle is tied to this attribute being
+        # non-None; the cleanup in ``_run_inner``'s ``finally``
+        # guarantees we ``aclose()`` even on crash / Ctrl-C.
+        self._mcp_registry: Any = None
         self.agent, self.workspace = build_agent(
             project,
             model=model,
@@ -293,7 +314,26 @@ class Repl:
         )
 
     async def run(self) -> int:
-        """The REPL loop. Returns an exit code."""
+        """The REPL loop. Returns an exit code.
+
+        Wraps the inner loop with cleanup that ``aclose()``s any
+        MCP subprocess the user spawned via ``/graphify on`` mid-
+        session. Without this, hitting Ctrl-C with graphify
+        enabled would leak the subprocess.
+        """
+        try:
+            return await self._run_inner()
+        finally:
+            if self._mcp_registry is not None:
+                try:
+                    await self._mcp_registry.aclose()
+                except Exception:  # noqa: BLE001 — cleanup is best-effort
+                    pass
+
+    async def _run_inner(self) -> int:
+        """The actual REPL loop body. Split out so ``run()`` can
+        own the MCP-cleanup ``finally`` without indenting the whole
+        function."""
         banner(self.model, str(self.project.root), self.project.is_git)
         if self.project.context_file:
             console.print(
@@ -323,6 +363,11 @@ class Repl:
         console.print(
             "  [dim]▸ [cyan]/loominit[/cyan]      index this "
             "codebase so future turns skip re-reading source[/dim]"
+        )
+        console.print(
+            "  [dim]▸ [cyan]/graphify on[/cyan]   build a knowledge "
+            "graph of this codebase and enable graph queries "
+            "(auto-installs graphifyy on first run)[/dim]"
         )
         # Show the resume hint ONLY when a prior session pointer
         # exists — no point telling first-time users about a
@@ -766,6 +811,8 @@ class Repl:
             await self._handle_set_web()
         elif cmd == "/loominit":
             await self._handle_loominit()
+        elif cmd == "/graphify":
+            await self._handle_graphify(arg)
         elif cmd == "/resume":
             await self._handle_resume()
         elif cmd == "/set_continue_cap":
@@ -802,16 +849,17 @@ class Repl:
 
     def _rebuild_agent(self) -> None:
         """Reconstruct the supervisor + workers using the current
-        ``self.model`` and ``self._web_backend``. Used by both
-        ``/model`` (changes the model) and ``/set_web`` (changes
-        the web backend) — same rebuild semantics, single source
-        of truth for what a "rebuild" entails."""
+        ``self.model``, ``self._web_backend``, and
+        ``self._mcp_registry``. Used by ``/model``, ``/set_web``,
+        and ``/graphify on|off`` — same rebuild semantics, single
+        source of truth for what a "rebuild" entails."""
         self.agent, self.workspace = build_agent(
             self.project,
             model=self.model,
             approval_handler=self._gate.handler,
             web_backend=self._web_backend,
             max_stop_hook_iterations=self._auto_continue_limit,
+            mcp_registry=self._mcp_registry,
         )
         self._compactor = Compactor(model=self.model)
         self._compact_tokens = 0
@@ -909,6 +957,247 @@ class Repl:
         console.print(
             f"  [dim]compacted into {len(summary)}-char summary "
             f"in memory; new conversation thread.[/dim]"
+        )
+
+    async def _ensure_graphifyy_installed(self) -> bool:
+        """Return True if the ``graphifyy`` package is importable;
+        otherwise pip-install it on the current Python and return
+        True on success / False on failure.
+
+        Uses ``sys.executable -m pip install graphifyy`` so we
+        install into whatever Python loom-code is running in — not
+        whatever ``pip`` happens to be on PATH. Captures stdout/
+        stderr (pip is chatty) and only surfaces the tail on
+        failure to keep the REPL output clean. Pip install runs in
+        an anyio subprocess so the event loop doesn't stall.
+
+        Why not require pre-install: ``/graphify on`` is the
+        user's first encounter with graphify; making them quit,
+        run pip, restart, then try again is friction that kills
+        adoption. One command, one wait, working.
+        """
+        import importlib.util
+        if importlib.util.find_spec("graphifyy") is not None:
+            return True
+        if importlib.util.find_spec("graphify") is not None:
+            # graphifyy installs as the ``graphify`` module; check
+            # both names because the PyPI name and import name
+            # differ.
+            return True
+        console.print(
+            "  [dim]installing [cyan]graphifyy[/cyan] "
+            "(~30-90s, one time)...[/dim]"
+        )
+        try:
+            with console.status("[dim]pip install graphifyy...[/dim]"):
+                proc = await anyio.run_process(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--quiet",
+                        "graphifyy",
+                    ],
+                    check=False,
+                )
+        except Exception as exc:  # noqa: BLE001 — subprocess infra failure
+            console.print(
+                f"  [red]could not run pip:[/red] {exc}"
+            )
+            return False
+        if proc.returncode != 0:
+            stderr_tail = (
+                proc.stderr.decode("utf-8", errors="replace")[-400:]
+                if proc.stderr else ""
+            )
+            console.print(
+                f"  [red]pip install graphifyy failed[/red] "
+                f"(exit {proc.returncode})"
+            )
+            if stderr_tail:
+                console.print(f"  [dim]{stderr_tail}[/dim]")
+            return False
+        console.print("  [green]✓ graphifyy installed[/green]")
+        return True
+
+    async def _ensure_graph_built(self, graph_path: Path) -> bool:
+        """Return True if ``graph_path`` exists; otherwise run
+        ``graphify <project> --out <.loom/graphify>`` to build it.
+        Returns False on subprocess failure.
+
+        Build time scales with codebase size — 30s for a small repo,
+        2+ minutes for one with 100s of files. Captured under a
+        status spinner so the REPL doesn't appear hung.
+        """
+        if graph_path.is_file():  # noqa: ASYNC240 — trivial fs op
+            return True
+        out_dir = graph_path.parent
+        out_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+        console.print(
+            "  [dim]building knowledge graph "
+            "(this can take 30s-2min on a real codebase)...[/dim]"
+        )
+        try:
+            with console.status(
+                "[dim]graphify scanning project...[/dim]"
+            ):
+                proc = await anyio.run_process(
+                    [
+                        "graphify",
+                        str(self.project.root),
+                        "--out",
+                        str(out_dir),
+                    ],
+                    check=False,
+                )
+        except Exception as exc:  # noqa: BLE001 — subprocess infra failure
+            console.print(
+                f"  [red]could not run graphify:[/red] {exc}"
+            )
+            return False
+        if proc.returncode != 0 or not graph_path.is_file():  # noqa: ASYNC240
+            stderr_tail = (
+                proc.stderr.decode("utf-8", errors="replace")[-400:]
+                if proc.stderr else ""
+            )
+            console.print(
+                f"  [red]graphify build failed[/red] "
+                f"(exit {proc.returncode})"
+            )
+            if stderr_tail:
+                console.print(f"  [dim]{stderr_tail}[/dim]")
+            return False
+        size_kb = graph_path.stat().st_size / 1024  # noqa: ASYNC240
+        console.print(
+            f"  [green]✓ graph built[/green] "
+            f"[dim]({size_kb:.1f} KB at {graph_path})[/dim]"
+        )
+        return True
+
+    async def _handle_graphify(self, arg: str) -> None:
+        """``/graphify [on|off]`` — toggle or report graphify MCP wiring.
+
+        ``/graphify on``:
+            * Construct ``MCPRegistry`` from ``default_graphify_spec``
+            * ``await connect()`` — spawns ``graphify --mcp`` subprocess
+            * Rebuild the agent so the coordinator sees graphify tools
+            * Mark enabled
+
+        ``/graphify off``:
+            * ``await aclose()`` — kills the subprocess
+            * Set registry to ``None``
+            * Rebuild the agent (back to no MCP tools)
+
+        ``/graphify`` (bare): status report — registry wired?
+            graph file present on disk? tool surface?
+
+        Subprocess cleanup on REPL exit is handled by ``run()``'s
+        ``finally`` block, so an unclosed registry from a forgotten
+        ``/graphify off`` doesn't leak a child process.
+        """
+        from .agent import LOOM_DIR
+
+        arg = arg.strip().lower()
+        graph_path = (
+            self.project.root / LOOM_DIR / "graphify" / "graph.json"
+        )
+
+        if arg == "on":
+            if self._mcp_registry is not None:
+                console.print(
+                    "  [dim]graphify already enabled.[/dim]"
+                )
+                return
+            # Step 1: ensure the ``graphifyy`` package is installed.
+            # We pip-install on demand so the user never has to
+            # know the package name or run pip themselves — same
+            # zero-friction story as ``/set_web`` saving API keys.
+            if not await self._ensure_graphifyy_installed():
+                return
+            # Step 2: ensure the graph file exists. If missing,
+            # invoke ``graphify <project> --out .loom/graphify`` to
+            # build it from scratch. This is the slow part (30s-2min
+            # depending on codebase size) — show a status so the
+            # user sees we haven't hung.
+            if not await self._ensure_graph_built(graph_path):
+                return
+            # Step 3: now actually wire the MCP server. Subprocess
+            # spawns inside connect(); aclose() in run()'s finally
+            # block guarantees cleanup.
+            from loomflow.mcp import MCPRegistry
+
+            from .mcp_specs import default_graphify_spec
+            self._mcp_registry = MCPRegistry(
+                [default_graphify_spec(self.project.root)]
+            )
+            try:
+                await self._mcp_registry.connect()
+            except Exception as exc:  # noqa: BLE001 — surface to user
+                self._mcp_registry = None
+                console.print(
+                    f"  [red]could not start graphify:[/red] {exc}"
+                )
+                return
+            self._rebuild_agent()
+            console.print("  [green]✓ graphify enabled[/green]")
+            # Install the debounced post-commit hook so the graph
+            # refreshes itself every N commits instead of going
+            # stale silently. Idempotent — safe to call every
+            # ``/graphify on``. Skips cleanly on non-git projects.
+            from .git_hook import install as install_hook
+            hook_status = install_hook(self.project.root)
+            if hook_status in ("installed", "updated"):
+                console.print(
+                    f"  [dim]post-commit hook {hook_status} "
+                    "— graph refreshes every 5 commits[/dim]"
+                )
+            return
+
+        if arg == "off":
+            if self._mcp_registry is None:
+                console.print(
+                    "  [dim]graphify already disabled.[/dim]"
+                )
+                return
+            try:
+                await self._mcp_registry.aclose()
+            except Exception:  # noqa: BLE001 — cleanup is best-effort
+                pass
+            self._mcp_registry = None
+            self._rebuild_agent()
+            console.print("  [yellow]graphify disabled.[/yellow]")
+            return
+
+        # No arg → status report.
+        if self._mcp_registry is None:
+            console.print(
+                "  [dim]graphify:[/dim] [yellow]disabled[/yellow] "
+                "— run [cyan]/graphify on[/cyan] to install "
+                "(if needed), build the graph, and enable queries"
+            )
+            return
+        console.print(
+            "  [dim]graphify:[/dim] [green]enabled[/green]"
+        )
+        if graph_path.is_file():
+            size_kb = graph_path.stat().st_size / 1024
+            console.print(
+                f"  [dim]graph:[/dim] [green]{graph_path}[/green] "
+                f"([dim]{size_kb:.1f} KB[/dim])"
+            )
+        else:
+            console.print(
+                "  [dim]graph:[/dim] [yellow]missing[/yellow] — "
+                "build with [cyan]graphify .[/cyan] in another "
+                "terminal"
+            )
+        console.print(
+            "  [dim]tools:[/dim] "
+            "[cyan]graphify_query[/cyan] · "
+            "[cyan]graphify_path[/cyan] · "
+            "[cyan]graphify_explain[/cyan] "
+            "— [cyan]/graphify off[/cyan] to disable"
         )
 
     def _handle_set_continue_cap(self, arg: str) -> None:
@@ -1365,6 +1654,20 @@ class Repl:
             "  [dim]future turns will reference this file. Re-run "
             "[cyan]/loominit[/cyan] after major refactors.[/dim]"
         )
+        # Install the debounced post-commit hook so the structural
+        # index refreshes itself every N commits. ``LOOM.md`` stays
+        # whatever the annotator wrote; the structural refresh
+        # updates ``.loom/index.json`` so per-turn injection picks
+        # up file changes + the inline ``(stale: path:line)``
+        # markers in LOOM.md surface when annotated claims drift.
+        # Idempotent + git-aware (silent skip on non-git).
+        from .git_hook import install as install_hook
+        hook_status = install_hook(self.project.root)
+        if hook_status in ("installed", "updated"):
+            console.print(
+                f"  [dim]post-commit hook {hook_status} "
+                "— structural index refreshes every 5 commits[/dim]"
+            )
 
 
 def _read_pyproject_metadata(repo_root) -> dict[str, str]:
@@ -1396,6 +1699,7 @@ def _read_pyproject_metadata(repo_root) -> dict[str, str]:
 
 
 async def run_repl(project: Project, model: str) -> int:
-    """Entry point for the interactive REPL."""
+    """Entry point for the interactive REPL. Graphify is opt-in
+    via ``/graphify on`` from within the session."""
     repl = Repl(project, model)
     return await repl.run()

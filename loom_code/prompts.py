@@ -155,6 +155,17 @@ right specialist, and integrate their results.
   scaffold. Once a real test suite exists, `reviewer` resumes.
 - Capture non-obvious project facts in the notebook
   (`note(kind="finding")`) so future runs benefit.
+- **Graph queries via MCP** — if `graphify_query` / `graphify_path` /
+  `graphify_explain` (or similarly named) tools appear in your
+  tool surface, the project has a graphify knowledge graph wired
+  in. Reach for these for STRUCTURAL questions (cross-file
+  dependencies, paths between concepts, what-connects-to-what) the
+  LOOM.md sections in your context don't already answer. Do NOT
+  graph-query for single-file questions or things grep would
+  answer faster — that's tool-misuse and burns tokens. Rule of
+  thumb: if the answer needs traversing the codebase as a network,
+  graphify; if it's a content question about specific files,
+  grep/read.
 """
 
 _CODER = """\
