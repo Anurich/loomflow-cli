@@ -17,6 +17,7 @@ import difflib
 from typing import Any
 
 import anyio
+from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.text import Text
@@ -89,12 +90,49 @@ class ApprovalGate:
     # ---- internals ------------------------------------------------------
 
     def _ask(self) -> str:
-        """Blocking y/n/a prompt. Runs on a worker thread."""
+        """Blocking choice prompt. Runs on a worker thread.
+
+        Renders a bordered "button-row" panel above the prompt line
+        so each choice is visually obvious — the prior one-line
+        ``allow? [y/n/a] (y):`` form was easy to miss and the
+        Enter-to-accept-default wasn't communicated. User reported
+        that as a real obstacle: "it must show the button or
+        something i can press because here i need to press enter
+        to make it go ahead".
+
+        Three options, clearly labeled with their hotkey + the
+        Enter cue on the default ('yes'). Rich Prompt still
+        validates the typed answer, so unknown keys re-prompt
+        rather than silently misfiring.
+        """
+        button_row = Text.assemble(
+            ("  [", "dim"),
+            ("Y", "bold green"),
+            ("] yes  ", "green"),
+            ("(default — press ", "dim"),
+            ("Enter", "bold"),
+            (")    ", "dim"),
+            ("[", "dim"),
+            ("N", "bold red"),
+            ("] no    ", "red"),
+            ("[", "dim"),
+            ("A", "bold yellow"),
+            ("] yes to all this session", "yellow"),
+        )
+        console.print(
+            Panel(
+                button_row,
+                border_style="dim",
+                padding=(0, 1),
+                expand=False,
+            )
+        )
         return Prompt.ask(
-            "  [bold]allow?[/bold]",
+            "  [bold]choose[/bold]",
             choices=["y", "n", "a"],
             default="y",
-            show_choices=True,
+            show_choices=False,
+            show_default=False,
         ).strip().lower()
 
     def _render_preview(self, tool: str, args: dict[str, Any]) -> None:

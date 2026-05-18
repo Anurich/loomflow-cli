@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import Any
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.text import Text
@@ -121,13 +122,22 @@ class StreamRenderer:
         # the _on_completed fallback (print result["output"] only if
         # nothing streamed, so we never double-print).
         self._any_text = False
-        # Buffer for one prose burst — chunks accumulate here, then
-        # `_end_text` renders the whole thing as Markdown. We don't
-        # stream char-by-char because Markdown can't be rendered
-        # incrementally (headings / code-fences / list items need
-        # the surrounding context to format correctly). The spinner
-        # gives feedback during the wait.
+        # Buffer for one prose burst — chunks accumulate here AND
+        # the in-place Live widget re-renders the accumulated
+        # markdown on each chunk. We use Rich's ``Live`` to update a
+        # region of the terminal in place: the user sees prose
+        # forming token-by-token instead of a long spinner-then-blob
+        # wait. ``_live`` is set in ``_on_model_chunk`` when the
+        # burst starts and torn down in ``_end_text``.
+        #
+        # Why the in-place re-render (instead of plain-text
+        # streaming + final markdown pass): the plain approach
+        # forces the user to see the same response twice (raw text
+        # streams, then re-renders as markdown), which is jarring.
+        # Live re-renders the markdown buffer on every chunk —
+        # slight flicker, but only ONE render the user remembers.
         self._text_buffer: list[str] = []
+        self._live: Live | None = None
         # call_id -> tool name. loomflow's `tool_result` event only
         # carries `call_id` (ToolResult has no `tool` field) — the
         # tool NAME is only on the `tool_call` event. We bridge the
@@ -176,12 +186,14 @@ class StreamRenderer:
         # "text" kind carries assistant prose; "tool_call"/"finish"
         # chunks have text=None and are surfaced by other handlers.
         #
-        # We BUFFER chunks rather than printing incrementally — once
-        # the prose burst ends we render the whole thing as
-        # Markdown. Streaming raw text would mean the user sees
-        # half-formed markdown (`#`, `**`, etc.) flash by before
-        # the renderer kicks in, which is worse UX than the spinner
-        # holding for a few seconds while the response completes.
+        # We render INCREMENTALLY via Rich's ``Live`` widget — the
+        # buffer accumulates and Live re-renders the markdown view
+        # of it in place on every chunk. Two visible wins vs the
+        # old buffer-and-blob path: (1) SIMPLE route turns that
+        # answer without tool calls finally show progress instead
+        # of a long silent spinner, (2) the user gets the feeling
+        # the model is THINKING rather than dead — the
+        # asymmetry-with-COMPLEX-route problem the user flagged.
         chunk = payload.get("chunk") or {}
         if chunk.get("kind") != "text":
             return
@@ -189,33 +201,87 @@ class StreamRenderer:
         if not text:
             return
         if not self._in_text:
+            # Starting a new prose burst — pause the spinner so it
+            # doesn't fight Live for the cursor row, then start Live
+            # and let it own the bottom of the terminal.
+            self._pause_status()
+            console.print()
+            # ``refresh_per_second=8`` keeps re-render cost bounded
+            # while still feeling smooth. transient=False so the
+            # final rendered markdown stays on screen after Live
+            # stops (we explicitly DON'T want it to disappear).
+            self._live = Live(
+                Markdown(""),
+                console=console,
+                refresh_per_second=8,
+                transient=False,
+            )
+            self._live.start()
             self._in_text = True
         self._any_text = True
         self._text_buffer.append(text)
+        # Update Live with the accumulated markdown so far. Try
+        # Markdown first; on pathological partial markdown (open
+        # code fences, etc.) Rich can still parse, but if it ever
+        # raises we degrade to plain Text — never crash mid-stream.
+        if self._live is not None:
+            full_so_far = "".join(self._text_buffer)
+            try:
+                self._live.update(Markdown(full_so_far))
+            except Exception:  # noqa: BLE001 — survive odd markdown
+                self._live.update(Text(full_so_far))
 
     def _end_text(self) -> None:
         if not self._in_text:
             return
-        # Drain the buffer, render once. The spinner was running
-        # the whole time; pause it now so the markdown render
-        # doesn't fight for the cursor line.
+        # Final flush — render the COMPLETE markdown one last time
+        # before stopping Live, so the on-screen output reflects the
+        # final well-formed markdown (the partial re-renders during
+        # streaming may have been mid-block).
         full = "".join(self._text_buffer).strip()
+        if self._live is not None:
+            if full:
+                try:
+                    self._live.update(Markdown(full))
+                except Exception:  # noqa: BLE001
+                    self._live.update(Text(full))
+            self._live.stop()
+            self._live = None
         self._text_buffer.clear()
         self._in_text = False
-        if full:
-            self._pause_status()
-            console.print()
-            try:
-                console.print(Markdown(full))
-            except Exception:  # noqa: BLE001 — must survive odd markdown
-                # Markdown rendering can throw on pathological input
-                # (unclosed fences, weird escapes). Fall back to
-                # plain print so we never lose the response.
-                console.print(full, markup=False, highlight=False)
         # Prose burst over — bring the spinner back; the next
         # tool_call will overwrite this label with something
         # more specific.
         self._set_status("thinking...")
+
+    # ---- architecture events --------------------------------------------
+
+    def _on_architecture_event(self, payload: dict[str, Any]) -> None:
+        """Surface the bits the user actually cares about. Most
+        architecture events are framework-internal progress signals
+        the renderer correctly hides — but ``router.dispatched``
+        tells the user WHICH route the classifier picked
+        ('simple' vs 'complex' for loom-code), which fixes the
+        observability asymmetry where COMPLEX turns showed
+        delegate+worker activity but SIMPLE turns showed nothing
+        but a spinner. Unrelated event names are ignored."""
+        name = payload.get("name")
+        if name != "router.dispatched":
+            return
+        route = payload.get("route")
+        if not route:
+            return
+        # End any in-flight prose burst first so the route line
+        # doesn't land mid-Live-render. Then print a single line.
+        self._end_text()
+        self._pause_status()
+        console.print(
+            f"  [dim]→ routed to[/dim] [cyan]{route}[/cyan]"
+        )
+        # Re-set the status spinner so the user has feedback while
+        # the specialist starts up. Specific tool labels will
+        # overwrite it as the route's agent does its work.
+        self._set_status(f"{route} working...")
 
     # ---- tools ----------------------------------------------------------
 
