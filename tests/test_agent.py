@@ -84,53 +84,16 @@ def test_coordinator_persists_tool_transcripts(project: Project) -> None:
     assert coordinator._persist_tool_transcripts is True
 
 
-def test_mcp_registry_reaches_the_supervisor(project: Project) -> None:
-    """When ``mcp_registry`` is passed to ``build_agent``, the registry
-    surfaces on the COMPLEX route (supervisor coordinator) so the
-    model can call MCP tools (e.g. graphify queries) alongside
-    delegate/forward/send_message. Pins the wiring so a future edit
-    can't silently drop the MCP plumbing."""
-    from loomflow.mcp import MCPRegistry, MCPServerSpec
-
-    # Construct a registry from a fake stdio spec. We never call
-    # ``connect()`` — that would spawn a subprocess. We just verify
-    # the registry reference reaches the supervisor's tool host.
-    spec = MCPServerSpec.stdio(
-        name="fake",
-        command="true",  # /bin/true — exists, exits 0, never connected here
-        args=(),
-        description="test spec; never spawned",
-    )
-    registry = MCPRegistry([spec])
-
-    coordinator, _ = build_agent(
-        project, model="echo", mcp_registry=registry
-    )
-    # Navigate: router → complex route → supervisor agent → tool host.
-    from loomflow.architecture.router import Router
-
-    assert isinstance(coordinator.architecture, Router)
-    complex_route = next(
-        r for r in coordinator.architecture._routes if r.name == "complex"
-    )
-    supervisor_agent = complex_route.agent
-    # The supervisor's tool host wraps our MCPRegistry (the framework's
-    # ExtendedToolHost wraps the base ``tools=`` we passed with
-    # delegate-family tools). The base must be the registry instance
-    # we handed in — reference identity, not equality, is what we
-    # pin.
-    base = getattr(
-        supervisor_agent._tool_host, "_base", supervisor_agent._tool_host
-    )
-    assert base is registry, (
-        "mcp_registry was dropped between build_agent and the "
-        "supervisor's tool host; agent will not see MCP tools"
-    )
-
-
-def test_mcp_registry_default_is_none(project: Project) -> None:
-    """Default behavior unchanged for users who don't pass MCP —
-    no subprocess overhead, no extra tools in the surface."""
+def test_graphify_skill_registered_on_coordinator(
+    project: Project,
+) -> None:
+    """The bundled graphify skill in
+    ``loom_code/skills/graphify/`` must be auto-discovered by
+    ``build_agent`` and wired into the COMPLEX-route supervisor's
+    skill registry. Regression-pins the skill-discovery path
+    (importlib.resources lookup + package-data inclusion in
+    pyproject) so a future edit can't silently drop the
+    graphify integration."""
     coordinator, _ = build_agent(project, model="echo")
     from loomflow.architecture.router import Router
 
@@ -139,11 +102,12 @@ def test_mcp_registry_default_is_none(project: Project) -> None:
         r for r in coordinator.architecture._routes if r.name == "complex"
     )
     supervisor_agent = complex_route.agent
-    # Without mcp_registry, the base host is InProcessToolHost (empty
-    # or supervisor-only), NOT an MCPRegistry.
-    base = getattr(
-        supervisor_agent._tool_host, "_base", supervisor_agent._tool_host
+    # The Skill registry on the supervisor must list 'graphify'
+    # — that's what the agent sees when deciding to call
+    # ``load_skill('graphify')``. ``names()`` is the public listing.
+    skill_names = set(supervisor_agent.skills.names())
+    assert "graphify" in skill_names, (
+        f"graphify skill missing from coordinator's surface "
+        f"(found: {skill_names}). Check pyproject.toml's "
+        "package-data section + loom_code/skills/graphify/SKILL.md."
     )
-    from loomflow.mcp import MCPRegistry
-
-    assert not isinstance(base, MCPRegistry)

@@ -25,7 +25,6 @@ Backgrounded by the shell hook so it doesn't delay the commit.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -99,22 +98,31 @@ def _maybe_refresh(
 
 
 def _refresh_graphify(project_root: Path, graphify_dir: Path) -> None:
-    """Run graphify in incremental-update mode. ``--update`` is
-    much cheaper than a full rebuild — it only re-extracts files
-    whose hash changed since the last build. Capped at 5 min to
-    avoid runaway on giant repos."""
-    subprocess.run(
-        [
-            "graphify",
-            str(project_root),
-            "--update",
-            "--out",
-            str(graphify_dir),
-        ],
-        check=False,
-        capture_output=True,
-        timeout=300,
-    )
+    """Re-run the graphify extract → build → cluster → persist
+    pipeline in-process via the shared ``graphify_build_impl``
+    helper that the ``@tool`` wrapper + ``/loominit`` already use.
+
+    Single source of truth means three things stay in sync: the
+    submodule-import shim that dodges graphify's ``__getattr__``
+    namespace shadowing, the git-ls-files fast path that skips
+    walking ``.venv`` / ``node_modules``, and the exact tree-sitter
+    / Leiden / JSON pipeline. Bypassing it here is what caused this
+    function to silently fail on every commit before: it called
+    ``graphify.extract(files)`` (a submodule, not a function),
+    passed ``[extraction]`` (build_from_json wants a dict), and
+    dropped the ``communities`` arg to ``to_json``.
+
+    Capped via subprocess from the shell hook (5 min, see the hook
+    wrapper) so a hung extraction can't block git indefinitely."""
+    # graphify_dir kept in the signature for the caller's existing
+    # path math; the impl writes to the same `.loom/graphify/graph.json`
+    # via its own ``_graph_path`` helper, so we don't need to use it.
+    _ = graphify_dir
+    import anyio
+
+    from .skills.graphify.tools import graphify_build_impl
+
+    anyio.run(graphify_build_impl, project_root)
 
 
 def _refresh_loominit(project_root: Path) -> None:

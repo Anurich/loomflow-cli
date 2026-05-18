@@ -222,6 +222,7 @@ def _build_coder(
     model: str,
     approval_handler: Callable[..., Awaitable[bool]] | None,
     has_web: bool = False,
+    skills: list[Any] | None = None,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
@@ -244,6 +245,14 @@ def _build_coder(
             bash_tool(root, timeout=300.0),
             web_fetch_tool(),
         ],
+        # Bundled skills (graphify, etc.) — registered on workers
+        # too, not just the coordinator. Without this, when the
+        # coordinator delegates "build the graph" to coder, the
+        # coder spawns with its own tool host that doesn't have
+        # ``graphify__build`` — and falls back to ``bash
+        # graphify__build`` which doesn't exist. Skill on worker
+        # = tool actually callable wherever execution lands.
+        skills=skills,
         permissions=StandardPermissions(),
         approval_handler=approval_handler,
         prompt_caching=True,
@@ -261,7 +270,11 @@ def _build_coder(
 
 
 def _build_explorer(
-    project: Project, *, model: str, has_web: bool = False
+    project: Project,
+    *,
+    model: str,
+    has_web: bool = False,
+    skills: list[Any] | None = None,
 ) -> Agent:
     """Read-only investigator — no permissions needed (none of its
     tools are destructive). ``has_web`` toggles the `web_search`
@@ -271,6 +284,7 @@ def _build_explorer(
         model=model,
         architecture=ReAct(),
         tools=_read_only_tools(project),
+        skills=skills,
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
         # See ``_build_coder`` for the rationale. Explorer benefits
@@ -281,7 +295,12 @@ def _build_explorer(
     )
 
 
-def _build_auditor(project: Project, *, model: str) -> Agent:
+def _build_auditor(
+    project: Project,
+    *,
+    model: str,
+    skills: list[Any] | None = None,
+) -> Agent:
     """Read-only defect hunter — same tool scope as the explorer,
     different objective."""
     return Agent(
@@ -289,6 +308,7 @@ def _build_auditor(project: Project, *, model: str) -> Agent:
         model=model,
         architecture=ReAct(),
         tools=_read_only_tools(project),
+        skills=skills,
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
         # Same rationale as explorer — auditor accumulates context
@@ -303,6 +323,7 @@ def _build_reviewer(
     *,
     model: str,
     approval_handler: Callable[..., Awaitable[bool]] | None,
+    skills: list[Any] | None = None,
 ) -> Agent:
     """Independent verifier — read-only inspection plus `bash` to
     run the project's real test suite. `bash` is gated through the
@@ -314,6 +335,7 @@ def _build_reviewer(
         model=model,
         architecture=ReAct(),
         tools=[*_read_only_tools(project), bash_tool(root, timeout=300.0)],
+        skills=skills,
         permissions=StandardPermissions(),
         approval_handler=approval_handler,
         prompt_caching=True,
@@ -332,6 +354,7 @@ def build_simple_coder(
     approval_handler: Callable[..., Awaitable[bool]] | None,
     memory_url: str,
     web_backend: str | None = None,
+    skills: list[Any] | None = None,
 ) -> Agent:
     """Build the SIMPLE-mode loom-code agent — single coder, no team.
 
@@ -379,6 +402,7 @@ def build_simple_coder(
         model=model,
         architecture=ReAct(),
         tools=tools,
+        skills=skills,
         memory=memory_url,
         permissions=StandardPermissions(),
         approval_handler=approval_handler,
@@ -394,6 +418,7 @@ def build_workers(
     model: str,
     approval_handler: Callable[..., Awaitable[bool]] | None = None,
     web_backend: str | None = None,
+    skills: list[Any] | None = None,
 ) -> dict[str, Agent]:
     """Build the worker roster for ``Team.supervisor``.
 
@@ -422,13 +447,17 @@ def build_workers(
             model=model,
             approval_handler=approval_handler,
             has_web=has_web,
+            skills=skills,
         ),
         "explorer": _build_explorer(
-            project, model=model, has_web=has_web
+            project, model=model, has_web=has_web, skills=skills
         ),
-        "auditor": _build_auditor(project, model=model),
+        "auditor": _build_auditor(project, model=model, skills=skills),
         "reviewer": _build_reviewer(
-            project, model=model, approval_handler=approval_handler
+            project,
+            model=model,
+            approval_handler=approval_handler,
+            skills=skills,
         ),
     }
     if has_web:

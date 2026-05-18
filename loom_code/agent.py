@@ -15,17 +15,36 @@ loom-code (REPL, CLI, renderer) treats it exactly like any agent.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from importlib.resources import files as _pkg_files
 from pathlib import Path
 
 from loomflow import Agent
 from loomflow.architecture.router import RouterRoute
-from loomflow.mcp import MCPRegistry
 from loomflow.team import Team
 from loomflow.workspace import LocalDiskWorkspace
 
 from .project import Project
 from .prompts import build_coordinator_instructions
 from .workers import build_simple_coder, build_workers
+
+
+# Bundled skills shipped with loom-code. Each entry is a directory
+# under ``loom_code/skills/`` with a ``SKILL.md`` + optional
+# ``tools.py``. The framework's SkillRegistry discovers them on
+# Agent construction; the agent sees a 50-token (name + description)
+# entry for each, and calls ``load_skill(name)`` to materialise the
+# body + tools when relevant. Cheap baseline — no LLM cost unless
+# the agent actually loads a skill.
+def _bundled_skill_paths() -> list[Path]:
+    """Return absolute Paths to every shipped skill directory.
+    Uses ``importlib.resources`` so the lookup works whether
+    loom-code is installed editable, as a wheel, or zipped."""
+    root = _pkg_files("loom_code.skills")
+    out: list[Path] = []
+    for entry in root.iterdir():  # type: ignore[attr-defined]
+        if entry.is_dir() and (entry / "SKILL.md").is_file():
+            out.append(Path(str(entry)))
+    return out
 
 # loom-code keeps its per-project state under <root>/.loom/ —
 # the workspace notebook and the sqlite memory db both live here.
@@ -47,7 +66,6 @@ def build_agent(
     snip_window: int = 8,
     auto_compact: bool = True,
     tool_result_summarizer: str | None = None,
-    mcp_registry: MCPRegistry | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -152,11 +170,23 @@ def build_agent(
     workspace = LocalDiskWorkspace(str(loom_dir / "notebook"))
     memory_url = f"sqlite:{loom_dir / 'memory.db'}"
 
+    # Bundled skills — graphify today, more shipped here later.
+    # Computed here (before workers/supervisor are built) so the
+    # SAME list lands on the coordinator AND every worker AND
+    # the simple-mode coder. Without skills on workers, the
+    # coordinator delegating "build the graph" to coder fails:
+    # coder's tool host doesn't have ``graphify__build`` and the
+    # model falls back to ``bash graphify__build`` (no such
+    # executable). Skills on the worker = tool actually callable
+    # wherever execution lands.
+    bundled_skills = _bundled_skill_paths()
+
     workers = build_workers(
         project,
         model=model,
         approval_handler=approval_handler,
         web_backend=web_backend,
+        skills=bundled_skills,
     )
 
     # ``max_stop_hook_iterations`` bounds the framework Ralph loop.
@@ -206,22 +236,6 @@ def build_agent(
     # persist_tool_transcripts + tool_transcript_max_bytes since
     # 0.10.16's Team-kwarg-forwarding sweep). No more post-
     # construction monkey-patching.
-    # MCP tool surface for the coordinator. When ``mcp_registry``
-    # is provided (typically a graphify stdio server — see the
-    # README quickstart), the registry's tools surface in the
-    # coordinator's tool list alongside ``delegate`` /
-    # ``forward_message`` / ``send_message``. The supervisor
-    # architecture wraps whatever ``tools=`` we pass with an
-    # ``ExtendedToolHost`` that adds its own delegate-family
-    # tools — passing MCPRegistry as the base means both layers
-    # coexist (MCP tools + delegate-family) without surgery.
-    #
-    # Caller owns the registry lifecycle (``async with
-    # mcp_registry:``) — we just wire the reference. v1 limitation:
-    # MCP tools only reach the COMPLEX route (supervisor); the
-    # SIMPLE coder doesn't have MCP yet (would need
-    # ExtendedToolHost composition of local kernel + MCP, follow-
-    # up phase).
     supervisor = Team.supervisor(
         workers=workers,
         instructions=build_coordinator_instructions(project),
@@ -230,7 +244,7 @@ def build_agent(
         auto_consolidate=True,
         workspace=workspace,
         living_plan=True,
-        tools=mcp_registry,
+        skills=bundled_skills,
         max_turns=max_turns,
         max_stop_hook_iterations=max_stop_hook_iterations,
         prompt_caching=True,
@@ -263,6 +277,7 @@ def build_agent(
         approval_handler=approval_handler,
         memory_url=memory_url,
         web_backend=web_backend,
+        skills=bundled_skills,
     )
 
     # ROUTER — the actual entrypoint loom-code returns. One
@@ -321,6 +336,22 @@ def build_agent(
         auto_compact_at_tokens=auto_compact_at_tokens,
         tool_result_summarizer=tool_result_summarizer,
         persist_tool_transcripts=True,
+        # ``conversation_scope='shared'`` (loomflow 0.10.18+): every
+        # turn — whether routed to SIMPLE or COMPLEX — runs under
+        # the PARENT REPL session_id instead of the default per-
+        # route ``{parent}__route_{name}`` derivation. Without this,
+        # ``what is this code about?`` (turn 1 → COMPLEX) followed
+        # by ``can you check what is this code about?`` (turn 2 →
+        # SIMPLE) lost continuity: the SIMPLE coder woke up under
+        # a fresh per-route session_id with zero prior messages.
+        # In shared mode the routed agent rehydrates from the
+        # parent session and sees the WHOLE conversation, no
+        # matter which route handled each turn. Tradeoff: routes
+        # see each other's tool calls in history (the SIMPLE coder
+        # sees ``delegate``/``send_message`` from prior COMPLEX
+        # turns) — empirically harmless since the model treats
+        # them as context, not actionable history.
+        conversation_scope="shared",
         # Single classification call per user message; the routed
         # agent then runs to completion. The router's StopHook
         # behavior is moot since classification doesn't have a

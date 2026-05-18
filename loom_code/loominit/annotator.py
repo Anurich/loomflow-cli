@@ -66,6 +66,7 @@ async def annotate(
     model: Any,
     concurrency: int = DEFAULT_CONCURRENCY,
     project_metadata: dict[str, str] | None = None,
+    graphify_section: str | None = None,
 ) -> str:
     """Run the full annotation pipeline against ``index``.
 
@@ -76,6 +77,14 @@ async def annotate(
     ..., "requires_python": ...}`` from pyproject.toml. The REPL
     builds this dict; passing it in keeps this module out of TOML
     parsing.
+
+    ``graphify_section``: optional pre-rendered markdown block (no
+    heading — assembler adds the ``## Knowledge Graph`` header) that
+    describes the bundled graphify graph artifact + tool usage hints.
+    The REPL builds this from a ``GraphifyBuildResult`` so the
+    coordinating agent sees the graph's existence + shape on every
+    turn without needing to ``load_skill('graphify')`` first. ``None``
+    skips the section entirely.
     """
     if not index.files:
         # Empty repo — emit a minimal placeholder so the user sees
@@ -97,6 +106,7 @@ async def annotate(
         metadata=metadata,
         overview=overview,
         cluster_results=cluster_results,
+        graphify_section=graphify_section,
     )
 
 
@@ -498,9 +508,15 @@ def _assemble_markdown(
     metadata: dict[str, str],
     overview: _ProjectOverviewOutput,
     cluster_results: dict[str, _ClusterAnnotationOutput],
+    graphify_section: str | None = None,
 ) -> str:
     """Stitch the LLM outputs + structural data into the final
-    LOOM.md body. Deterministic — same inputs → byte-equal output."""
+    LOOM.md body. Deterministic — same inputs → byte-equal output.
+
+    ``graphify_section`` is rendered as ``## Knowledge Graph`` between
+    the Subsystems and Pending-annotations sections when supplied.
+    Caller pre-formats the body (path / counts / usage hints) — this
+    function only wraps it with the heading + blank lines."""
     name = metadata.get("name", "project")
     parts: list[str] = []
     parts.append(f"# {name} — LOOM.md\n")
@@ -555,6 +571,17 @@ def _assemble_markdown(
                     f"{sp.purpose.strip()}"
                 )
             parts.append("")
+
+    # Knowledge Graph — the bundled graphify artifact, when
+    # ``/loominit`` built one alongside this annotation pass. Lives
+    # between Subsystems and Pending annotations so it's near the
+    # bottom (the agent reads top-down — overview first, then
+    # subsystems, then tooling pointers) but stays visible. Caller
+    # supplies the rendered body so this assembler stays decoupled
+    # from ``skills/graphify/tools.py``.
+    if graphify_section:
+        parts.append("## Knowledge Graph\n")
+        parts.append(graphify_section.strip() + "\n")
 
     # Pending annotations — empty on first generation; slice 4
     # populates this section as the agent adds new symbols. We

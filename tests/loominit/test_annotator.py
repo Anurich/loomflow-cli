@@ -351,6 +351,92 @@ def test_assemble_markdown_includes_all_sections() -> None:
     assert "built at commit abc" in md
 
 
+def test_assemble_emits_knowledge_graph_when_section_supplied() -> None:
+    """The ``## Knowledge Graph`` section appears between Subsystems
+    and Pending annotations when ``graphify_section`` is non-empty.
+    Pins the contract that ``/loominit`` relies on to surface the
+    pre-built graph + graphify tool usage hints to the agent on
+    every turn."""
+    index = LoomIndex(
+        generated_at=datetime(2026, 1, 1, tzinfo=UTC),
+        repo_root="/r",
+        git_commit=None,
+        files=[_file("x.py")],
+        symbols=[_sym("x.py", "X")],
+        imports=[],
+        decorators=[],
+        entry_points=[],
+        clusters=[
+            Cluster(
+                id="c", title="c", paths=["x.py"],
+                centroid_symbols=[], centrality=0.0, hash_bucket="b",
+            )
+        ],
+    )
+    cluster_results = {
+        "c": _ClusterAnnotationOutput(
+            narrative="n", data_flow=[], conventions=[],
+            symbol_purposes=[],
+        )
+    }
+    section_body = (
+        "Pre-built knowledge graph at `.loom/graphify/graph.json` "
+        "(700 nodes, 1000 edges, 40 communities)."
+    )
+    md = _assemble_markdown(
+        index=index,
+        metadata={"name": "p"},
+        overview=_ProjectOverviewOutput(overview="x", tech_stack=[]),
+        cluster_results=cluster_results,
+        graphify_section=section_body,
+    )
+    assert "## Knowledge Graph" in md
+    assert section_body in md
+    # Ordering: must sit between Subsystems and Pending annotations
+    # — the assembler stitches it in that slot.
+    assert (
+        md.index("## Subsystems")
+        < md.index("## Knowledge Graph")
+        < md.index("## Pending annotations")
+    )
+
+
+def test_assemble_omits_knowledge_graph_by_default() -> None:
+    """No ``graphify_section`` arg → no Knowledge Graph heading.
+    Keeps LOOM.md unchanged for callers that don't have a graph
+    built (or where the graphify build failed and the REPL skipped
+    passing a section)."""
+    index = LoomIndex(
+        generated_at=datetime(2026, 1, 1, tzinfo=UTC),
+        repo_root="/r",
+        git_commit=None,
+        files=[_file("x.py")],
+        symbols=[_sym("x.py", "X")],
+        imports=[],
+        decorators=[],
+        entry_points=[],
+        clusters=[
+            Cluster(
+                id="c", title="c", paths=["x.py"],
+                centroid_symbols=[], centrality=0.0, hash_bucket="b",
+            )
+        ],
+    )
+    cluster_results = {
+        "c": _ClusterAnnotationOutput(
+            narrative="n", data_flow=[], conventions=[],
+            symbol_purposes=[],
+        )
+    }
+    md = _assemble_markdown(
+        index=index,
+        metadata={"name": "p"},
+        overview=_ProjectOverviewOutput(overview="x", tech_stack=[]),
+        cluster_results=cluster_results,
+    )
+    assert "## Knowledge Graph" not in md
+
+
 def test_assemble_skips_empty_sections() -> None:
     """data_flow=[] / conventions=[] / no entry_points → the
     corresponding sections are omitted, not rendered empty. Keeps

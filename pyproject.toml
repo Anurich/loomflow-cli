@@ -18,7 +18,11 @@ dependencies = [
     # 4-of-4 Anthropic cache breakpoints, count_tokens helper)
     # and the 0.10.10+ persistent subagents / Windows compat /
     # earlier Team kwarg fixes.
-    "loomflow[litellm,web]>=0.10.17",
+    # 0.10.18 added Router(conversation_scope="shared") so all
+    # routes in loom-code's Team.router share one session_id with
+    # the parent REPL, fixing the "turn 2 lost prior context" bug
+    # when the classifier flipped between SIMPLE and COMPLEX.
+    "loomflow[litellm,web]>=0.10.18",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user
@@ -27,6 +31,16 @@ dependencies = [
     "prompt-toolkit>=3.0",
     "anthropic",
     "openai",
+    # graphifyy — knowledge-graph extraction over the project.
+    # Wired into the REPL's /graphify slash command + the desktop
+    # IDE's graphify chip. Moved from an optional extra to a hard
+    # dep so ``pip install -e .`` (or ``pip install loom-code``)
+    # gives users a working ``/graphify on`` out of the box — no
+    # "install with: pip install 'loom-code[graphify]' then re-run"
+    # friction. The install adds ~30s + a few hundred MB
+    # (tree-sitter grammars, NetworkX, Leiden); acceptable price
+    # for zero-config knowledge-graph integration.
+    "graphifyy",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +55,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["loom_code*"]
+
+# Bundled skills ship as package data — ``SKILL.md`` + ``tools.py``
+# under ``loom_code/skills/<name>/`` get installed alongside the
+# code so ``importlib.resources.files('loom_code.skills')`` finds
+# them at runtime. Without this the SKILL.md files would be
+# skipped by setuptools' default Python-only inclusion.
+[tool.setuptools.package-data]
+"loom_code.skills" = ["*/*.md", "*/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

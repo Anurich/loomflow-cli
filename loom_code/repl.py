@@ -47,11 +47,8 @@ Slash commands (handled here, never sent to the agent):
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
-from typing import Any
 
-import anyio
 from loomflow import new_id
 from prompt_toolkit import HTML, PromptSession
 from prompt_toolkit.completion import (
@@ -62,7 +59,7 @@ from prompt_toolkit.completion import (
 from prompt_toolkit.document import Document
 from rich.text import Text
 
-from .agent import build_agent
+from .agent import LOOM_DIR, build_agent
 from .approval import ApprovalGate
 from .compact import Compactor, default_compact_threshold
 from .credentials import (
@@ -92,13 +89,10 @@ _SLASH_HELP = """\
   [cyan]/model[/cyan] <name>    switch to a specific model by name
   [cyan]/set_model[/cyan]       pick OpenAI / Anthropic + save API key
   [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
-  [cyan]/loominit[/cyan]        index this codebase → LOOM.md so the
-                   agent can skip re-reading source on every task
-  [cyan]/graphify[/cyan] [on|off]
-                   on  → install graphifyy if needed, build the
-                         knowledge graph, enable graph queries
-                   off → disable + kill the MCP subprocess
-                   (bare) → status report
+  [cyan]/loominit[/cyan]        index this codebase → LOOM.md + a
+                   bundled knowledge graph (graphify) so the agent
+                   can skip re-reading source AND has cross-file
+                   structural queries available from turn one
   [cyan]/resume[/cyan]          resume the last session — rehydrates prior
                    turns from loomflow memory so you pick up where
                    you left off
@@ -169,11 +163,7 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/model", "switch to a specific model by name"),
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
-    ("/loominit", "index this codebase → LOOM.md"),
-    (
-        "/graphify",
-        "on | off | status — graphify knowledge-graph MCP wiring",
-    ),
+    ("/loominit", "index this codebase → LOOM.md + knowledge graph"),
     ("/resume", "resume the last session (rehydrate prior turns)"),
     ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
     ("/clear", "fresh conversation (new session)"),
@@ -219,15 +209,9 @@ class Repl:
         # for the whole session.
         self._gate = ApprovalGate()
         self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
-        # Optional graphify MCP server — disabled at startup, the
-        # user opts in with ``/graphify on``. When toggled on we
-        # construct the registry, call ``await connect()`` (spawns
-        # graphify subprocess), and rebuild the agent so the new
-        # tool host wires in. ``/graphify off`` reverses it.
-        # Subprocess lifecycle is tied to this attribute being
-        # non-None; the cleanup in ``_run_inner``'s ``finally``
-        # guarantees we ``aclose()`` even on crash / Ctrl-C.
-        self._mcp_registry: Any = None
+        # Graphify and other bundled skills are auto-registered
+        # by build_agent (see _bundled_skill_paths). No per-session
+        # toggle needed — the agent decides when to load skills.
         self.agent, self.workspace = build_agent(
             project,
             model=model,
@@ -316,24 +300,20 @@ class Repl:
     async def run(self) -> int:
         """The REPL loop. Returns an exit code.
 
-        Wraps the inner loop with cleanup that ``aclose()``s any
-        MCP subprocess the user spawned via ``/graphify on`` mid-
-        session. Without this, hitting Ctrl-C with graphify
-        enabled would leak the subprocess.
+        Skills (graphify and friends) are wired in at agent
+        construction time via :func:`build_agent` — no per-session
+        spawning, no subprocess lifecycle to manage here. The
+        run-method's ``finally`` block used to ``aclose()`` an MCP
+        subprocess from the prior MCP-based graphify integration;
+        that's no longer needed now that graphify is a bundled
+        skill (Mode B Python tools, in-process).
         """
-        try:
-            return await self._run_inner()
-        finally:
-            if self._mcp_registry is not None:
-                try:
-                    await self._mcp_registry.aclose()
-                except Exception:  # noqa: BLE001 — cleanup is best-effort
-                    pass
+        return await self._run_inner()
 
     async def _run_inner(self) -> int:
-        """The actual REPL loop body. Split out so ``run()`` can
-        own the MCP-cleanup ``finally`` without indenting the whole
-        function."""
+        """The REPL loop body. Held as a separate method in case a
+        future feature wants to wrap it in a context manager again
+        — keeps the wrapping point obvious."""
         banner(self.model, str(self.project.root), self.project.is_git)
         if self.project.context_file:
             console.print(
@@ -362,12 +342,9 @@ class Repl:
         )
         console.print(
             "  [dim]▸ [cyan]/loominit[/cyan]      index this "
-            "codebase so future turns skip re-reading source[/dim]"
-        )
-        console.print(
-            "  [dim]▸ [cyan]/graphify on[/cyan]   build a knowledge "
-            "graph of this codebase and enable graph queries "
-            "(auto-installs graphifyy on first run)[/dim]"
+            "codebase + build a knowledge graph (so future turns "
+            "skip re-reading source AND get structural queries)"
+            "[/dim]"
         )
         # Show the resume hint ONLY when a prior session pointer
         # exists — no point telling first-time users about a
@@ -811,8 +788,6 @@ class Repl:
             await self._handle_set_web()
         elif cmd == "/loominit":
             await self._handle_loominit()
-        elif cmd == "/graphify":
-            await self._handle_graphify(arg)
         elif cmd == "/resume":
             await self._handle_resume()
         elif cmd == "/set_continue_cap":
@@ -849,17 +824,17 @@ class Repl:
 
     def _rebuild_agent(self) -> None:
         """Reconstruct the supervisor + workers using the current
-        ``self.model``, ``self._web_backend``, and
-        ``self._mcp_registry``. Used by ``/model``, ``/set_web``,
-        and ``/graphify on|off`` — same rebuild semantics, single
-        source of truth for what a "rebuild" entails."""
+        ``self.model`` and ``self._web_backend``. Used by
+        ``/model`` (model change) and ``/set_web`` (backend change).
+        Bundled skills (graphify et al.) are auto-registered
+        inside ``build_agent`` so we don't pass them explicitly
+        here."""
         self.agent, self.workspace = build_agent(
             self.project,
             model=self.model,
             approval_handler=self._gate.handler,
             web_backend=self._web_backend,
             max_stop_hook_iterations=self._auto_continue_limit,
-            mcp_registry=self._mcp_registry,
         )
         self._compactor = Compactor(model=self.model)
         self._compact_tokens = 0
@@ -957,247 +932,6 @@ class Repl:
         console.print(
             f"  [dim]compacted into {len(summary)}-char summary "
             f"in memory; new conversation thread.[/dim]"
-        )
-
-    async def _ensure_graphifyy_installed(self) -> bool:
-        """Return True if the ``graphifyy`` package is importable;
-        otherwise pip-install it on the current Python and return
-        True on success / False on failure.
-
-        Uses ``sys.executable -m pip install graphifyy`` so we
-        install into whatever Python loom-code is running in — not
-        whatever ``pip`` happens to be on PATH. Captures stdout/
-        stderr (pip is chatty) and only surfaces the tail on
-        failure to keep the REPL output clean. Pip install runs in
-        an anyio subprocess so the event loop doesn't stall.
-
-        Why not require pre-install: ``/graphify on`` is the
-        user's first encounter with graphify; making them quit,
-        run pip, restart, then try again is friction that kills
-        adoption. One command, one wait, working.
-        """
-        import importlib.util
-        if importlib.util.find_spec("graphifyy") is not None:
-            return True
-        if importlib.util.find_spec("graphify") is not None:
-            # graphifyy installs as the ``graphify`` module; check
-            # both names because the PyPI name and import name
-            # differ.
-            return True
-        console.print(
-            "  [dim]installing [cyan]graphifyy[/cyan] "
-            "(~30-90s, one time)...[/dim]"
-        )
-        try:
-            with console.status("[dim]pip install graphifyy...[/dim]"):
-                proc = await anyio.run_process(
-                    [
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "install",
-                        "--quiet",
-                        "graphifyy",
-                    ],
-                    check=False,
-                )
-        except Exception as exc:  # noqa: BLE001 — subprocess infra failure
-            console.print(
-                f"  [red]could not run pip:[/red] {exc}"
-            )
-            return False
-        if proc.returncode != 0:
-            stderr_tail = (
-                proc.stderr.decode("utf-8", errors="replace")[-400:]
-                if proc.stderr else ""
-            )
-            console.print(
-                f"  [red]pip install graphifyy failed[/red] "
-                f"(exit {proc.returncode})"
-            )
-            if stderr_tail:
-                console.print(f"  [dim]{stderr_tail}[/dim]")
-            return False
-        console.print("  [green]✓ graphifyy installed[/green]")
-        return True
-
-    async def _ensure_graph_built(self, graph_path: Path) -> bool:
-        """Return True if ``graph_path`` exists; otherwise run
-        ``graphify <project> --out <.loom/graphify>`` to build it.
-        Returns False on subprocess failure.
-
-        Build time scales with codebase size — 30s for a small repo,
-        2+ minutes for one with 100s of files. Captured under a
-        status spinner so the REPL doesn't appear hung.
-        """
-        if graph_path.is_file():  # noqa: ASYNC240 — trivial fs op
-            return True
-        out_dir = graph_path.parent
-        out_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
-        console.print(
-            "  [dim]building knowledge graph "
-            "(this can take 30s-2min on a real codebase)...[/dim]"
-        )
-        try:
-            with console.status(
-                "[dim]graphify scanning project...[/dim]"
-            ):
-                proc = await anyio.run_process(
-                    [
-                        "graphify",
-                        str(self.project.root),
-                        "--out",
-                        str(out_dir),
-                    ],
-                    check=False,
-                )
-        except Exception as exc:  # noqa: BLE001 — subprocess infra failure
-            console.print(
-                f"  [red]could not run graphify:[/red] {exc}"
-            )
-            return False
-        if proc.returncode != 0 or not graph_path.is_file():  # noqa: ASYNC240
-            stderr_tail = (
-                proc.stderr.decode("utf-8", errors="replace")[-400:]
-                if proc.stderr else ""
-            )
-            console.print(
-                f"  [red]graphify build failed[/red] "
-                f"(exit {proc.returncode})"
-            )
-            if stderr_tail:
-                console.print(f"  [dim]{stderr_tail}[/dim]")
-            return False
-        size_kb = graph_path.stat().st_size / 1024  # noqa: ASYNC240
-        console.print(
-            f"  [green]✓ graph built[/green] "
-            f"[dim]({size_kb:.1f} KB at {graph_path})[/dim]"
-        )
-        return True
-
-    async def _handle_graphify(self, arg: str) -> None:
-        """``/graphify [on|off]`` — toggle or report graphify MCP wiring.
-
-        ``/graphify on``:
-            * Construct ``MCPRegistry`` from ``default_graphify_spec``
-            * ``await connect()`` — spawns ``graphify --mcp`` subprocess
-            * Rebuild the agent so the coordinator sees graphify tools
-            * Mark enabled
-
-        ``/graphify off``:
-            * ``await aclose()`` — kills the subprocess
-            * Set registry to ``None``
-            * Rebuild the agent (back to no MCP tools)
-
-        ``/graphify`` (bare): status report — registry wired?
-            graph file present on disk? tool surface?
-
-        Subprocess cleanup on REPL exit is handled by ``run()``'s
-        ``finally`` block, so an unclosed registry from a forgotten
-        ``/graphify off`` doesn't leak a child process.
-        """
-        from .agent import LOOM_DIR
-
-        arg = arg.strip().lower()
-        graph_path = (
-            self.project.root / LOOM_DIR / "graphify" / "graph.json"
-        )
-
-        if arg == "on":
-            if self._mcp_registry is not None:
-                console.print(
-                    "  [dim]graphify already enabled.[/dim]"
-                )
-                return
-            # Step 1: ensure the ``graphifyy`` package is installed.
-            # We pip-install on demand so the user never has to
-            # know the package name or run pip themselves — same
-            # zero-friction story as ``/set_web`` saving API keys.
-            if not await self._ensure_graphifyy_installed():
-                return
-            # Step 2: ensure the graph file exists. If missing,
-            # invoke ``graphify <project> --out .loom/graphify`` to
-            # build it from scratch. This is the slow part (30s-2min
-            # depending on codebase size) — show a status so the
-            # user sees we haven't hung.
-            if not await self._ensure_graph_built(graph_path):
-                return
-            # Step 3: now actually wire the MCP server. Subprocess
-            # spawns inside connect(); aclose() in run()'s finally
-            # block guarantees cleanup.
-            from loomflow.mcp import MCPRegistry
-
-            from .mcp_specs import default_graphify_spec
-            self._mcp_registry = MCPRegistry(
-                [default_graphify_spec(self.project.root)]
-            )
-            try:
-                await self._mcp_registry.connect()
-            except Exception as exc:  # noqa: BLE001 — surface to user
-                self._mcp_registry = None
-                console.print(
-                    f"  [red]could not start graphify:[/red] {exc}"
-                )
-                return
-            self._rebuild_agent()
-            console.print("  [green]✓ graphify enabled[/green]")
-            # Install the debounced post-commit hook so the graph
-            # refreshes itself every N commits instead of going
-            # stale silently. Idempotent — safe to call every
-            # ``/graphify on``. Skips cleanly on non-git projects.
-            from .git_hook import install as install_hook
-            hook_status = install_hook(self.project.root)
-            if hook_status in ("installed", "updated"):
-                console.print(
-                    f"  [dim]post-commit hook {hook_status} "
-                    "— graph refreshes every 5 commits[/dim]"
-                )
-            return
-
-        if arg == "off":
-            if self._mcp_registry is None:
-                console.print(
-                    "  [dim]graphify already disabled.[/dim]"
-                )
-                return
-            try:
-                await self._mcp_registry.aclose()
-            except Exception:  # noqa: BLE001 — cleanup is best-effort
-                pass
-            self._mcp_registry = None
-            self._rebuild_agent()
-            console.print("  [yellow]graphify disabled.[/yellow]")
-            return
-
-        # No arg → status report.
-        if self._mcp_registry is None:
-            console.print(
-                "  [dim]graphify:[/dim] [yellow]disabled[/yellow] "
-                "— run [cyan]/graphify on[/cyan] to install "
-                "(if needed), build the graph, and enable queries"
-            )
-            return
-        console.print(
-            "  [dim]graphify:[/dim] [green]enabled[/green]"
-        )
-        if graph_path.is_file():
-            size_kb = graph_path.stat().st_size / 1024
-            console.print(
-                f"  [dim]graph:[/dim] [green]{graph_path}[/green] "
-                f"([dim]{size_kb:.1f} KB[/dim])"
-            )
-        else:
-            console.print(
-                "  [dim]graph:[/dim] [yellow]missing[/yellow] — "
-                "build with [cyan]graphify .[/cyan] in another "
-                "terminal"
-            )
-        console.print(
-            "  [dim]tools:[/dim] "
-            "[cyan]graphify_query[/cyan] · "
-            "[cyan]graphify_path[/cyan] · "
-            "[cyan]graphify_explain[/cyan] "
-            "— [cyan]/graphify off[/cyan] to disable"
         )
 
     def _handle_set_continue_cap(self, arg: str) -> None:
@@ -1561,6 +1295,29 @@ class Repl:
         self.session_id = prior
         self._compact_tokens = 0
         self._compact_exchanges.clear()
+
+        # Legacy data migration — loom-code pre-0.10.18 ran the
+        # Router in ``per_route`` mode, so episodes were stored
+        # under ``{prior}__route_simple`` / ``{prior}__route_complex``,
+        # NOT under ``prior`` itself. Post-upgrade we run
+        # ``conversation_scope='shared'`` which keys rehydration on
+        # ``prior`` — so a /resume to a pre-upgrade session loses
+        # all context unless we migrate.
+        #
+        # One-shot UPDATE in the sqlite db (loom-code hardcodes the
+        # sqlite backend). Idempotent — a post-upgrade session has
+        # nothing under the derived names. Episode_tool_transcripts
+        # cascades via episode_id, so no separate migration needed.
+        migrated = _migrate_legacy_per_route_episodes(
+            self.project.root / LOOM_DIR / "memory.db", prior
+        )
+        if migrated:
+            console.print(
+                f"  [dim]migrated {migrated} legacy per-route "
+                "episode(s) into the shared session for "
+                "rehydration[/dim]"
+            )
+
         console.print(
             f"  [green]✓[/green] resumed session [cyan]{prior[:8]}…"
             f"[/cyan] (was on {old[:8]}…)"
@@ -1600,6 +1357,10 @@ class Repl:
             save_index,
             write_markdown,
         )
+        from .skills.graphify.tools import (
+            GraphifyBuildResult,
+            graphify_build_impl,
+        )
 
         console.print()
         console.print(
@@ -1611,6 +1372,14 @@ class Repl:
             "[dim]building structural index…[/dim]", spinner="dots"
         )
         status.start()
+        # Graph build runs BEFORE annotation so its summary can be
+        # embedded into LOOM.md by the assembler. Wrapped in its own
+        # try/except so a graphify failure (e.g. tree-sitter missing
+        # for an exotic file mix) doesn't kill the loominit pass —
+        # LOOM.md still gets written, just without the
+        # ``## Knowledge Graph`` section.
+        graphify_result: GraphifyBuildResult | None = None
+        graphify_error: str | None = None
         try:
             index = build_index(self.project.root)
             if not index.files:
@@ -1621,15 +1390,45 @@ class Repl:
                 )
                 return
             save_index(self.project.root, index)
+
+            status.update(
+                "[dim]building knowledge graph "
+                "(graphify — tree-sitter + Leiden)…[/dim]"
+            )
+            try:
+                graphify_result = await graphify_build_impl(
+                    self.project.root
+                )
+            except Exception as gx:  # noqa: BLE001
+                # Capture for a status line; do NOT abort loominit.
+                graphify_error = f"{type(gx).__name__}: {gx}"
+
             status.update(
                 f"[dim]annotating {len(index.clusters)} cluster(s) "
                 "via the model — this is the LLM-cost step…[/dim]"
             )
             metadata = _read_pyproject_metadata(self.project.root)
+            graphify_section: str | None = None
+            if (
+                graphify_result is not None
+                and graphify_result.skipped_reason is None
+            ):
+                graphify_section = _render_graphify_section(
+                    graph_rel_path=str(
+                        graphify_result.graph_path.relative_to(
+                            graphify_result.project_root
+                        )
+                    ),
+                    n_nodes=graphify_result.n_nodes,
+                    n_edges=graphify_result.n_edges,
+                    n_communities=graphify_result.n_communities,
+                    source=graphify_result.source,
+                )
             body = await annotate(
                 index,
                 model=self.model,
                 project_metadata=metadata,
+                graphify_section=graphify_section,
             )
             write_markdown(self.project.root, body)
         except Exception as exc:  # noqa: BLE001 — REPL must survive
@@ -1650,6 +1449,32 @@ class Repl:
             f"— {n_files} files, {n_symbols} symbols, "
             f"{n_clusters} cluster(s)"
         )
+        # Separate status line for graphify — three branches: ✓
+        # (built), ⚠ (skipped — no extractable files), ✗ (error).
+        if (
+            graphify_result is not None
+            and graphify_result.skipped_reason is None
+        ):
+            rel = graphify_result.graph_path.relative_to(
+                graphify_result.project_root
+            )
+            console.print(
+                f"  [green]✓[/green] wrote [cyan]{rel}[/cyan] "
+                f"— {graphify_result.n_nodes} nodes, "
+                f"{graphify_result.n_edges} edges, "
+                f"{graphify_result.n_communities} communities "
+                f"(via {graphify_result.source})"
+            )
+        elif graphify_result is not None and graphify_result.skipped_reason:
+            console.print(
+                f"  [yellow]graphify: skipped — "
+                f"{graphify_result.skipped_reason}[/yellow]"
+            )
+        elif graphify_error is not None:
+            console.print(
+                f"  [yellow]graphify: failed — {graphify_error}"
+                "[/yellow] (LOOM.md still written)"
+            )
         console.print(
             "  [dim]future turns will reference this file. Re-run "
             "[cyan]/loominit[/cyan] after major refactors.[/dim]"
@@ -1668,6 +1493,109 @@ class Repl:
                 f"  [dim]post-commit hook {hook_status} "
                 "— structural index refreshes every 5 commits[/dim]"
             )
+
+
+def _migrate_legacy_per_route_episodes(
+    db_path: Path, parent_session_id: str
+) -> int:
+    """Re-key any legacy per-route episodes into the parent
+    session_id so ``conversation_scope='shared'`` rehydration sees
+    them.
+
+    Pre-0.10.18 loom-code ran the Router in default ``per_route``
+    mode, persisting episodes under ``{parent}__route_simple`` and
+    ``{parent}__route_complex``. The new shared-mode lookup keys on
+    ``parent`` alone, so /resume'd pre-upgrade sessions had no
+    visible history. This UPDATE rewrites the session_id column for
+    any matching legacy rows. Idempotent — re-running on a
+    post-upgrade session is a no-op.
+
+    Returns the number of rows migrated. Silently no-ops when the
+    db file is absent or unreadable — failure here must NEVER
+    block /resume.
+
+    Why direct sqlite (not via the Memory protocol): the Memory
+    protocol exposes ``remember(Episode)`` and ``session_messages``
+    but no primitive for ``rekey-session``. Adding one to the
+    framework just to satisfy this one-shot loom-code migration
+    isn't worth the surface. We know the backend is sqlite (the
+    REPL hardcodes it) and the column name is stable.
+    """
+    if not db_path.is_file():
+        return 0
+    legacy_simple = f"{parent_session_id}__route_simple"
+    legacy_complex = f"{parent_session_id}__route_complex"
+    try:
+        import sqlite3
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE episodes SET session_id = ? "
+                "WHERE session_id IN (?, ?)",
+                (parent_session_id, legacy_simple, legacy_complex),
+            )
+            migrated = cur.rowcount or 0
+            conn.commit()
+            return int(migrated)
+    except (sqlite3.Error, OSError):
+        return 0
+
+
+def _render_graphify_section(
+    *,
+    graph_rel_path: str,
+    n_nodes: int,
+    n_edges: int,
+    n_communities: int,
+    source: str,
+) -> str:
+    """Format graphify build stats into the body of LOOM.md's
+    ``## Knowledge Graph`` section. Returned text gets the heading
+    added by ``_assemble_markdown``; we just supply the body.
+
+    Why this lives in the REPL (not the annotator): the annotator
+    deliberately doesn't import ``skills/graphify/`` so it stays a
+    standalone module. The REPL owns the cross-package wiring.
+    Takes plain primitives — the caller unpacks the
+    ``GraphifyBuildResult`` so this function has no coupling to the
+    graphify skill's types.
+
+    The body is structured as load-bearing context for the agent:
+    artifact path + counts up top (so the agent knows the graph
+    exists and how big it is) followed by per-tool usage hints (so
+    the agent picks the right call without needing to
+    ``load_skill('graphify')`` first to read the docstrings). That's
+    the whole efficiency win — graph tools become discoverable from
+    the always-injected LOOM.md, not only from the skill listing.
+    """
+    return (
+        f"Pre-built knowledge graph at `{graph_rel_path}` "
+        f"({n_nodes} nodes, {n_edges} edges, "
+        f"{n_communities} communities — generated by "
+        f"graphify, AST-only, deterministic, no LLM cost). "
+        f"Source files discovered via `{source}`.\n\n"
+        "**When to query the graph instead of grepping**:\n"
+        "- `graphify__query(question)` — BFS from nodes matching "
+        "question keywords. Use for *structural* questions like "
+        "\"what's involved in auth\" or \"which symbols touch the "
+        "config loader\" — graph returns the neighbourhood, grep "
+        "returns string hits.\n"
+        "- `graphify__path(a, b)` — shortest path between two named "
+        "concepts. The one graph query grep genuinely can't do: "
+        "\"how does A reach B in this codebase?\".\n"
+        "- `graphify__explain(node)` — one-symbol report (source "
+        "file/line, neighbours, community). Faster than reading the "
+        "file when the user asks \"what is X\".\n"
+        "- `graphify__build(path)` — rebuild from scratch. Already "
+        "run by `/loominit`; only call manually after a large "
+        "refactor (the post-commit hook auto-refreshes every 5 "
+        "commits).\n\n"
+        "**When NOT to use it**: single-file content questions (use "
+        "`read` / `grep`), or asking for raw source text (the graph "
+        "stores *structure*, not bodies). For one-file changes, "
+        "skip the graph entirely — it costs context without adding "
+        "anything."
+    )
 
 
 def _read_pyproject_metadata(repo_root) -> dict[str, str]:
