@@ -8,6 +8,7 @@ from loom_code.project import Project
 from loom_code.prompts import (
     build_coder_prompt,
     build_coordinator_instructions,
+    build_simple_coder_prompt,
 )
 
 
@@ -55,3 +56,30 @@ def test_context_file_inlined_in_both_prompts(tmp_path: Path) -> None:
     proj = _proj(tmp_path, context=marker)
     assert marker in build_coordinator_instructions(proj)
     assert marker in build_coder_prompt(proj)
+
+
+def test_simple_coder_forces_regrounding_on_action_prompts(
+    tmp_path: Path,
+) -> None:
+    """The SIMPLE coder must instruct the model to re-read file
+    state before claiming work is done. This is what stops the
+    "parrot prior session's lie" failure mode (observed in
+    production: SIMPLE coder answered 'all 12 issues fixed' with
+    zero tool calls because episode recall surfaced a prior
+    session's hallucinated 'all done' claim).
+
+    Without this directive being load-bearing in the system prompt,
+    the bug recurs every time stale completion claims land in
+    memory recall. Pin the language so a future prompt rewrite
+    can't silently drop it."""
+    proj = _proj(tmp_path)
+    prompt = build_simple_coder_prompt(proj)
+    # The directive heading itself.
+    assert "GROUND CLAIMS IN CURRENT FILE STATE" in prompt
+    # The behavioural rule: re-read on action verbs.
+    assert "fix / check / verify" in prompt
+    # The reason: explicit naming of the failure mode so the
+    # model understands WHY (LLMs follow directives better when
+    # the rationale is visible).
+    assert "stale completion claims" in prompt
+    assert "Trust file contents, not memory" in prompt

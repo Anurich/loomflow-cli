@@ -224,9 +224,19 @@ class Repl:
         # context block in project.context_text already wired." When
         # the retriever loads, the per-turn ``_inject_loom_context``
         # call before ``_turn`` updates the ``loom_index`` working
-        # block with BM25-picked sections.
+        # block.
+        #
+        # ``mode`` is pulled from the coordinator
+        # (``_loom_retrieval_mode``, stamped in ``build_agent``) so
+        # the retriever's strategy stays in sync with whether the
+        # agent has the ``read_loom_section`` tool. ``"agentic"``
+        # injects a stable TOC (good for cache hits); ``"bm25"``
+        # (default) keeps the per-turn keyword-ranked section dump.
         from .loominit.injection import LoomRetriever
-        self._loom_retriever = LoomRetriever.from_repo_root(project.root)
+        mode = getattr(self.agent, "_loom_retrieval_mode", "bm25")
+        self._loom_retriever = LoomRetriever.from_repo_root(
+            project.root, mode=mode
+        )
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
         self.session_id = new_id()

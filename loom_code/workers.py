@@ -50,14 +50,14 @@ from loomflow import Agent, StandardPermissions
 from loomflow.architecture import ReAct
 from loomflow.tools import (
     bash_tool,
-    edit_tool,
     find_tool,
-    grep_tool,
     ls_tool,
     read_tool,
     write_tool,
 )
 
+from .edit_tool import verifying_edit_tool as edit_tool
+from .grep_tool import enhanced_grep_tool as grep_tool
 from .project import Project
 from .prompts import build_coder_prompt, build_simple_coder_prompt
 from .web_fetch import web_fetch_tool
@@ -355,6 +355,7 @@ def build_simple_coder(
     memory_url: str,
     web_backend: str | None = None,
     skills: list[Any] | None = None,
+    extra_tools: list[Any] | None = None,
 ) -> Agent:
     """Build the SIMPLE-mode loom-code agent — single coder, no team.
 
@@ -396,6 +397,8 @@ def build_simple_coder(
     if has_web:
         from loomflow.tools import web_tool
         tools.append(web_tool(backend=web_backend))  # type: ignore[arg-type]
+    if extra_tools:
+        tools.extend(extra_tools)
 
     return Agent(
         build_simple_coder_prompt(project, has_web=has_web),

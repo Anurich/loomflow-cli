@@ -29,11 +29,28 @@ CLI. Use tool-call syntax exclusively.
   major refactors) before the query tools below; the post-commit
   hook keeps it current every 5 commits afterward.
 
-* ``graphify__query(question, path=".")`` — BFS traversal over
-  the graph from nodes whose label matches keywords in
-  ``question``. Returns a list of related nodes + their edges,
-  one paragraph each. Use for "what's involved in X" / "how does
-  Y work in this codebase" questions.
+* ``graphify__query(question, path=".")`` — three-tier search
+  that surfaces the WHOLE subsystem around a keyword, not just
+  literal name matches. Returns results grouped by tier:
+
+    - **DIRECT** — nodes whose label or source file literally
+      matches the query keywords (the narrow case grep would also
+      catch).
+    - **NEIGHBOR** — 1-hop graph neighbours of any direct match.
+      Surfaces callers / callees / dependencies whose names DON'T
+      contain the keyword but participate in the same call
+      structure. (Example: querying ``auth`` surfaces
+      ``validate_token``, ``check_credentials``,
+      ``require_login`` — all of which grep would miss.)
+    - **COMMUNITY** — other nodes in the same Leiden cluster as
+      a direct match. Surfaces the rest of the subsystem when
+      the query is a concept name (``auth``, ``runtime``,
+      ``memory``) rather than a specific symbol.
+
+  Use for "what's involved in X" / "how does Y work in this
+  codebase" / "what's the auth subsystem look like" — questions
+  about a CONCEPT spanning files, not a single name lookup. For
+  literal "where is foo defined" use grep directly.
 
 * ``graphify__path(a, b, path=".")`` — shortest path between two
   named concepts. Returns the hop-by-hop trail with edge labels.

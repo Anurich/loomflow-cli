@@ -74,12 +74,26 @@ class _Section:
     ``heading`` is the literal heading text without the ``##`` prefix
     (e.g. ``"Workspace internals"``). ``body`` is everything between
     this heading and the next one. ``tokens`` is the tokenised body
-    cached for BM25 scoring.
+    cached for BM25 scoring. ``slug`` is a stable kebab-case
+    identifier the agentic-retrieval tool uses to address the
+    section by name (`read_loom_section('workspace-internals')`).
     """
 
     heading: str
     body: str
     tokens: list[str] = field(default_factory=list)
+    slug: str = ""
+
+
+_SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify(heading: str) -> str:
+    """Heading → stable kebab-case slug. ``"Workspace Internals"`` →
+    ``"workspace-internals"``. Empty / all-symbol headings collapse
+    to ``"section"`` (caller deduplicates with a numeric suffix)."""
+    base = _SLUG_NON_ALNUM_RE.sub("-", heading.lower()).strip("-")
+    return base or "section"
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]+")
@@ -173,6 +187,16 @@ def parse_sections(markdown: str) -> list[_Section]:
                 )
             )
 
+    # Assign stable slugs with collision-numbering. Two sections with
+    # the same heading get ``-2``, ``-3``, ... suffixes so the agentic
+    # ``read_loom_section`` tool can address each unambiguously.
+    seen_slugs: dict[str, int] = {}
+    for sec in sections:
+        base = _slugify(sec.heading)
+        count = seen_slugs.get(base, 0) + 1
+        seen_slugs[base] = count
+        sec.slug = base if count == 1 else f"{base}-{count}"
+
     return sections
 
 
@@ -255,6 +279,7 @@ class LoomRetriever:
         *,
         top_n: int = 3,
         max_chars: int = 4000,
+        mode: str = "bm25",
     ) -> None:
         self._sections = sections
         self._index = _build_index(sections)
@@ -263,6 +288,28 @@ class LoomRetriever:
         # tokens for English prose — comparable to the old static
         # bake but targeted per-turn.
         self._max_chars = max_chars
+        # ``mode``:
+        #   - ``"bm25"`` (default, back-compat): per-turn ranked
+        #     section bodies via BM25 score; ``relevant(query)``
+        #     returns the top-N section bodies. Changes per turn
+        #     → invalidates OpenAI's prefix cache.
+        #   - ``"agentic"``: ``relevant(query)`` returns a STABLE
+        #     TOC listing (heading + slug + one-line summary)
+        #     that doesn't vary per turn. Agent fetches specific
+        #     section bodies on demand via the
+        #     ``read_loom_section(slug)`` tool. Prefix stays
+        #     stable → real prompt-cache hits + LLM judgment over
+        #     keyword scoring.
+        if mode not in ("bm25", "agentic"):
+            raise ValueError(
+                f"mode must be 'bm25' or 'agentic', got {mode!r}"
+            )
+        self._mode = mode
+
+    @property
+    def mode(self) -> str:
+        """Which retrieval strategy is active."""
+        return self._mode
 
     @classmethod
     def from_repo_root(
@@ -271,6 +318,7 @@ class LoomRetriever:
         *,
         top_n: int = 3,
         max_chars: int = 4000,
+        mode: str = "bm25",
     ) -> LoomRetriever | None:
         """Load + parse ``<repo_root>/LOOM.md``. Returns ``None`` if
         the file is absent or empty."""
@@ -280,7 +328,53 @@ class LoomRetriever:
         sections = parse_sections(text)
         if not sections:
             return None
-        return cls(sections, top_n=top_n, max_chars=max_chars)
+        return cls(
+            sections, top_n=top_n, max_chars=max_chars, mode=mode
+        )
+
+    def section_body(self, slug: str) -> str | None:
+        """Return the body of the section whose slug matches.
+        ``None`` if no such slug — caller surfaces a helpful error
+        listing available slugs. Used by the agentic
+        ``read_loom_section`` tool."""
+        for sec in self._sections:
+            if sec.slug == slug:
+                return sec.body
+        return None
+
+    def available_slugs(self) -> list[str]:
+        """All stable slugs in this LOOM.md, in source order.
+        Useful for ``read_loom_section`` error messages and for
+        building the TOC view."""
+        return [sec.slug for sec in self._sections]
+
+    def toc(self) -> str:
+        """Stable LOOM.md table-of-contents view for agentic
+        retrieval. Returns ``# Section Map`` block listing every
+        section's heading + slug. **Same output every turn** — that
+        stability is what makes prompt caching actually hit.
+
+        Format::
+
+            # LOOM.md section map
+            (call read_loom_section('<slug>') to fetch a body)
+
+            - [overview] Overview
+            - [tech-stack] Tech Stack
+            - [subsystems] Subsystems
+            - ...
+        """
+        if not self._sections:
+            return ""
+        lines = [
+            "# LOOM.md section map",
+            "(call read_loom_section('<slug>') to fetch the body "
+            "of any section below)",
+            "",
+        ]
+        for sec in self._sections:
+            lines.append(f"- [{sec.slug}] {sec.heading}")
+        return "\n".join(lines)
 
     @property
     def is_loaded(self) -> bool:
@@ -294,19 +388,23 @@ class LoomRetriever:
         return len(self._sections)
 
     def relevant(self, query: str) -> str:
-        """Return a markdown block of the top-N most-relevant sections.
+        """Return the LOOM-context block to inject into the system
+        prompt for this turn.
 
-        Empty string when:
-        * the retriever has no sections
-        * the query produced zero non-zero BM25 scores (no token
-          overlap with any section)
+        ``agentic`` mode: returns the stable TOC (same every turn),
+        ignoring ``query`` entirely. The agent uses
+        ``read_loom_section(slug)`` to fetch specific bodies on
+        demand. Stable prefix → real prompt-cache hits.
 
-        The renderer prefixes each section with its original heading
-        so the model knows which subsystem the snippet belongs to.
-        Sections are truncated to fit under ``max_chars`` total.
+        ``bm25`` mode (default, back-compat): returns the top-N
+        most-relevant section bodies by BM25 score. Empty string
+        when there's no token overlap with any section. Changes
+        per turn → no cache hits.
         """
         if not self._sections:
             return ""
+        if self._mode == "agentic":
+            return self.toc()
         tokens = _tokenize(query)
         if not tokens:
             return ""

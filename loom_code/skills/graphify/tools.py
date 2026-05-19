@@ -251,12 +251,28 @@ async def build(path: str = ".") -> str:
 
 @tool
 async def query(question: str, path: str = ".") -> str:
-    """BFS traversal from nodes matching ``question`` keywords —
-    returns ranked related nodes + their edges.
+    """Find nodes related to ``question`` via THREE strategies and
+    rank them so the agent sees the whole subsystem, not just the
+    literal name matches.
 
-    Use for "how does X work in this codebase" / "what's involved
-    in Y" — questions that need to see the neighbourhood around a
-    concept, not a single file's text.
+    1. **DIRECT** — literal substring match on node label or
+       source-file. The narrow case grep would also catch.
+    2. **NEIGHBOR** — 1-hop graph neighbours of any direct match.
+       Surfaces callers, callees, decorators, dependencies — the
+       things grep on the keyword would silently miss because they
+       use a DIFFERENT identifier name but participate in the same
+       call structure.
+    3. **COMMUNITY** — other nodes in the same Leiden community
+       as a direct match. Surfaces the "auth subsystem" when the
+       query is "auth" even if specific symbols don't contain
+       "auth" in their name. Leiden communities are pre-computed
+       at build time and persisted in graph.json; we just use the
+       cluster id at query time.
+
+    Output is grouped by tier so the agent knows which results
+    are literal hits vs structural neighbours vs community-cohort.
+    Limited to 20 results total (8 direct + 8 neighbors + 4
+    community) to keep tool output bounded while showing breadth.
     """
     graph_obj = _load_graph(path)
     terms = [t.lower() for t in question.split() if len(t) > 2]
@@ -265,31 +281,107 @@ async def query(question: str, path: str = ".") -> str:
             "graphify__query: question too short (need at least "
             "one keyword > 2 chars)."
         )
-    # Score nodes by keyword presence in label or source_file.
-    scored: list[tuple[float, str, dict[str, Any]]] = []
+
+    # === Tier 1: DIRECT label/source matches (existing behaviour) ===
+    direct_scored: list[tuple[float, str, dict[str, Any]]] = []
     for nid, data in graph_obj.nodes(data=True):
         label = str(data.get("label", "")).lower()
-        source = str(data.get("source_file", "")).lower()
+        src = str(data.get("source_file", "")).lower()
         score = sum(1.0 for t in terms if t in label)
-        score += sum(0.4 for t in terms if t in source)
+        score += sum(0.4 for t in terms if t in src)
         if score > 0:
-            scored.append((score, nid, data))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    if not scored:
-        return f"graphify__query: no nodes matched {terms!r}."
-    # Top 5 matches + their immediate neighbours.
-    out: list[str] = []
-    for _score, nid, data in scored[:5]:
+            direct_scored.append((score, nid, data))
+    direct_scored.sort(key=lambda x: x[0], reverse=True)
+    if not direct_scored:
+        return (
+            f"graphify__query: no nodes matched {terms!r}. "
+            "Try a different keyword, or use ``graphify__explain`` "
+            "on a known symbol to discover related names."
+        )
+    direct_ids = {nid for _, nid, _ in direct_scored[:8]}
+
+    # === Tier 2: NEIGHBORS of direct matches (1-hop in graph) ===
+    # graphify builds undirected graphs by default, so .neighbors()
+    # gives both ends (callers + callees + dependencies in one
+    # call). Skip nodes already in direct_ids so neighbours don't
+    # double-count literal matches.
+    neighbour_ids: set[str] = set()
+    for did in direct_ids:
+        for n in graph_obj.neighbors(did):
+            if n not in direct_ids:
+                neighbour_ids.add(n)
+    # Rank neighbours by degree — the high-degree ones are
+    # structurally central and most worth surfacing first.
+    neighbour_ranked = sorted(
+        neighbour_ids,
+        key=lambda n: graph_obj.degree(n),
+        reverse=True,
+    )[:8]
+
+    # === Tier 3: COMMUNITY peers (same Leiden cluster) ===
+    # Find every community id touched by a direct match, then
+    # surface OTHER members of those communities — skipping nodes
+    # already in tier 1 or 2. Communities give "the subsystem"
+    # rather than just "the call neighbourhood".
+    direct_communities: set[Any] = set()
+    for did in direct_ids:
+        cid = graph_obj.nodes[did].get("community")
+        if cid is not None:
+            direct_communities.add(cid)
+    seen = direct_ids | set(neighbour_ranked)
+    community_ids: list[str] = []
+    if direct_communities:
+        # Rank community peers by degree too so we surface the
+        # central members of the subsystem first.
+        candidates = [
+            n for n, d in graph_obj.nodes(data=True)
+            if d.get("community") in direct_communities
+            and n not in seen
+        ]
+        community_ids = sorted(
+            candidates,
+            key=lambda n: graph_obj.degree(n),
+            reverse=True,
+        )[:4]
+
+    # === Render: grouped by tier with explicit labels ===
+    def _line(nid: str, tier: str) -> str:
+        data = graph_obj.nodes[nid]
         label = data.get("label", nid)
         src = data.get("source_file", "?")
         loc = data.get("source_location", "")
-        neighbour_count = graph_obj.degree(nid)
-        community = data.get("community", "?")
-        out.append(
-            f"• {label} [{src}{':' + str(loc) if loc else ''}] — "
-            f"degree {neighbour_count}, community {community}"
+        deg = graph_obj.degree(nid)
+        cid = data.get("community", "?")
+        loc_part = f":{loc}" if loc else ""
+        return (
+            f"  [{tier}] {label}  [{src}{loc_part}] "
+            f"— degree {deg}, community {cid}"
         )
-    return "graphify__query results:\n" + "\n".join(out)
+
+    sections: list[str] = []
+    sections.append(
+        f"graphify__query for {terms!r}:\n"
+    )
+    sections.append("DIRECT matches (literal label/source hit):")
+    for _, nid, _ in direct_scored[:8]:
+        sections.append(_line(nid, "DIRECT"))
+    if neighbour_ranked:
+        sections.append("")
+        sections.append(
+            "NEIGHBOR (1-hop in graph — callers / callees / "
+            "dependencies of the direct matches):"
+        )
+        for nid in neighbour_ranked:
+            sections.append(_line(nid, "NEIGHBOR"))
+    if community_ids:
+        sections.append("")
+        sections.append(
+            "COMMUNITY (same Leiden cluster as the direct matches "
+            "— the rest of the subsystem):"
+        )
+        for nid in community_ids:
+            sections.append(_line(nid, "COMMUNITY"))
+    return "\n".join(sections)
 
 
 @tool

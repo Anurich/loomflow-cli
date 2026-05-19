@@ -22,7 +22,13 @@ dependencies = [
     # routes in loom-code's Team.router share one session_id with
     # the parent REPL, fixing the "turn 2 lost prior context" bug
     # when the classifier flipped between SIMPLE and COMPLEX.
-    "loomflow[litellm,web]>=0.10.18",
+    # 0.10.19 added strong plan_write verification: DONE
+    # transitions must reference real tool_call_ids via
+    # verified_by (each id usable once — kills "one edit, five
+    # claims" hallucination) OR carry a substantive finding.
+    # ReAct + ReWOO call record_tool_call; other architectures
+    # get a soft-cutover finding-fallback.
+    "loomflow[litellm,web]>=0.10.19",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

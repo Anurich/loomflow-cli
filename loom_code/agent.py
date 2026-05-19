@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from importlib.resources import files as _pkg_files
 from pathlib import Path
+from typing import Any
 
 from loomflow import Agent
 from loomflow.architecture.router import RouterRoute
@@ -66,6 +67,7 @@ def build_agent(
     snip_window: int = 8,
     auto_compact: bool = True,
     tool_result_summarizer: str | None = None,
+    loom_retrieval: str = "agentic",
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -236,6 +238,26 @@ def build_agent(
     # persist_tool_transcripts + tool_transcript_max_bytes since
     # 0.10.16's Team-kwarg-forwarding sweep). No more post-
     # construction monkey-patching.
+    #
+    if loom_retrieval not in ("bm25", "agentic"):
+        raise ValueError(
+            "loom_retrieval must be 'bm25' or 'agentic', "
+            f"got {loom_retrieval!r}"
+        )
+
+    # Agentic LOOM.md retrieval: wire the ``read_loom_section``
+    # tool into both the coordinator and the simple coder. The
+    # TOC injection (which tells the model the slugs) happens via
+    # the REPL's per-turn LoomRetriever; the tool fetches a
+    # specific section body on demand.
+    coordinator_extra_tools: list[Any] = []
+    simple_coder_extra_tools: list[Any] = []
+    if loom_retrieval == "agentic":
+        from .loom_section_tool import read_loom_section_tool
+        loom_tool = read_loom_section_tool(project.root)
+        coordinator_extra_tools.append(loom_tool)
+        simple_coder_extra_tools.append(loom_tool)
+
     supervisor = Team.supervisor(
         workers=workers,
         instructions=build_coordinator_instructions(project),
@@ -244,6 +266,7 @@ def build_agent(
         auto_consolidate=True,
         workspace=workspace,
         living_plan=True,
+        tools=coordinator_extra_tools or None,
         skills=bundled_skills,
         max_turns=max_turns,
         max_stop_hook_iterations=max_stop_hook_iterations,
@@ -278,6 +301,7 @@ def build_agent(
         memory_url=memory_url,
         web_backend=web_backend,
         skills=bundled_skills,
+        extra_tools=simple_coder_extra_tools or None,
     )
 
     # ROUTER — the actual entrypoint loom-code returns. One
@@ -300,30 +324,48 @@ def build_agent(
                 name="simple",
                 agent=simple_coder,
                 description=(
-                    "Use SIMPLE for one-shot tasks the user can describe "
-                    "in a sentence and a single coding agent can handle "
-                    "in a handful of tool calls. Examples: 'create a "
-                    "hello-world file', 'fix this typo on line 12', 'add "
-                    "a docstring to the foo function', 'rename bar to "
-                    "baz in this file', 'what does this function do?', "
-                    "'read this URL and tell me about X'. Single file, "
-                    "single concern, no investigation needed across the "
-                    "codebase, no multi-step plan required."
+                    "Use SIMPLE for any task that lives in ONE FILE or "
+                    "addresses ONE CONCERN — regardless of how many "
+                    "steps inside. A sequential checklist on a single "
+                    "file (e.g. 'fix all 12 issues in observer.py', "
+                    "'add docstrings to every function in foo.py', "
+                    "'clean up linter warnings here') is SIMPLE — "
+                    "the steps are sequential, not parallel, and a "
+                    "single coder working through them is faster + "
+                    "more accurate than a team. Also SIMPLE: one-shot "
+                    "tasks ('fix this typo', 'rename bar to baz in "
+                    "this file', 'what does this function do?', "
+                    "'read this URL and tell me about X'), single-"
+                    "file questions, and any prompt that doesn't "
+                    "benefit from parallel investigation across "
+                    "files. When unsure between SIMPLE and COMPLEX, "
+                    "PREFER SIMPLE — a competent single coder rarely "
+                    "loses to team overhead on file-local work."
                 ),
             ),
             RouterRoute(
                 name="complex",
                 agent=supervisor,
                 description=(
-                    "Use COMPLEX for tasks that benefit from a team — "
-                    "parallel investigation, multi-step planning, cross-"
-                    "file refactors, code review, dedicated test pass, "
-                    "architecture changes. Examples: 'add OAuth to this "
-                    "app', 'refactor the data layer to use Postgres', "
-                    "'review my PR and write a test plan', 'investigate "
-                    "why X is slow then fix it'. Multiple files, "
-                    "multiple concerns, real planning + verification "
-                    "loops needed, parallel research pays off."
+                    "Use COMPLEX ONLY when the task genuinely "
+                    "benefits from PARALLEL work across MULTIPLE "
+                    "files or MULTIPLE concerns. Trigger shapes: "
+                    "(1) cross-file refactors touching N modules in "
+                    "ways that need coordination ('refactor the data "
+                    "layer to use Postgres', 'add OAuth — touches "
+                    "auth + middleware + tests'); (2) work that "
+                    "splits naturally into independent sub-tasks an "
+                    "explorer + auditor + reviewer can do in "
+                    "parallel ('investigate why X is slow then fix "
+                    "it', 'review my PR end-to-end'); (3) "
+                    "architecture changes affecting the whole "
+                    "system. DO NOT pick COMPLEX for single-file "
+                    "work, no matter how many issues that file has "
+                    "— a checklist of 20 fixes in one file is still "
+                    "SIMPLE because the steps are sequential, not "
+                    "parallel. The team's overhead (planning, "
+                    "delegation, review-of-review) only pays off "
+                    "when there's real parallelism to exploit."
                 ),
             ),
         ],
@@ -358,6 +400,12 @@ def build_agent(
         # plan — but pass it anyway for symmetry with supervisor.
         max_stop_hook_iterations=max_stop_hook_iterations,
     )
+    # Stamp the retrieval mode on the coordinator so the REPL's
+    # per-turn LoomRetriever build can read it back without
+    # plumbing yet another arg through every call site. The REPL
+    # checks ``getattr(self.agent, '_loom_retrieval_mode', 'bm25')``
+    # when instantiating LoomRetriever and the two stay in sync.
+    coordinator._loom_retrieval_mode = loom_retrieval  # type: ignore[attr-defined]
     return coordinator, workspace
 
 
