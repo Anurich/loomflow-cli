@@ -16,8 +16,6 @@ from collections.abc import Callable
 from typing import Any
 
 from rich.console import Console
-from rich.live import Live
-from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -124,22 +122,13 @@ class StreamRenderer:
         # the _on_completed fallback (print result["output"] only if
         # nothing streamed, so we never double-print).
         self._any_text = False
-        # Buffer for one prose burst — chunks accumulate here AND
-        # the in-place Live widget re-renders the accumulated
-        # markdown on each chunk. We use Rich's ``Live`` to update a
-        # region of the terminal in place: the user sees prose
-        # forming token-by-token instead of a long spinner-then-blob
-        # wait. ``_live`` is set in ``_on_model_chunk`` when the
-        # burst starts and torn down in ``_end_text``.
-        #
-        # Why the in-place re-render (instead of plain-text
-        # streaming + final markdown pass): the plain approach
-        # forces the user to see the same response twice (raw text
-        # streams, then re-renders as markdown), which is jarring.
-        # Live re-renders the markdown buffer on every chunk —
-        # slight flicker, but only ONE render the user remembers.
+        # Buffer for one prose burst — chunks accumulate here while
+        # they're also streamed inline as plain text (see
+        # ``_on_model_chunk`` for why we DON'T use a Rich Live
+        # widget: it recurses against the REPL's status spinner).
+        # The buffer lets ``_on_completed`` know whether anything
+        # streamed (so it doesn't double-print result["output"]).
         self._text_buffer: list[str] = []
-        self._live: Live | None = None
         # call_id -> tool name. loomflow's `tool_result` event only
         # carries `call_id` (ToolResult has no `tool` field) — the
         # tool NAME is only on the `tool_call` event. We bridge the
@@ -194,14 +183,21 @@ class StreamRenderer:
         # "text" kind carries assistant prose; "tool_call"/"finish"
         # chunks have text=None and are surfaced by other handlers.
         #
-        # We render INCREMENTALLY via Rich's ``Live`` widget — the
-        # buffer accumulates and Live re-renders the markdown view
-        # of it in place on every chunk. Two visible wins vs the
-        # old buffer-and-blob path: (1) SIMPLE route turns that
-        # answer without tool calls finally show progress instead
-        # of a long silent spinner, (2) the user gets the feeling
-        # the model is THINKING rather than dead — the
-        # asymmetry-with-COMPLEX-route problem the user flagged.
+        # We stream the chunks as PLAIN TEXT inline, NOT through a
+        # Rich ``Live`` widget. Hard-won reason: a Live nested
+        # inside the REPL's ``console.status()`` spinner (which is
+        # ALSO a Live) makes Rich's refresh recurse on
+        # ``console._live_stack[0].refresh()`` — observed blowing
+        # the stack (RecursionError, ~992 frames) AND corrupting
+        # the approval prompt's stdin. Two Live contexts on one
+        # console don't compose. Plain ``console.print(..., end="")``
+        # gives the same token-by-token streaming feel with zero
+        # Live machinery, so it can't deadlock or recurse.
+        #
+        # Tradeoff: streamed prose isn't markdown-rendered (you see
+        # literal ``**bold**`` / code fences). Acceptable — a crash
+        # that blocks the agent mid-write is infinitely worse than
+        # un-prettified streaming.
         chunk = payload.get("chunk") or {}
         if chunk.get("kind") != "text":
             return
@@ -209,65 +205,28 @@ class StreamRenderer:
         if not text:
             return
         if not self._in_text:
-            # Starting a new prose burst — pause the spinner so it
-            # doesn't fight Live for the cursor row, then start Live
-            # and let it own the bottom of the terminal.
+            # First chunk of a prose burst — pause the spinner (it
+            # owns the cursor line) + drop a blank line so the
+            # streamed text starts clean.
             self._pause_status()
             console.print()
-            # ``transient=True`` is load-bearing: Rich's Live widget
-            # clears its in-progress output when ``.stop()`` is
-            # called, so we don't leave a TRAIL of partial markdown
-            # renders on screen. The previous ``transient=False``
-            # combo with an active spinner caused visible duplicate
-            # lines because Live's cursor-overwrite math fights
-            # any other widget trying to own the bottom of the
-            # terminal. With transient=True, ``_end_text`` clears
-            # the streaming visual and then explicitly
-            # ``console.print(Markdown(full))`` lands the final
-            # clean render — best of both: streaming feedback
-            # during, clean output after, no duplication.
-            self._live = Live(
-                Text(""),
-                console=console,
-                refresh_per_second=8,
-                transient=True,
-            )
-            self._live.start()
             self._in_text = True
         self._any_text = True
         self._text_buffer.append(text)
-        # Update Live with the accumulated text so far. We render
-        # the LIVE preview as plain Text (not Markdown) for two
-        # reasons: (1) partial markdown — open headings, open code
-        # fences, half-rendered bullets — re-flows the entire
-        # rendered output on every chunk, which is what triggered
-        # the cursor-overwrite duplication. Plain text streams
-        # additively and is cheap to re-render. (2) the FINAL
-        # render in ``_end_text`` uses Markdown, so the user still
-        # gets pretty formatting once the burst completes.
-        if self._live is not None:
-            full_so_far = "".join(self._text_buffer)
-            self._live.update(Text(full_so_far))
+        # Stream the raw chunk inline. ``markup=False`` /
+        # ``highlight=False`` so a stray ``[`` in the model's text
+        # isn't parsed as a Rich style tag mid-stream.
+        console.print(text, end="", markup=False, highlight=False)
 
     def _end_text(self) -> None:
         if not self._in_text:
             return
-        # Stop Live FIRST — with transient=True this clears the
-        # streaming visual cleanly. Then print the final markdown
-        # once via the normal console flow, so the on-screen result
-        # is a single well-rendered markdown block (no partial
-        # re-render artefacts, no duplicates).
-        full = "".join(self._text_buffer).strip()
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+        # Close the streamed line. The streamed plain text IS the
+        # final output — no re-render (re-rendering as Markdown
+        # would print the whole response a SECOND time).
         self._text_buffer.clear()
         self._in_text = False
-        if full:
-            try:
-                console.print(Markdown(full))
-            except Exception:  # noqa: BLE001 — survive odd markdown
-                console.print(full, markup=False, highlight=False)
+        console.print()  # newline to end the inline stream
         # Prose burst over — bring the spinner back; the next
         # tool_call will overwrite this label with something
         # more specific.
