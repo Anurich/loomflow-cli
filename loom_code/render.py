@@ -21,6 +21,8 @@ from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.text import Text
 
+from .escalate import ESCALATE_TOOL_NAME
+
 console = Console()
 
 # Tools whose results are worth showing in full-ish; others get a
@@ -166,6 +168,12 @@ class StreamRenderer:
         # the agent having to report any of it itself.
         self.bash_commands: list[str] = []
         self.notes_written: list[tuple[str, str]] = []  # (kind, title)
+        # Set when the SIMPLE coder calls ``escalate_to_team`` — the
+        # REPL reads these after the run to re-dispatch the same
+        # prompt through the supervisor (which inherits the SIMPLE
+        # coder's partial context via the shared session).
+        self.escalation_requested: bool = False
+        self.escalation_reason: str = ""
 
     def handle(self, event: Any) -> None:
         """Render a single ``Event``. ``kind`` is a string enum;
@@ -206,49 +214,60 @@ class StreamRenderer:
             # and let it own the bottom of the terminal.
             self._pause_status()
             console.print()
-            # ``refresh_per_second=8`` keeps re-render cost bounded
-            # while still feeling smooth. transient=False so the
-            # final rendered markdown stays on screen after Live
-            # stops (we explicitly DON'T want it to disappear).
+            # ``transient=True`` is load-bearing: Rich's Live widget
+            # clears its in-progress output when ``.stop()`` is
+            # called, so we don't leave a TRAIL of partial markdown
+            # renders on screen. The previous ``transient=False``
+            # combo with an active spinner caused visible duplicate
+            # lines because Live's cursor-overwrite math fights
+            # any other widget trying to own the bottom of the
+            # terminal. With transient=True, ``_end_text`` clears
+            # the streaming visual and then explicitly
+            # ``console.print(Markdown(full))`` lands the final
+            # clean render — best of both: streaming feedback
+            # during, clean output after, no duplication.
             self._live = Live(
-                Markdown(""),
+                Text(""),
                 console=console,
                 refresh_per_second=8,
-                transient=False,
+                transient=True,
             )
             self._live.start()
             self._in_text = True
         self._any_text = True
         self._text_buffer.append(text)
-        # Update Live with the accumulated markdown so far. Try
-        # Markdown first; on pathological partial markdown (open
-        # code fences, etc.) Rich can still parse, but if it ever
-        # raises we degrade to plain Text — never crash mid-stream.
+        # Update Live with the accumulated text so far. We render
+        # the LIVE preview as plain Text (not Markdown) for two
+        # reasons: (1) partial markdown — open headings, open code
+        # fences, half-rendered bullets — re-flows the entire
+        # rendered output on every chunk, which is what triggered
+        # the cursor-overwrite duplication. Plain text streams
+        # additively and is cheap to re-render. (2) the FINAL
+        # render in ``_end_text`` uses Markdown, so the user still
+        # gets pretty formatting once the burst completes.
         if self._live is not None:
             full_so_far = "".join(self._text_buffer)
-            try:
-                self._live.update(Markdown(full_so_far))
-            except Exception:  # noqa: BLE001 — survive odd markdown
-                self._live.update(Text(full_so_far))
+            self._live.update(Text(full_so_far))
 
     def _end_text(self) -> None:
         if not self._in_text:
             return
-        # Final flush — render the COMPLETE markdown one last time
-        # before stopping Live, so the on-screen output reflects the
-        # final well-formed markdown (the partial re-renders during
-        # streaming may have been mid-block).
+        # Stop Live FIRST — with transient=True this clears the
+        # streaming visual cleanly. Then print the final markdown
+        # once via the normal console flow, so the on-screen result
+        # is a single well-rendered markdown block (no partial
+        # re-render artefacts, no duplicates).
         full = "".join(self._text_buffer).strip()
         if self._live is not None:
-            if full:
-                try:
-                    self._live.update(Markdown(full))
-                except Exception:  # noqa: BLE001
-                    self._live.update(Text(full))
             self._live.stop()
             self._live = None
         self._text_buffer.clear()
         self._in_text = False
+        if full:
+            try:
+                console.print(Markdown(full))
+            except Exception:  # noqa: BLE001 — survive odd markdown
+                console.print(full, markup=False, highlight=False)
         # Prose burst over — bring the spinner back; the next
         # tool_call will overwrite this label with something
         # more specific.
@@ -301,6 +320,13 @@ class StreamRenderer:
             cmd = str(args.get("command") or "").strip()
             if cmd:
                 self.bash_commands.append(cmd)
+        elif tool == ESCALATE_TOOL_NAME:
+            # SIMPLE coder asked for the team. Record it; the REPL
+            # re-dispatches to the supervisor after the run.
+            self.escalation_requested = True
+            self.escalation_reason = str(
+                args.get("reason") or ""
+            ).strip()
         elif tool == "note":
             title = str(args.get("title") or "").strip()
             if title:
@@ -358,14 +384,23 @@ class StreamRenderer:
         if not text:
             console.print(Text("    ✓ (no output)", style="dim green"))
             return
-        # The living plan is load-bearing context — show it in full,
-        # never truncated. Verbose tools (read/grep/ls/find) get a
-        # fuller preview; everything else gets a tight one.
+        # The living plan is load-bearing — show it in full. Prefer
+        # the compact glyph view (built from the structured steps
+        # captured on the tool_call); fall back to the raw markdown
+        # table only if we somehow didn't capture structured steps.
         if is_plan:
-            indented = "\n".join(
-                "    " + ln for ln in text.splitlines()
-            )
-            console.print(Text(indented, style="dim"))
+            if self.last_plan_steps:
+                console.print(
+                    _render_plan_glyphs(
+                        self.last_plan_steps,
+                        goal=_extract_plan_goal(text),
+                    )
+                )
+            else:
+                indented = "\n".join(
+                    "    " + ln for ln in text.splitlines()
+                )
+                console.print(Text(indented, style="dim"))
             return
         is_verbose = any(
             v in str(tool) for v in _VERBOSE_RESULT_TOOLS
@@ -439,6 +474,87 @@ class StreamRenderer:
         # shot run summary, so we don't duplicate them here.
         console.print()
         console.rule(style="dim")
+
+
+# Status → (glyph, Rich style) for the compact plan view. ■ done /
+# ▸ doing / □ todo / ⊘ skipped / ✗ blocked — scannable at a glance,
+# the way Claude Code / modern TODO panels render task state.
+_PLAN_GLYPHS: dict[str, tuple[str, str]] = {
+    "done": ("■", "green"),
+    "doing": ("▸", "bold yellow"),
+    "todo": ("□", "dim"),
+    "skipped": ("⊘", "dim"),
+    "blocked": ("✗", "red"),
+}
+
+
+def _extract_plan_goal(markdown: str) -> str:
+    """Pull the goal line out of loomflow's rendered plan markdown
+    (``**GOAL:** ...``) so the glyph header can show it."""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("**GOAL:**"):
+            return stripped.replace("**GOAL:**", "").strip()
+    return ""
+
+
+def _render_plan_glyphs(
+    steps: list[dict[str, Any]], *, goal: str = ""
+) -> Text:
+    """Render a living plan as a compact glyph list instead of a
+    markdown table. Far faster to scan mid-run ("what's left?")
+    than the bordered table.
+
+    Layout::
+
+        ◆ <goal>  ·  1/3 done  ·  1 blocked
+          ■ Fix shell injection        — rewrote without shell=True
+          ▸ Fix eval usage  (doing)
+          □ Fix path traversal
+          ⊘ Update changelog           › skipped: outside ask
+
+    Done steps show their ``finding`` inline (dim); skipped/blocked
+    steps show the reason right-flagged with ``›``. Built with Rich
+    ``Text.append`` (not markup) so step descriptions containing
+    ``[`` don't get mis-parsed as style tags.
+    """
+    t = Text()
+    total = len(steps)
+    done = sum(1 for s in steps if str(s.get("status")) == "done")
+    blocked = sum(
+        1 for s in steps if str(s.get("status")) == "blocked"
+    )
+    t.append("  ◆ ", style="bold cyan")
+    t.append(goal or "Plan", style="bold")
+    t.append(f"  ·  {done}/{total} done", style="dim")
+    if blocked:
+        t.append(f"  ·  {blocked} blocked", style="dim red")
+    t.append("\n")
+    for s in steps:
+        status = str(s.get("status", "todo"))
+        glyph, gstyle = _PLAN_GLYPHS.get(status, ("□", "dim"))
+        desc = str(s.get("description", "")).strip()
+        finding = (
+            str(s.get("finding", "")).replace("\n", " ").strip()
+        )
+        t.append(f"    {glyph} ", style=gstyle)
+        if status == "done":
+            t.append(desc, style="dim")
+        elif status == "doing":
+            t.append(desc, style="bold")
+            t.append("  (doing)", style="dim yellow")
+        else:
+            t.append(desc)
+        if finding:
+            if status in ("skipped", "blocked"):
+                t.append(f"   › {finding}", style="dim")
+            elif status == "done":
+                # Cap the inline finding so a verbose one doesn't
+                # blow the line width.
+                clip = finding if len(finding) <= 60 else finding[:59] + "…"
+                t.append(f"   — {clip}", style="dim")
+        t.append("\n")
+    return t
 
 
 def _coerce_plan_steps(raw: Any) -> list[dict[str, Any]] | None:

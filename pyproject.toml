@@ -28,7 +28,14 @@ dependencies = [
     # claims" hallucination) OR carry a substantive finding.
     # ReAct + ReWOO call record_tool_call; other architectures
     # get a soft-cutover finding-fallback.
-    "loomflow[litellm,web]>=0.10.19",
+    # 0.10.20 made AutoExtractMemory background-by-default:
+    # remember() schedules the LLM fact-extraction as a fire-
+    # and-forget asyncio task instead of awaiting it. Kills the
+    # per-turn "next loom: prompt comes back late" latency
+    # without disabling fact extraction. Loom-code relies on
+    # this — without it the previous explicit auto_extract=False
+    # band-aid would have to come back.
+    "loomflow[litellm,web]>=0.10.20",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

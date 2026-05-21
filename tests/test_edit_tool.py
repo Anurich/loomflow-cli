@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from loom_code.edit_tool import verifying_edit_tool
+from loom_code.edit_tool import multi_edit_tool, verifying_edit_tool
 
 
 def test_happy_path_appends_edit_preview(tmp_path: Path) -> None:
@@ -158,3 +158,197 @@ def test_tool_name_is_edit(tmp_path: Path) -> None:
     loomflow's ``edit_tool`` slot in the agent's tool surface."""
     tool = verifying_edit_tool(tmp_path)
     assert tool.name == "edit"
+
+
+def test_replace_all_string_true_coerced(tmp_path: Path) -> None:
+    """The tool-call layer can send replace_all='true' (string).
+    A non-empty 'false' string is truthy, so without coercion a
+    model meaning replace_all=False would silently replace ALL
+    occurrences. Coercion must parse the string form."""
+    f = tmp_path / "f.py"
+    f.write_text("x = 1\nx = 1\nx = 1\n")
+    tool = verifying_edit_tool(tmp_path)
+
+    # replace_all="false" (string) → must replace only ONE.
+    result = asyncio.run(
+        tool.fn(
+            path="f.py",
+            old_string="x = 1",
+            new_string="x = 2",
+            replace_all="false",
+        )
+    )
+    # loomflow's edit errors on multi-match without replace_all —
+    # so a correctly-coerced "false" yields the multi-match error,
+    # NOT a silent replace-all.
+    assert "ERROR" in result and "appears" in result
+    # File unchanged (the edit was rejected for ambiguity).
+    assert f.read_text().count("x = 1") == 3
+
+
+def test_replace_all_string_true_replaces_all(tmp_path: Path) -> None:
+    """replace_all='true' (string) → coerced to True → all
+    occurrences replaced."""
+    f = tmp_path / "f.py"
+    f.write_text("x = 1\nx = 1\nx = 1\n")
+    tool = verifying_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="f.py",
+            old_string="x = 1",
+            new_string="x = 2",
+            replace_all="true",
+        )
+    )
+    assert "ERROR" not in result
+    assert f.read_text().count("x = 2") == 3
+
+
+# ---- multi_edit: atomic batch edits to one file ---------------------
+
+
+def test_multi_edit_applies_all_atomically(tmp_path: Path) -> None:
+    """N edits in one call → all applied, single write, EDIT
+    PREVIEW returned. The headline "all at once" win."""
+    f = tmp_path / "m.py"
+    f.write_text("a = 1\nb = 2\nc = 3\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {"old_string": "a = 1", "new_string": "a = 100"},
+                {"old_string": "b = 2", "new_string": "b = 200"},
+                {"old_string": "c = 3", "new_string": "c = 300"},
+            ],
+        )
+    )
+    assert "applied 3 edits" in result
+    assert "EDIT PREVIEW" in result
+    assert f.read_text() == "a = 100\nb = 200\nc = 300\n"
+
+
+def test_multi_edit_atomic_failure_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """If ANY edit's old_string doesn't match, NOTHING is written
+    — the file is never left half-edited. The corruption guard."""
+    f = tmp_path / "m.py"
+    f.write_text("x = 1\ny = 2\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {"old_string": "x = 1", "new_string": "x = 9"},
+                {"old_string": "NONEXISTENT", "new_string": "z"},
+            ],
+        )
+    )
+    assert result.startswith("ERROR")
+    assert "edit #2" in result
+    assert "NOTHING was written" in result
+    # File completely unchanged — edit #1 was NOT applied either.
+    assert f.read_text() == "x = 1\ny = 2\n"
+
+
+def test_multi_edit_syntax_break_warns(tmp_path: Path) -> None:
+    """A batch that leaves the .py file invalid still applies (the
+    edits all matched) but warns — same contract as single edit."""
+    f = tmp_path / "m.py"
+    f.write_text("def f():\n    return 1\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {"old_string": "def f():", "new_string": "def f( :: broken"},
+            ],
+        )
+    )
+    assert "applied 1 edit" in result
+    assert "WARNING" in result
+    assert "syntactically valid Python" in result
+
+
+def test_multi_edit_json_string_edits_arg(tmp_path: Path) -> None:
+    """The tool-call layer often serialises the edits list as a
+    JSON STRING. Must be coerced, not rejected."""
+    f = tmp_path / "m.py"
+    f.write_text("p = 1\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits='[{"old_string": "p = 1", "new_string": "p = 2"}]',
+        )
+    )
+    assert "applied 1 edit" in result
+    assert f.read_text() == "p = 2\n"
+
+
+def test_multi_edit_replace_all_per_edit(tmp_path: Path) -> None:
+    """A single edit in the batch can set replace_all to hit every
+    occurrence; without it, a multi-match edit fails the batch."""
+    f = tmp_path / "m.py"
+    f.write_text("v = 0\nv = 0\nv = 0\n")
+    tool = multi_edit_tool(tmp_path)
+
+    # Without replace_all → ambiguous → whole batch rejected.
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[{"old_string": "v = 0", "new_string": "v = 1"}],
+        )
+    )
+    assert result.startswith("ERROR")
+    assert "appears 3 times" in result
+    assert f.read_text() == "v = 0\nv = 0\nv = 0\n"  # untouched
+
+    # With replace_all=true → all three replaced.
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {
+                    "old_string": "v = 0",
+                    "new_string": "v = 1",
+                    "replace_all": "true",
+                }
+            ],
+        )
+    )
+    assert "applied 1 edit" in result
+    assert f.read_text().count("v = 1") == 3
+
+
+def test_multi_edit_empty_edits_rejected(tmp_path: Path) -> None:
+    f = tmp_path / "m.py"
+    f.write_text("x\n")
+    tool = multi_edit_tool(tmp_path)
+    result = asyncio.run(tool.fn(path="m.py", edits=[]))
+    assert result.startswith("ERROR")
+    assert "empty" in result.lower()
+
+
+def test_multi_edit_path_traversal_refused(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text("x\n")
+    tool = multi_edit_tool(tmp_path)
+    result = asyncio.run(
+        tool.fn(
+            path="../../../etc/hosts",
+            edits=[{"old_string": "a", "new_string": "b"}],
+        )
+    )
+    assert "refusing" in result.lower() or "not found" in result.lower()
+
+
+def test_multi_edit_tool_name_and_destructive(tmp_path: Path) -> None:
+    tool = multi_edit_tool(tmp_path)
+    assert tool.name == "multi_edit"
+    assert tool.destructive is True

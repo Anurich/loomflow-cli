@@ -31,9 +31,47 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from loomflow import tool
 from loomflow.tools.registry import Tool
+
+
+def _as_int(value: Any, default: int) -> int:
+    """Coerce a model-supplied value to int. The tool-call layer
+    often serialises ``context=2`` as the STRING ``"2"`` (and some
+    providers send floats), so a typed ``int`` param arrives as a
+    str and ``lineno - context`` crashes with 'int - str'. Coerce
+    leniently; fall back to ``default`` on anything unparseable."""
+    if isinstance(value, bool):
+        # bool is an int subclass — don't let True become 1 silently
+        # for a numeric arg; treat as default.
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Coerce a model-supplied value to bool. Weak models send
+    ``ignore_case=true`` as the STRING ``"true"`` (or ``"1"`` /
+    ``"yes"``); a typed ``bool`` param then arrives truthy-non-empty
+    for ANY non-empty string including ``"false"``. Parse the
+    common truthy/falsy spellings explicitly."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "y", "on"):
+        return True
+    if s in ("false", "0", "no", "n", "off", ""):
+        return False
+    return default
+
 
 # Directories we never search — matches loomflow's grep_tool noise
 # list so behaviour around big virtualenvs / build outputs is the
@@ -163,6 +201,16 @@ def enhanced_grep_tool(
         """Find regex matches under ``path`` and return grouped,
         context-rich results. See module docstring for the full
         contract."""
+        # Coerce model-supplied args defensively — the tool-call
+        # layer serialises typed params as strings ("2", "true"),
+        # which crashed the line-window math ('int - str') and
+        # made bool flags always-truthy. Same lenient coercion
+        # loomflow's plan_write does for weak-model serialisation.
+        context = _as_int(context, default_context)
+        ignore_case = _as_bool(ignore_case, default=False)
+        include_tests = _as_bool(include_tests, default=False)
+        raw = _as_bool(raw, default=False)
+
         # Resolve and bounds-check ``path``. Must stay under root.
         target = (root / path).resolve()
         try:

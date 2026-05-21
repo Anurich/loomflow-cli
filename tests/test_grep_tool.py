@@ -181,3 +181,61 @@ def test_tool_name_and_destructive_flag(tmp_path: Path) -> None:
     grep = enhanced_grep_tool(tmp_path)
     assert grep.name == "grep"
     assert grep.destructive is False
+
+
+def test_string_typed_args_coerced_not_crash(tmp_path: Path) -> None:
+    """The headline crash: the tool-call layer serialises typed
+    params as strings (context='2', ignore_case='true'), and the
+    line-window math did ``lineno - context`` → 'int - str'
+    TypeError. Coercion must make string args work."""
+    _make_repo(tmp_path)
+    grep = enhanced_grep_tool(tmp_path)
+
+    # Pass EVERY typed param as a string, exactly as a weak model's
+    # serialised tool call would.
+    result = asyncio.run(
+        grep.fn(
+            pattern="authenticate",
+            context="2",          # str, not int
+            ignore_case="true",   # str, not bool
+            include_tests="false",  # str, not bool
+            raw="false",          # str, not bool
+        )
+    )
+    # Must NOT crash — must return real grouped output.
+    assert "src/a.py" in result
+    assert "▸" in result
+
+
+def test_string_context_controls_window(tmp_path: Path) -> None:
+    """A string context value must still control the window size,
+    not silently fall back to default."""
+    f = tmp_path / "big.py"
+    f.write_text("\n".join(f"line_{i}" for i in range(1, 31)) + "\n")
+    grep = enhanced_grep_tool(tmp_path)
+
+    # context="0" → only the hit line, no surrounding context.
+    result = asyncio.run(
+        grep.fn(pattern="line_15", context="0")
+    )
+    assert "line_15" in result
+    assert "line_14" not in result  # context=0 → no neighbours
+
+
+def test_as_bool_and_as_int_helpers() -> None:
+    """Unit-pin the coercion helpers — they guard the whole tool
+    surface against weak-model string serialisation."""
+    from loom_code.grep_tool import _as_bool, _as_int
+
+    assert _as_int("2", 99) == 2
+    assert _as_int(2, 99) == 2
+    assert _as_int("garbage", 99) == 99  # unparseable → default
+    assert _as_int(True, 99) == 99  # bool not treated as int
+
+    assert _as_bool("true") is True
+    assert _as_bool("false") is False
+    assert _as_bool("1") is True
+    assert _as_bool("0") is False
+    assert _as_bool(True) is True
+    assert _as_bool("garbage", default=True) is True  # → default
+    assert _as_bool("", default=True) is False  # empty → falsy

@@ -24,11 +24,15 @@ state silently).
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
+from typing import Any
 
 from loomflow import tool
 from loomflow.tools import edit_tool as _loomflow_edit_tool
 from loomflow.tools.registry import Tool
+
+from .grep_tool import _as_bool
 
 # How many lines of context to show around the edited region in
 # the EDIT PREVIEW. Chosen so the model can usually see the whole
@@ -147,6 +151,11 @@ def verifying_edit_tool(workdir: Path | str) -> Tool:
         edit summary PLUS a preview of the file after the edit
         so the agent can self-correct malformed replacements.
         See module docstring for the full contract."""
+        # Coerce ``replace_all`` — the tool-call layer may send the
+        # STRING "true"/"false" instead of a bool, and a non-empty
+        # "false" string is truthy, which would silently replace
+        # ALL occurrences when the model meant just one.
+        replace_all = _as_bool(replace_all, default=False)
         # Snapshot the file's pre-edit content for the diff bounds.
         target = (root / path).resolve()
         try:
@@ -216,3 +225,187 @@ def verifying_edit_tool(workdir: Path | str) -> Tool:
         # tests/test_approval_integration.py).
         destructive=True,
     )(edit)
+
+
+def _coerce_edits(value: Any) -> list[dict[str, str]] | str:
+    """Coerce the model's serialisation of the ``edits`` list into
+    a native list of ``{old_string, new_string}`` dicts. Returns
+    the list, or an error string the tool returns verbatim.
+
+    Weak models serialise list-of-objects args inconsistently — a
+    JSON string, a list of JSON strings, a dict with an ``edits``
+    key — so we salvage every shape, same lenient approach
+    ``plan_write`` uses for its ``steps`` arg.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return (
+                "ERROR: `edits` must be a list of "
+                "{old_string, new_string} objects (or a JSON "
+                "string of one). Couldn't parse the string given."
+            )
+    if isinstance(value, dict):
+        # ``{"edits": [...]}`` wrapper, or a single edit dict.
+        value = value.get("edits", [value])
+    if not isinstance(value, list):
+        return (
+            "ERROR: `edits` must be a list of "
+            f"{{old_string, new_string}} objects. Got "
+            f"{type(value).__name__}."
+        )
+    out: list[dict[str, str]] = []
+    for i, item in enumerate(value):
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError:
+                return (
+                    f"ERROR: edit #{i + 1} is a string that isn't "
+                    "valid JSON. Each edit must be an object with "
+                    "`old_string` and `new_string`."
+                )
+        if not isinstance(item, dict):
+            return (
+                f"ERROR: edit #{i + 1} must be an object with "
+                f"`old_string` + `new_string`, got "
+                f"{type(item).__name__}."
+            )
+        if "old_string" not in item or "new_string" not in item:
+            return (
+                f"ERROR: edit #{i + 1} is missing `old_string` "
+                "and/or `new_string`."
+            )
+        coerced_edit: dict[str, str] = {
+            "old_string": str(item["old_string"]),
+            "new_string": str(item["new_string"]),
+        }
+        # Preserve the optional per-edit ``replace_all`` flag (the
+        # multi_edit applier coerces it to bool). Without carrying
+        # it through, every edit defaults to single-replace.
+        if "replace_all" in item:
+            coerced_edit["replace_all"] = str(item["replace_all"])
+        out.append(coerced_edit)
+    if not out:
+        return "ERROR: `edits` was empty — nothing to do."
+    return out
+
+
+def multi_edit_tool(workdir: Path | str) -> Tool:
+    """Build the loom-code ``multi_edit`` tool — apply MANY edits to
+    ONE file in a single ATOMIC call.
+
+    Why it exists: making N separate ``edit`` calls to fix N things
+    in one file is N round-trips, and a model that produces a
+    slightly-off ``old_string`` retries the same edit repeatedly
+    (observed: ~8 retries for one fix, burning a whole session's
+    tokens). ``multi_edit`` collapses N changes into one call AND
+    is region-targeted — it never reproduces unchanged code, so it
+    scales to arbitrarily large files without the token blow-up (or
+    the "# ... rest unchanged ..." laziness) of a whole-file
+    rewrite.
+
+    **Atomic**: every edit's ``old_string`` must match (exactly
+    once, unless that edit sets ``replace_all``). If ANY edit fails
+    to match, NOTHING is written and the tool reports which edit
+    failed — so the file is never left half-changed / corrupted.
+    The model fixes the offending edit and resubmits the batch.
+
+    Model-facing signature:
+        ``multi_edit(path, edits=[{old_string, new_string,
+        replace_all?}, ...])``
+
+    On success the result carries the same EDIT PREVIEW + Python
+    syntax-break warning as ``edit``, so the model can verify the
+    whole batch landed correctly in one look.
+    """
+    root = Path(workdir).resolve()
+
+    async def multi_edit(path: str, edits: Any) -> str:
+        """Apply a batch of find-and-replace edits to one file
+        atomically. See the module/tool docstring for the full
+        contract."""
+        coerced = _coerce_edits(edits)
+        if isinstance(coerced, str):
+            return coerced  # error message, verbatim
+
+        target = (root / path).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return (
+                f"multi_edit: refusing to edit outside workdir: "
+                f"{target}"
+            )
+        if not target.is_file():
+            return f"multi_edit: file not found: {path}"
+
+        original = target.read_text(encoding="utf-8", errors="replace")
+        working = original
+        # Apply each edit to the in-memory working copy. Validate
+        # match BEFORE mutating so a mid-batch failure leaves
+        # ``working`` partially applied but we NEVER write it.
+        for i, e in enumerate(coerced):
+            old = e["old_string"]
+            new = e["new_string"]
+            replace_all = _as_bool(
+                e.get("replace_all"), default=False
+            )
+            count = working.count(old)
+            if count == 0:
+                return (
+                    f"ERROR: edit #{i + 1} old_string not found in "
+                    f"{path} (after applying edits 1..{i}). It must "
+                    "match EXACTLY (whitespace, indentation, line "
+                    "breaks). NOTHING was written — fix this edit "
+                    "and resubmit the whole batch."
+                )
+            if count > 1 and not replace_all:
+                return (
+                    f"ERROR: edit #{i + 1} old_string appears "
+                    f"{count} times in {path}; add more surrounding "
+                    "context to make it unique, or set "
+                    "replace_all=true on that edit. NOTHING was "
+                    "written."
+                )
+            working = (
+                working.replace(old, new)
+                if replace_all
+                else working.replace(old, new, 1)
+            )
+
+        # All edits matched — write once.
+        target.write_text(working, encoding="utf-8")
+
+        start_line, end_line = _find_edit_region(original, working)
+        preview = _render_preview(
+            target, working, start_line, end_line
+        )
+        warn = _syntax_check_python(target, working)
+        header = (
+            f"multi_edit: ✓ applied {len(coerced)} edit"
+            f"{'s' if len(coerced) != 1 else ''} to {path} "
+            f"({len(original)} → {len(working)} bytes)"
+        )
+        parts = [header, "", preview]
+        if warn:
+            parts.append("")
+            parts.append(warn)
+        return "\n".join(parts)
+
+    return tool(
+        name="multi_edit",
+        description=(
+            "Apply MULTIPLE find-and-replace edits to ONE file in a "
+            "single ATOMIC call. Prefer this over repeated `edit` "
+            "calls when changing several things in the same file — "
+            "one round-trip, and it scales to large files (only "
+            "touches the changed regions, never rewrites the whole "
+            "file). All edits must match or NONE apply (no half-"
+            "edited file). Args: path, edits=[{old_string, "
+            "new_string, replace_all?}, ...]. Result includes an "
+            "EDIT PREVIEW + a syntax-break warning for .py files."
+        ),
+        destructive=True,
+    )(multi_edit)

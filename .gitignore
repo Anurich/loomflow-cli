@@ -20,8 +20,14 @@ venv/
 .ruff_cache/
 .mypy_cache/
 
-# loom-code per-project runtime state (notebook + memory db)
+# loom-code per-project runtime state + generated indices
+# (.loom = notebook + memory db + graphify graph; graphify-out =
+# graphify's AST cache; LOOM.md = the loominit annotation output).
+# These are produced when loom-code runs on THIS repo (dogfooding
+# /loominit) and must never be committed.
 .loom/
+graphify-out/
+/LOOM.md
 
 # OS
 .DS_Store

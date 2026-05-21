@@ -56,7 +56,9 @@ from loomflow.tools import (
     write_tool,
 )
 
+from .edit_tool import multi_edit_tool
 from .edit_tool import verifying_edit_tool as edit_tool
+from .escalate import escalate_to_team_tool
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .project import Project
 from .prompts import build_coder_prompt, build_simple_coder_prompt
@@ -239,6 +241,7 @@ def _build_coder(
             read_tool(root),
             write_tool(root),
             edit_tool(root),
+            multi_edit_tool(root),
             grep_tool(root),
             find_tool(root),
             ls_tool(root),
@@ -388,11 +391,18 @@ def build_simple_coder(
         read_tool(root),
         write_tool(root),
         edit_tool(root),
+        multi_edit_tool(root),
         grep_tool(root),
         find_tool(root),
         ls_tool(root),
         bash_tool(root, timeout=300.0),
         web_fetch_tool(),
+        # Last-resort escape hatch: SIMPLE can hand a too-hard task
+        # up to the supervisor team. The REPL detects the call +
+        # re-dispatches (the team inherits SIMPLE's context via the
+        # shared session). NOT on the team's coder — only the
+        # single-agent SIMPLE path can escalate.
+        escalate_to_team_tool(),
     ]
     if has_web:
         from loomflow.tools import web_tool

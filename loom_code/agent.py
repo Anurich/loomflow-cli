@@ -263,7 +263,15 @@ def build_agent(
         instructions=build_coordinator_instructions(project),
         model=model,
         memory=memory_url,
-        auto_consolidate=True,
+        # auto_extract default (True for real providers) is FINE
+        # as of loomflow 0.10.20+: AutoExtractMemory now schedules
+        # the LLM fact-extraction call as a fire-and-forget task,
+        # so it no longer blocks Agent.run() from returning. The
+        # next ``loom:`` prompt comes back the moment the visible
+        # response ends; facts get written asynchronously in the
+        # background. Pre-0.10.20 we explicitly disabled this as a
+        # band-aid against the per-turn latency; the framework fix
+        # makes the band-aid unnecessary.
         workspace=workspace,
         living_plan=True,
         tools=coordinator_extra_tools or None,
@@ -406,6 +414,11 @@ def build_agent(
     # checks ``getattr(self.agent, '_loom_retrieval_mode', 'bm25')``
     # when instantiating LoomRetriever and the two stay in sync.
     coordinator._loom_retrieval_mode = loom_retrieval  # type: ignore[attr-defined]
+    # Stamp the supervisor (COMPLEX-route agent) on the coordinator
+    # so the REPL can re-dispatch to it when the SIMPLE coder calls
+    # ``escalate_to_team``. Running it with the same session_id
+    # (shared scope) means the team inherits SIMPLE's partial work.
+    coordinator._complex_agent = supervisor  # type: ignore[attr-defined]
     return coordinator, workspace
 
 

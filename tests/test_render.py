@@ -174,3 +174,112 @@ def test_truncate_preview_empty_input() -> None:
     from loom_code.render import _truncate_preview
 
     assert _truncate_preview("", char_cap=10, line_cap=2) == ""
+
+
+# ---- glyph plan rendering -------------------------------------------
+
+
+def test_extract_plan_goal() -> None:
+    from loom_code.render import _extract_plan_goal
+
+    md = "**GOAL:** Fix all the bugs\n\n| # | Status |\n"
+    assert _extract_plan_goal(md) == "Fix all the bugs"
+    # No goal line → empty string (header falls back to "Plan").
+    assert _extract_plan_goal("no goal here") == ""
+
+
+def test_render_plan_glyphs_header_counts() -> None:
+    from loom_code.render import _render_plan_glyphs
+
+    steps = [
+        {"description": "a", "status": "done", "finding": "did it"},
+        {"description": "b", "status": "doing", "finding": ""},
+        {"description": "c", "status": "todo", "finding": ""},
+        {"description": "d", "status": "blocked", "finding": "stuck"},
+    ]
+    plain = _render_plan_glyphs(steps, goal="My goal").plain
+    # Header shows goal + done/total + blocked count.
+    assert "My goal" in plain
+    assert "1/4 done" in plain
+    assert "1 blocked" in plain
+
+
+def test_render_plan_glyphs_uses_status_glyphs() -> None:
+    from loom_code.render import _render_plan_glyphs
+
+    steps = [
+        {"description": "done step", "status": "done", "finding": "f"},
+        {"description": "doing step", "status": "doing", "finding": ""},
+        {"description": "todo step", "status": "todo", "finding": ""},
+        {"description": "skip step", "status": "skipped", "finding": "why"},
+        {"description": "block step", "status": "blocked", "finding": "why"},
+    ]
+    plain = _render_plan_glyphs(steps).plain
+    assert "■ done step" in plain
+    assert "▸ doing step" in plain
+    assert "□ todo step" in plain
+    assert "⊘ skip step" in plain
+    assert "✗ block step" in plain
+    # Doing gets the (doing) marker.
+    assert "(doing)" in plain
+    # Done shows finding inline; skipped/blocked show the reason flag.
+    assert "— f" in plain
+    assert "› why" in plain
+
+
+def test_render_plan_glyphs_no_blocked_omits_blocked_count() -> None:
+    from loom_code.render import _render_plan_glyphs
+
+    steps = [
+        {"description": "a", "status": "done", "finding": ""},
+        {"description": "b", "status": "todo", "finding": ""},
+    ]
+    plain = _render_plan_glyphs(steps, goal="g").plain
+    assert "1/2 done" in plain
+    assert "blocked" not in plain
+
+
+def test_render_plan_glyphs_description_with_brackets_safe() -> None:
+    """Descriptions containing ``[`` must NOT be mis-parsed as Rich
+    style markup — we build with Text.append, not markup, so this
+    renders literally."""
+    from loom_code.render import _render_plan_glyphs
+
+    steps = [
+        {
+            "description": "handle list[str] type hints",
+            "status": "todo",
+            "finding": "",
+        }
+    ]
+    plain = _render_plan_glyphs(steps).plain
+    assert "list[str]" in plain
+
+
+def test_plan_result_renders_glyphs_when_steps_captured() -> None:
+    """End-to-end: a plan_write tool_call (captures structured
+    steps) followed by its tool_result should render the glyph
+    view, not the raw markdown table."""
+    from loomflow.core.types import Event, ToolCall
+
+    r = StreamRenderer()
+    # tool_call carrying structured steps.
+    r.handle(
+        Event.tool_call(
+            "s",
+            ToolCall(
+                id="c1",
+                tool="plan_write",
+                args={
+                    "goal": "g",
+                    "steps": [
+                        {"description": "step one", "status": "done",
+                         "finding": "ok"},
+                        {"description": "step two", "status": "todo"},
+                    ],
+                },
+            ),
+        )
+    )
+    assert r.last_plan_steps is not None
+    assert len(r.last_plan_steps) == 2

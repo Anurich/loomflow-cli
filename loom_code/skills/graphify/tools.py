@@ -51,36 +51,96 @@ _GRAPHIFY_SUPPORTED_SUFFIXES = frozenset({
 })
 
 
-async def _git_ls_files(project_root: Path) -> list[Path] | None:
-    """Fast path for source-file discovery: ask git for the tracked
-    file list. Returns ``None`` (caller falls back to
-    ``graphify.collect_files``) on any failure — not a git repo, no
-    git binary, timeout, anything. Trust git's ignore handling
-    (``.gitignore`` + ``.git/info/exclude``) — it already knows
-    ``.venv`` / ``node_modules`` / build artifacts are noise.
+# loom-code's OWN generated artifacts — never feed these to the
+# knowledge graph. ``LOOM.md`` is loominit's output (indexing it is
+# circular); ``.loom/`` is generated state (memory.db, graph.json,
+# the notebook); ``graphify-out/`` is graphify's AST cache. These
+# are frequently NOT in the user's ``.gitignore``, so ``git
+# ls-files --others`` would happily surface them — we exclude them
+# explicitly by path rather than relying on git's ignore handling.
+_LOOM_OWN_ARTIFACT_FILES = frozenset({"LOOM.md"})
+_LOOM_OWN_ARTIFACT_PREFIXES = (".loom/", "graphify-out/")
 
-    Why this matters: ``graphify.collect_files`` walks every file
-    under the root (including everything in a 17k-file ``.venv``)
-    then filters to known extensions. On loomflow-ide that walk is
-    6+ seconds; git ls-files returns the same 46-file set in ~10ms.
-    """
+
+def _is_loom_own_artifact(rel_path: str) -> bool:
+    """True if ``rel_path`` (repo-root-relative, forward slashes)
+    is one of loom-code's own generated outputs."""
+    if rel_path in _LOOM_OWN_ARTIFACT_FILES:
+        return True
+    return any(
+        rel_path.startswith(p) for p in _LOOM_OWN_ARTIFACT_PREFIXES
+    )
+
+
+async def _run_git_ls(
+    project_root: Path, extra_args: list[str]
+) -> list[str] | None:
+    """Run ``git -C <root> ls-files <extra_args>`` and return the
+    relative-path lines, or ``None`` on any failure (not a git
+    repo, no git binary, non-zero exit)."""
     try:
         result = await anyio.run_process(
-            ["git", "-C", str(project_root), "ls-files"],
+            ["git", "-C", str(project_root), "ls-files", *extra_args],
             check=False,
         )
     except (FileNotFoundError, OSError):
         return None
     if result.returncode != 0:
         return None
+    return result.stdout.decode("utf-8", errors="replace").splitlines()
+
+
+async def _git_ls_files(project_root: Path) -> list[Path] | None:
+    """Discover source files via git — TRACKED plus brand-new
+    UNTRACKED-but-not-ignored files — minus loom-code's own
+    generated artifacts. Returns ``None`` (caller falls back to
+    ``graphify.collect_files``) when git is unavailable.
+
+    Two git queries combine to mean "every file git considers part
+    of the project":
+
+    * ``git ls-files`` — tracked files (committed + staged).
+    * ``git ls-files --others --exclude-standard`` — untracked
+      files that AREN'T gitignored. This is what makes a freshly-
+      created ``new_module.py`` show up in the graph BEFORE it's
+      ``git add``-ed — the previous tracked-only behaviour left
+      new files invisible until commit, which surprised users
+      ("why doesn't the agent see the file I just made?").
+
+    Both inherit git's ignore handling, so ``.venv`` /
+    ``node_modules`` / build artifacts stay out for free. On top of
+    that we drop loom-code's own outputs (``LOOM.md`` / ``.loom/``
+    / ``graphify-out/``) explicitly, because those are usually NOT
+    gitignored and ``--others`` would otherwise surface them —
+    indexing loominit's own output is circular noise.
+
+    Why git at all: ``graphify.collect_files`` walks every file
+    under the root (including a 17k-file ``.venv``) then filters by
+    extension — 6+ seconds on a real project. The git index gives
+    the same set in ~10ms.
+    """
+    tracked = await _run_git_ls(project_root, [])
+    if tracked is None:
+        # Not a git repo (or git missing) — signal fallback.
+        return None
+    # Untracked-but-not-ignored. If THIS sub-call fails for some
+    # reason (it shouldn't if the tracked one succeeded), treat it
+    # as "no extra files" rather than aborting the whole discovery.
+    untracked = await _run_git_ls(
+        project_root, ["--others", "--exclude-standard"]
+    )
     out: list[Path] = []
-    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
-        if not line:
+    seen: set[str] = set()
+    for line in [*tracked, *(untracked or [])]:
+        if not line or line in seen:
             continue
-        # git ls-files emits paths relative to the repo root. Resolve
-        # against project_root, not cwd, so cwd shifts can't change
-        # which files we see. Skip directory entries (submodules
-        # appear as bare names with no extension).
+        seen.add(line)
+        if _is_loom_own_artifact(line):
+            continue
+        # git emits paths relative to the repo root with forward
+        # slashes. Resolve against project_root (not cwd) so a cwd
+        # shift can't change which files we see. Skip directory
+        # entries / submodules (bare names, no matching suffix).
         full = project_root / line
         if (
             full.is_file()
@@ -180,9 +240,18 @@ async def graphify_build_impl(path: str | Path = ".") -> GraphifyBuildResult:
     # for non-git projects (or when git itself is missing).
     files = await _git_ls_files(root)
     source = "git ls-files"
-    if files is None:
+    # Fall back to the walker when git gives us nothing usable —
+    # either not a git repo (None) OR a git repo whose source files
+    # aren't tracked yet (empty list: a fresh ``git init`` before the
+    # first commit, or source under .gitignore). The old check only
+    # caught ``None``, so an uncommitted project skipped graphify
+    # entirely even though ``collect_files`` would have found its
+    # files. ``collect_files`` may itself return empty (genuinely no
+    # supported source) — the ``if not files`` guard below handles
+    # that as the real "nothing to index" skip.
+    if not files:
         files = collect_files(root)
-        source = "graphify.collect_files (no git index)"
+        source = "graphify.collect_files (git index empty or absent)"
     if not files:
         return GraphifyBuildResult(
             graph_path=out_path,

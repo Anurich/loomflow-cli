@@ -73,6 +73,44 @@ def test_coordinator_has_memory_wired(project: Project) -> None:
     assert coordinator.memory is not None
 
 
+def test_no_auto_extract_override_band_aid_in_source() -> None:
+    """Pre-loomflow 0.10.20 we explicitly disabled auto_extract
+    everywhere as a band-aid against the per-turn LLM fact-
+    extraction latency (3-10s of invisible wait between visible
+    response and next ``loom:`` prompt). Since 0.10.20,
+    ``AutoExtractMemory`` runs extraction as a fire-and-forget
+    background task — the band-aid is unnecessary and should
+    not exist in our source.
+
+    If ``auto_extract=False`` creeps back into loom-code, fact
+    extraction silently turns off for the team — losing the
+    "remembers user preferences across sessions" feature that
+    the framework now provides for free.
+
+    This is a SOURCE-LEVEL check rather than a runtime assertion
+    because the runtime wrapping depends on the model (echo
+    defaults differently than real providers); pinning the
+    source guarantees we're not papering over the framework's
+    correct behaviour.
+    """
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    for rel in ("loom_code/agent.py", "loom_code/workers.py"):
+        text = (repo_root / rel).read_text()
+        assert "auto_extract=False" not in text, (
+            f"{rel} contains `auto_extract=False` — that band-aid "
+            "was needed pre-loomflow-0.10.20 to mask synchronous "
+            "extraction latency. Now that AutoExtractMemory is "
+            "background-by-default, the override is unnecessary "
+            "and silently disables fact extraction. Drop it."
+        )
+        assert "auto_consolidate=False" not in text, (
+            f"{rel} contains `auto_consolidate=False` — same "
+            "band-aid story as auto_extract. Drop it."
+        )
+
+
 def test_coordinator_persists_tool_transcripts(project: Project) -> None:
     # loomflow 0.10.16+ — Team.supervisor forwards
     # persist_tool_transcripts to the coordinator Agent. We pin the

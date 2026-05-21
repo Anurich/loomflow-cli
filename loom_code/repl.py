@@ -47,7 +47,9 @@ Slash commands (handled here, never sent to the agent):
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+from typing import Any
 
 from loomflow import new_id
 from prompt_toolkit import HTML, PromptSession
@@ -453,6 +455,71 @@ class Repl:
         except Exception:  # noqa: BLE001 — injection is best-effort
             pass
 
+    async def _consume_agent_stream(
+        self,
+        agent: Any,
+        prompt: str,
+        renderer: StreamRenderer,
+        pause_status: Any,
+    ) -> bool:
+        """Stream one agent run into ``renderer`` + tick the token-
+        optimisation counters. Returns False (caller should abort
+        the turn) if the stream raised; True on clean completion.
+
+        Extracted so the escalation path can re-run a SECOND agent
+        (the supervisor) through the identical consume + error-
+        handling logic without duplicating it."""
+        try:
+            async for event in agent.stream(
+                prompt,
+                user_id=_USER_ID,
+                session_id=self.session_id,
+            ):
+                renderer.handle(event)
+                # Tick the token-optimisation counters (loomflow
+                # 0.10.13+). The renderer doesn't surface
+                # architecture_events to the user — we inspect them
+                # here to drive the /cost display.
+                kind = getattr(event, "kind", None)
+                payload = getattr(event, "payload", None)
+                if (
+                    payload is not None
+                    and kind is not None
+                    and str(kind).endswith("architecture_event")
+                ):
+                    name = payload.get("name")
+                    if name == "tool_result_summarized":
+                        self.total_summaries += 1
+                    elif name == "auto_compacted":
+                        self.total_compacts += 1
+                    elif name == "messages_snipped":
+                        self.total_snips += 1
+        except KeyboardInterrupt:
+            pause_status()
+            console.print(
+                "\n[yellow]interrupted — turn abandoned[/yellow]"
+            )
+            return False
+        except BaseExceptionGroup as eg:
+            # anyio's task groups raise ``ExceptionGroup`` when any
+            # child task fails. Unwrap to surface the REAL cause(s)
+            # instead of the opaque wrapper message.
+            pause_status()
+            for inner in _flatten_exception_group(eg):
+                console.print(
+                    f"\n[bold red]error: "
+                    f"{type(inner).__name__}: {inner}[/bold red]"
+                )
+            return False
+        except Exception as exc:  # noqa: BLE001 — REPL must survive
+            pause_status()
+            console.print(
+                f"\n[bold red]error: "
+                f"{type(exc).__name__}: {exc}[/bold red]"
+            )
+            return False
+        return True
+
     async def _turn(self, prompt: str) -> None:
         """Stream one agent run for ``prompt``, reusing the
         session so conversation history carries forward.
@@ -500,58 +567,43 @@ class Repl:
         # still `doing`/`todo` after the architecture exits. We just
         # consume the agent's stream; the framework handles
         # continuation, bounded by ``max_stop_hook_iterations``.
-        try:
-            async for event in self.agent.stream(
-                prompt,
-                user_id=_USER_ID,
-                session_id=self.session_id,
-            ):
-                renderer.handle(event)
-                # Tick the token-optimisation counters (loomflow
-                # 0.10.13+). The renderer doesn't surface
-                # architecture_events to the user — we
-                # opportunistically inspect them here to drive
-                # the /cost display. ``kind`` and ``payload``
-                # come straight off the Event; the name lives
-                # under payload["name"].
-                kind = getattr(event, "kind", None)
-                payload = getattr(event, "payload", None)
-                if (
-                    payload is not None
-                    and kind is not None
-                    and str(kind).endswith("architecture_event")
-                ):
-                    name = payload.get("name")
-                    if name == "tool_result_summarized":
-                        self.total_summaries += 1
-                    elif name == "auto_compacted":
-                        self.total_compacts += 1
-                    elif name == "messages_snipped":
-                        self.total_snips += 1
-        except KeyboardInterrupt:
-            pause_status()
-            console.print(
-                "\n[yellow]interrupted — turn abandoned[/yellow]"
-            )
+        ok = await self._consume_agent_stream(
+            self.agent, prompt, renderer, pause_status
+        )
+        if not ok:
             return
-        except BaseExceptionGroup as eg:
-            # anyio's task groups raise ``ExceptionGroup`` when any
-            # child task fails. Unwrap to surface the REAL cause(s)
-            # instead of the opaque wrapper message.
+
+        # Escalation: the SIMPLE coder called ``escalate_to_team``.
+        # Re-dispatch the same prompt through the supervisor — which
+        # inherits SIMPLE's partial conversation via the shared
+        # session_id (conversation_scope="shared"), so the work
+        # SIMPLE already did becomes the team's context, not waste.
+        # The supervisor has no escalate tool, so this can't loop.
+        if renderer.escalation_requested:
+            sup = getattr(self.agent, "_complex_agent", None)
             pause_status()
-            for inner in _flatten_exception_group(eg):
-                console.print(
-                    f"\n[bold red]error: "
-                    f"{type(inner).__name__}: {inner}[/bold red]"
+            reason = renderer.escalation_reason or "(no reason given)"
+            console.print(
+                f"\n  [yellow]→ escalating to the team:[/yellow] "
+                f"{reason}"
+            )
+            if sup is not None:
+                team_renderer = StreamRenderer(
+                    set_status=set_status, pause_status=pause_status
                 )
-            return
-        except Exception as exc:  # noqa: BLE001 — REPL must survive
-            pause_status()
-            console.print(
-                f"\n[bold red]error: "
-                f"{type(exc).__name__}: {exc}[/bold red]"
-            )
-            return
+                ok = await self._consume_agent_stream(
+                    sup, prompt, team_renderer, pause_status
+                )
+                if not ok:
+                    return
+                # The team's run is now the authoritative result for
+                # cost accounting + output + the rest of the turn.
+                renderer = team_renderer
+            else:
+                console.print(
+                    "  [dim](no team agent wired — staying in "
+                    "simple mode)[/dim]"
+                )
 
         if renderer.last_plan:
             self.last_plan = renderer.last_plan
@@ -592,6 +644,30 @@ class Repl:
 
         pause_status()
         self._compact_exchanges.append((prompt, agent_output))
+
+        # Anti-poison gate: if the turn made ZERO tool calls AND the
+        # output is a bare completion claim ("all issues fixed"),
+        # the episode loomflow just persisted is a hallucination
+        # with no grounding — and a self-reinforcing one (recall
+        # surfaces it → next turn parrots it → new episode → doom
+        # loop). Delete it so it can't poison future recall. We
+        # only nuke the no-tool-call completion-claim case;
+        # legitimate no-tool answers ("what does X mean?") don't
+        # match the completion-claim pattern and are kept.
+        n_tool_calls = len(renderer._call_names)
+        if n_tool_calls == 0 and _looks_like_completion_claim(
+            agent_output
+        ):
+            deleted = _delete_last_episode(
+                self.project.root / LOOM_DIR / "memory.db",
+                session_id=self.session_id,
+                user_id=_USER_ID,
+            )
+            if deleted:
+                console.print(
+                    "  [dim](skipped persisting an unverified "
+                    "'done' claim — no tool calls backed it)[/dim]"
+                )
 
         # Persist the current session_id to disk so /resume on the
         # next REPL launch knows what to rehydrate. Done after EVERY
@@ -1337,6 +1413,76 @@ class Repl:
             "memory on your next task.[/dim]"
         )
 
+        # Surface the last N turns of the resumed session so the
+        # user has visual context of WHAT they're resuming. Without
+        # this, /resume is invisible — user has no way to confirm
+        # the rehydration actually picked up real content vs an
+        # empty session id, and no way to catch a wrong-session
+        # mistake before they type the next prompt.
+        await self._render_resumed_history_preview(prior)
+
+    async def _render_resumed_history_preview(
+        self, session_id: str
+    ) -> None:
+        """Fetch + render the last 5 turn groups from the resumed
+        session so the user sees what they're inheriting. Silently
+        no-ops when the memory backend doesn't expose
+        ``session_messages`` (some custom backends don't) or the
+        session is empty."""
+        try:
+            messages = await self.agent._memory.session_messages(
+                session_id, user_id=_USER_ID, limit=100
+            )
+        except (AttributeError, TypeError):
+            return
+        if not messages:
+            return
+        turn_groups = _group_messages_into_turns(messages)
+        if not turn_groups:
+            return
+        raw_count = len(turn_groups)
+        # Collapse consecutive identical (user, assistant) pairs
+        # into one row with a repeat count — without this, runs of
+        # "user typed the same thing twice" or "stop-hook re-fired
+        # the same prompt" produce visual noise in the preview.
+        collapsed = _collapse_consecutive_duplicate_turns(
+            turn_groups
+        )
+        recent = collapsed[-5:]
+        skipped = raw_count - sum(r[3] for r in recent)
+        console.print()
+        title = (
+            f"history (last {len(recent)} of {raw_count} "
+            "turns — agent sees the full set)"
+        )
+        rule = "─" * max(0, 64 - len(title) - 4)
+        console.print(f"  [dim]── {title} {rule}[/dim]")
+        for user_prompt, assistant_text, n_tool_calls, repeats in recent:
+            console.print()
+            u = _truncate_one_line(user_prompt, 140)
+            repeat_tag = f" [dim](×{repeats})[/dim]" if repeats > 1 else ""
+            console.print(
+                f"  [bold]user:[/bold] {u}{repeat_tag}"
+            )
+            a = _truncate_one_line(assistant_text, 200)
+            if a:
+                console.print(f"  [dim]loom:[/dim] {a}")
+            else:
+                console.print(
+                    "  [dim]loom: (no text response)[/dim]"
+                )
+            if n_tool_calls:
+                console.print(
+                    f"        [dim]({n_tool_calls} tool call"
+                    f"{'s' if n_tool_calls != 1 else ''})[/dim]"
+                )
+        console.print(f"  [dim]{'─' * 68}[/dim]")
+        if skipped > 0:
+            console.print(
+                f"  [dim]+ {skipped} earlier turn(s) recovered "
+                "(visible to the agent, not shown here)[/dim]"
+            )
+
     # ---- /loominit ------------------------------------------------------
 
     async def _handle_loominit(self) -> None:
@@ -1503,6 +1649,202 @@ class Repl:
                 f"  [dim]post-commit hook {hook_status} "
                 "— structural index refreshes every 5 commits[/dim]"
             )
+
+        # Rebuild the LoomRetriever so the next turn picks up the
+        # freshly-written LOOM.md. Without this, ``/loominit`` on a
+        # fresh repo writes the file but ``self._loom_retriever``
+        # stays at whatever ``__init__`` set it to (typically
+        # ``None`` on a first-time launch), and the agentic TOC
+        # injection never fires until the REPL is restarted. Mode
+        # is pulled from the coordinator so it stays in sync with
+        # ``build_agent(loom_retrieval=...)`` — same logic as the
+        # initial build in ``__init__``.
+        from .loominit.injection import LoomRetriever
+        mode = getattr(self.agent, "_loom_retrieval_mode", "bm25")
+        self._loom_retriever = LoomRetriever.from_repo_root(
+            self.project.root, mode=mode
+        )
+
+
+def _truncate_one_line(text: str, max_chars: int) -> str:
+    """Collapse to one line + cap length. For the /resume history
+    preview where multi-line messages would blow the layout."""
+    if not text:
+        return ""
+    first = text.replace("\r", " ").strip()
+    # Collapse all whitespace runs to a single space so multi-line
+    # responses fit on one line cleanly.
+    first = " ".join(first.split())
+    if len(first) <= max_chars:
+        return first
+    return first[: max_chars - 1].rstrip() + "…"
+
+
+def _collapse_consecutive_duplicate_turns(
+    groups: list[tuple[str, str, int]],
+) -> list[tuple[str, str, int, int]]:
+    """Collapse runs of consecutive identical
+    ``(user_prompt, assistant_text)`` turn groups into one entry
+    annotated with a repeat count.
+
+    Used by the /resume history preview to dedupe the visual when
+    the user (or a prior framework version's stop-hook re-prompt)
+    persisted the same exchange multiple times in a row. Three
+    consecutive identical groups collapse to one ``(user, asst,
+    n_tool, repeats=3)`` row; non-consecutive duplicates are kept
+    as separate rows (different points in the conversation should
+    show separately even if identical).
+
+    ``n_tool`` from the FIRST occurrence is preserved — the
+    assumption being that all collapsed copies had the same
+    tool-call shape (they had identical assistant text, so
+    almost certainly identical tools).
+    """
+    if not groups:
+        return []
+    out: list[tuple[str, str, int, int]] = []
+    cur_user, cur_asst, cur_tools = groups[0]
+    repeats = 1
+    for user, asst, tools in groups[1:]:
+        if user == cur_user and asst == cur_asst:
+            repeats += 1
+        else:
+            out.append((cur_user, cur_asst, cur_tools, repeats))
+            cur_user, cur_asst, cur_tools = user, asst, tools
+            repeats = 1
+    out.append((cur_user, cur_asst, cur_tools, repeats))
+    return out
+
+
+def _group_messages_into_turns(
+    messages: list[Any],
+) -> list[tuple[str, str, int]]:
+    """Walk a rehydrated message list and group it into the
+    natural ``(user_prompt, assistant_text, n_tool_calls)`` shape
+    used by the /resume preview.
+
+    Each USER message starts a new turn group; ASSISTANT messages
+    contribute their text content + tool_call count to the
+    currently-open group; TOOL result messages are folded into the
+    current group's tool-call count too (they're the other half of
+    a tool_call pair). SYSTEM messages are ignored — they're
+    framework context, not conversation.
+
+    Returns groups in source order (oldest first). Empty list for
+    a message stream with no USER turns.
+    """
+    groups: list[tuple[str, str, int]] = []
+    cur_user: str | None = None
+    cur_assistant: list[str] = []
+    cur_tool_calls = 0
+    for m in messages:
+        role = getattr(m, "role", None)
+        # Role enum values are lowercase strings: 'user', 'assistant',
+        # 'tool', 'system'. Some custom backends may pass plain strings.
+        role_s = str(role).lower().split(".")[-1]
+        content = str(getattr(m, "content", "") or "")
+        if role_s == "user":
+            # Close the previous group if any.
+            if cur_user is not None:
+                groups.append((
+                    cur_user,
+                    " ".join(cur_assistant).strip(),
+                    cur_tool_calls,
+                ))
+            cur_user = content
+            cur_assistant = []
+            cur_tool_calls = 0
+        elif role_s == "assistant":
+            if content:
+                cur_assistant.append(content)
+            tool_calls = getattr(m, "tool_calls", None) or ()
+            cur_tool_calls += len(tool_calls)
+        elif role_s == "tool":
+            # Tool result — counts as part of the open group's
+            # tool activity. We don't double-count vs the
+            # assistant's tool_calls list (which counted CALLS);
+            # the tool message is the RESULT of one of those.
+            # Skipping it avoids 2x-ing the displayed count.
+            pass
+        # SYSTEM messages: drop, not user-facing.
+    # Close the final group.
+    if cur_user is not None:
+        groups.append((
+            cur_user,
+            " ".join(cur_assistant).strip(),
+            cur_tool_calls,
+        ))
+    return groups
+
+
+# Phrases a hallucinated "I'm done" turn uses. Matched against the
+# agent's output when the turn made ZERO tool calls. Deliberately
+# narrow — we want completion CLAIMS, not legitimate no-tool
+# answers ("here's what X means"). Each pattern is "verb of
+# completion + object of work".
+_COMPLETION_CLAIM_RE = re.compile(
+    r"\b("
+    r"all (the )?(detected |previously )?(issues|problems|"
+    r"bugs|fixes)\b.{0,40}\b(fixed|addressed|resolved|done)"
+    r"|already been fixed"
+    r"|have been fixed"
+    r"|were fixed"
+    r"|no (remaining |outstanding )?(issues|problems|blockers)"
+    r")\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _looks_like_completion_claim(text: str) -> bool:
+    """True if ``text`` reads like "I finished the work" — used to
+    detect hallucinated completion claims on zero-tool-call turns.
+    Narrow on purpose: a normal answer that happens to say 'fixed'
+    once shouldn't trip it, but 'all the detected issues have been
+    fixed' should."""
+    if not text:
+        return False
+    return _COMPLETION_CLAIM_RE.search(text) is not None
+
+
+def _delete_last_episode(
+    db_path: Path, *, session_id: str, user_id: str
+) -> bool:
+    """Delete the most-recently-persisted episode for
+    ``(user_id, session_id)``. Used by the anti-poison gate to
+    remove a just-written no-tool-call completion claim before it
+    pollutes recall.
+
+    Direct sqlite (loom-code hardcodes the sqlite backend) because
+    the Memory protocol's ``forget`` is coarse (by user/session/
+    time, not 'the single most-recent row'). Returns True if a row
+    was deleted. Best-effort — swallows errors so a gate failure
+    never breaks the turn.
+    """
+    if not db_path.is_file():
+        return False
+    try:
+        import sqlite3
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.cursor()
+            # Find the most-recent episode id for this scope, then
+            # delete by id (episode_tool_transcripts cascades via
+            # the episode_id FK).
+            cur.execute(
+                "SELECT id FROM episodes "
+                "WHERE user_id = ? AND session_id = ? "
+                "ORDER BY occurred_at DESC LIMIT 1",
+                (user_id, session_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            cur.execute(
+                "DELETE FROM episodes WHERE id = ?", (row[0],)
+            )
+            conn.commit()
+            return (cur.rowcount or 0) > 0
+    except (sqlite3.Error, OSError):
+        return False
 
 
 def _migrate_legacy_per_route_episodes(
