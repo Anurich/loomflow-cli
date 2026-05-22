@@ -62,6 +62,7 @@ from prompt_toolkit.completion import (
 from prompt_toolkit.document import Document
 from rich.text import Text
 
+from . import worktree
 from .agent import LOOM_DIR, build_agent
 from .approval import ApprovalGate
 from .compact import Compactor, default_compact_threshold
@@ -77,7 +78,7 @@ from .paste import (
     expand_pastes,
     reset_paste_stash,
 )
-from .project import Project
+from .project import Project, detect_project
 from .render import StreamRenderer, banner, console
 from .trust import filter_trusted_hooks
 
@@ -169,6 +170,10 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/bad", "mark the last turn unhelpful"),
     ("/model", "switch to a specific model by name"),
     ("/effort", "reasoning effort: low | medium | high | off"),
+    ("/isolate", "run this session in its own git worktree"),
+    ("/review", "show the isolated session's diff vs base"),
+    ("/merge", "merge the isolated session's edits into base"),
+    ("/discard", "discard the isolated session's edits"),
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/loominit", "index this codebase → LOOM.md + knowledge graph"),
@@ -230,6 +235,12 @@ class Repl:
         # provider default. Set via /effort; threaded into build_agent
         # → every work agent. Inert on non-reasoning models.
         self._effort: str | None = None
+        # Session worktree isolation (/isolate). When set, this session
+        # edits in its own git worktree on ``_worktree.branch`` and the
+        # agent is rebuilt rooted there (_isolated_project); /merge or
+        # /discard restores the main tree.
+        self._worktree: worktree.WorktreeInfo | None = None
+        self._isolated_project: Project | None = None
         # User + project extensions (the ``.loom`` folder). Discovered
         # once here so the SAME bundle drives both build_agent (skills,
         # subagents, tool hooks) and the REPL-lifecycle hooks fired
@@ -1044,6 +1055,14 @@ class Repl:
             self._handle_set_continue_cap(arg)
         elif cmd == "/effort":
             self._handle_effort(arg)
+        elif cmd == "/isolate":
+            self._handle_isolate()
+        elif cmd == "/review":
+            self._handle_review()
+        elif cmd == "/merge":
+            self._handle_merge()
+        elif cmd == "/discard":
+            self._handle_discard()
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -1110,6 +1129,109 @@ class Repl:
             "— fresh conversation[/dim]"
         )
 
+    # ---- session worktree isolation -----------------------------------
+
+    def _handle_isolate(self) -> None:
+        """``/isolate`` — run this session in its own git worktree so
+        its edits can't collide with another loom-code session on the
+        same repo (e.g. a second terminal). Rebuilds the agent rooted
+        in the worktree; /merge or /discard finishes."""
+        if self._worktree is not None:
+            console.print(
+                f"  [dim]already isolated on "
+                f"{self._worktree.branch}[/dim]"
+            )
+            return
+        if not worktree.is_git_repo(self.project.root):
+            console.print("  [yellow]/isolate needs a git repo[/yellow]")
+            return
+        info, err = worktree.create(self.project.root, self.session_id)
+        if info is None:
+            console.print(f"  [red]isolate failed:[/red] {err}")
+            return
+        self._worktree = info
+        self._isolated_project = detect_project(info.path)
+        self._rebuild_agent()
+        console.print(
+            f"  [dim]isolated → worktree on [cyan]{info.branch}[/cyan] "
+            f"(base {info.base}). Edits stay here until "
+            "/merge or /discard.[/dim]"
+        )
+
+    def _handle_review(self) -> None:
+        """``/review`` — show this isolated session's diff vs its base
+        branch (read-only)."""
+        if self._worktree is None:
+            console.print("  [dim]not isolated — /isolate first[/dim]")
+            return
+        text, err = worktree.diff(self._worktree)
+        if err:
+            console.print(f"  [red]diff failed:[/red] {err}")
+            return
+        if not text.strip():
+            console.print("  [dim]no changes in this session yet[/dim]")
+            return
+        self._print_diff(text)
+
+    def _handle_merge(self) -> None:
+        """``/merge`` — review the session's diff, then commit + merge
+        its branch into base and return to the main tree."""
+        if self._worktree is None:
+            console.print("  [dim]not isolated — nothing to merge[/dim]")
+            return
+        text, _ = worktree.diff(self._worktree)
+        if text.strip():
+            self._print_diff(text)
+        else:
+            console.print("  [dim](no changes to merge)[/dim]")
+        info = self._worktree
+        ok, err = worktree.merge(self.project.root, info)
+        if not ok:
+            console.print(f"  [red]merge failed:[/red] {err}")
+            return
+        worktree.remove(self.project.root, info)
+        self._worktree = None
+        self._isolated_project = None
+        self._rebuild_agent()
+        console.print(
+            f"  [dim]merged [cyan]{info.branch}[/cyan] → {info.base} "
+            "+ cleaned up — back on the main tree[/dim]"
+        )
+
+    def _handle_discard(self) -> None:
+        """``/discard`` — drop this isolated session's edits + remove
+        the worktree, returning to the main tree."""
+        if self._worktree is None:
+            console.print("  [dim]not isolated — nothing to discard[/dim]")
+            return
+        info = self._worktree
+        worktree.remove(self.project.root, info)
+        self._worktree = None
+        self._isolated_project = None
+        self._rebuild_agent()
+        console.print(
+            f"  [dim]discarded [cyan]{info.branch}[/cyan] — back on "
+            "the main tree[/dim]"
+        )
+
+    def _print_diff(self, text: str) -> None:
+        """Print a unified diff with green/red/hunk colours — same
+        vocabulary as the desktop's review modal + edit cards."""
+        for raw in text.splitlines():
+            if raw.startswith(("+++", "---")):
+                style = "dim"
+            elif raw.startswith("@@"):
+                style = "cyan"
+            elif raw.startswith("diff --git") or raw.startswith("index "):
+                style = "bold dim"
+            elif raw.startswith("+"):
+                style = "green"
+            elif raw.startswith("-"):
+                style = "red"
+            else:
+                style = "default"
+            console.print(Text(raw or " ", style=style))
+
     def _rebuild_agent(self) -> None:
         """Reconstruct the supervisor + workers using the current
         ``self.model`` and ``self._web_backend``. Used by
@@ -1117,8 +1239,14 @@ class Repl:
         Bundled skills (graphify et al.) are auto-registered
         inside ``build_agent`` so we don't pass them explicitly
         here."""
+        # When isolated, build rooted at the worktree (its own working
+        # copy + .loom). Extensions stay ``self._extensions`` — they're
+        # the MAIN project's .loom config, which the worktree (being
+        # gitignored) doesn't have a copy of, so an isolated session
+        # would otherwise lose its skills/subagents/hooks.
+        build_project = self._isolated_project or self.project
         self.agent, self.workspace = build_agent(
-            self.project,
+            build_project,
             model=self.model,
             approval_handler=self._gate.handler,
             web_backend=self._web_backend,
