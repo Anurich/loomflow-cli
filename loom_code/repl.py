@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,9 @@ from .credentials import (
     ensure_key_for_model,
     save_credential,
 )
+from .extensions import Extensions, HookSpec
+from .extensions import discover as discover_extensions
+from .hooks import run_repl_hooks
 from .paste import (
     build_paste_keybindings,
     expand_pastes,
@@ -75,6 +79,7 @@ from .paste import (
 )
 from .project import Project
 from .render import StreamRenderer, banner, console
+from .trust import filter_trusted_hooks
 
 # Provider defaults for /set_model — picking a provider switches
 # to that provider's commonly-used model.
@@ -207,10 +212,28 @@ class Repl:
     def __init__(self, project: Project, model: str) -> None:
         self.project = project
         self.model = model
+        # Per-turn spinner controls. The ApprovalGate must pause the
+        # spinner while it prompts (its Live refresh otherwise mangles
+        # the keystroke). ``_turn`` points these at the live closures;
+        # the gate calls them through the stable wrapper methods.
+        self._active_pause_spinner: Any = None
+        self._active_resume_spinner: Any = None
         # ApprovalGate persists across turns so 'allow all' sticks
         # for the whole session.
-        self._gate = ApprovalGate()
+        self._gate = ApprovalGate(
+            pause_spinner=self._pause_active_spinner,
+            resume_spinner=self._resume_active_spinner,
+        )
         self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
+        # User + project extensions (the ``.loom`` folder). Discovered
+        # once here so the SAME bundle drives both build_agent (skills,
+        # subagents, tool hooks) and the REPL-lifecycle hooks fired
+        # below (SessionStart / UserPromptSubmit / SessionEnd). The
+        # REPL owns discovery because it also runs the trust prompt for
+        # project hooks (see _consume_trusted_extensions).
+        self._extensions = self._consume_trusted_extensions(
+            discover_extensions(project.root)
+        )
         # Graphify and other bundled skills are auto-registered
         # by build_agent (see _bundled_skill_paths). No per-session
         # toggle needed — the agent decides when to load skills.
@@ -219,6 +242,7 @@ class Repl:
             model=model,
             approval_handler=self._gate.handler,
             max_stop_hook_iterations=self._auto_continue_limit,
+            extensions=self._extensions,
         )
         # LOOM.md retrieval. ``LoomRetriever.from_repo_root`` returns
         # ``None`` when LOOM.md is missing or empty — we treat that as
@@ -367,7 +391,18 @@ class Repl:
                 "the last session for this project (rehydrates "
                 "prior turns)[/dim]"
             )
+        self._print_extensions_banner()
         console.print()
+
+        # SessionStart hooks fire once, after the banner and before the
+        # first prompt — for side effects (env setup, logging). Their
+        # added context is surfaced as a dim note rather than injected,
+        # since there's no user turn to attach it to yet.
+        start_result = await self._fire_repl_hooks("SessionStart")
+        if start_result.added_context:
+            console.print(
+                f"  [dim]{start_result.added_context}[/dim]"
+            )
 
         while True:
             # Persistent session status — printed before every prompt
@@ -380,6 +415,7 @@ class Repl:
             except (EOFError, KeyboardInterrupt):
                 # Leaving satisfied — credit any pending turn.
                 await self._attribute_pending(success=True, quiet=True)
+                await self._fire_repl_hooks("SessionEnd")
                 console.print("\n[dim]bye[/dim]")
                 return 0
 
@@ -400,9 +436,26 @@ class Repl:
                     await self._attribute_pending(
                         success=True, quiet=True
                     )
+                    await self._fire_repl_hooks("SessionEnd")
                     console.print("[dim]bye[/dim]")
                     return 0
                 continue
+
+            # UserPromptSubmit hooks see the prompt before the agent
+            # does. A hook may BLOCK the turn (exit 2) — e.g. a policy
+            # gate — or return additionalContext we fold into the
+            # prompt (e.g. inject the current ticket / branch).
+            submit = await self._fire_repl_hooks(
+                "UserPromptSubmit", prompt=line
+            )
+            if submit.blocked:
+                console.print(
+                    f"  [red]⊘ blocked by hook[/red]: "
+                    f"{submit.reason or '(no reason given)'}"
+                )
+                continue
+            if submit.added_context:
+                line = f"{line}\n\n[context from hook]\n{submit.added_context}"
 
             # A new task with no prior complaint → the previous
             # turn must have been fine. Credit it, then run.
@@ -520,6 +573,105 @@ class Repl:
             return False
         return True
 
+    # ---- .loom extensions: trust gate + REPL-lifecycle hooks --------
+
+    def _consume_trusted_extensions(
+        self, extensions: Extensions
+    ) -> Extensions:
+        """Apply the project-hook trust gate to a discovered bundle.
+
+        User hooks, skills, and subagents pass through untouched;
+        project hooks survive only if already trusted or approved at
+        the prompt below. Called once from ``__init__``."""
+        return filter_trusted_hooks(
+            extensions,
+            project_root=self.project.root,
+            prompt=self._prompt_trust_project_hooks,
+        )
+
+    def _prompt_trust_project_hooks(self, specs: list[HookSpec]) -> bool:
+        """Show a project's hook commands and ask whether to trust them.
+
+        Safe default is NO: a non-tty session never auto-trusts, and at
+        the prompt only an explicit ``y`` approves — we don't run a
+        cloned repo's shell commands without consent."""
+        from .approval import _read_single_key
+
+        console.print()
+        console.print(
+            "  [bold yellow]⚠ this project defines hooks[/bold yellow] "
+            "(.loom/settings.toml) that run shell commands "
+            "automatically:"
+        )
+        for s in specs:
+            tag = f" [{s.matcher}]" if s.matcher not in ("", "*") else ""
+            console.print(
+                f"    [cyan]{s.event}[/cyan]{tag}  →  "
+                f"[dim]{s.command}[/dim]"
+            )
+        if not sys.stdin.isatty():
+            console.print(
+                "  [dim](non-interactive — skipping project hooks)[/dim]"
+            )
+            return False
+        console.print(
+            "  [bold]trust and run these hooks?[/bold] "
+            "[dim](press y to trust, any other key to skip)[/dim] ",
+            end="",
+        )
+        trusted = _read_single_key() in ("y", "Y")
+        console.print(
+            "[green]trusted[/green]" if trusted else "[dim]skipped[/dim]"
+        )
+        return trusted
+
+    def _print_extensions_banner(self) -> None:
+        """Show what got picked up from ``.loom`` so the user can
+        confirm their skills / subagents / hooks loaded (and which
+        project hooks the trust gate let through)."""
+        ext = self._extensions
+        bits: list[str] = []
+        if ext.skill_paths:
+            bits.append(f"{len(ext.skill_paths)} skill(s)")
+        if ext.agent_specs:
+            names = ", ".join(s.name for s in ext.agent_specs)
+            bits.append(f"{len(ext.agent_specs)} subagent(s) ({names})")
+        if ext.hook_specs:
+            bits.append(f"{len(ext.hook_specs)} hook(s)")
+        if bits:
+            console.print(
+                f"  [dim]▸ .loom extensions: {' · '.join(bits)}[/dim]"
+            )
+
+    async def _fire_repl_hooks(
+        self, event: str, *, prompt: str | None = None
+    ) -> Any:
+        """Run every REPL-lifecycle hook registered for ``event``.
+
+        Returns the ``ReplHookResult`` so ``UserPromptSubmit`` can act
+        on a block / injected context; ``SessionStart`` / ``SessionEnd``
+        callers ignore it (those hooks run for their side effects)."""
+        return await run_repl_hooks(
+            self._extensions.hook_specs,
+            event,
+            cwd=self.project.root,
+            prompt=prompt,
+        )
+
+    def _pause_active_spinner(self) -> None:
+        """Stable hook the ApprovalGate calls to stop the current
+        turn's spinner before prompting. No-op between turns."""
+        cb = self._active_pause_spinner
+        if cb is not None:
+            cb()
+
+    def _resume_active_spinner(self) -> None:
+        """Stable hook the ApprovalGate calls after the prompt to
+        bring the spinner back."""
+        cb = self._active_resume_spinner
+        if cb is not None:
+            cb()
+
     async def _turn(self, prompt: str) -> None:
         """Stream one agent run for ``prompt``, reusing the
         session so conversation history carries forward.
@@ -556,6 +708,12 @@ class Repl:
             if status_running:
                 status.stop()
                 status_running = False
+
+        # Point the ApprovalGate's spinner hooks at THIS turn's
+        # closures. Resume re-labels to a neutral "thinking..." since
+        # the gate has no event to name.
+        self._active_pause_spinner = pause_status
+        self._active_resume_spinner = lambda: set_status("thinking...")
 
         renderer = StreamRenderer(
             set_status=set_status, pause_status=pause_status

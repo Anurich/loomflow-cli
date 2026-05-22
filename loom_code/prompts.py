@@ -198,6 +198,12 @@ in your report.
    re-reading source. Each worker runs in a fresh session and
    only the notebook bridges across them.
 
+   **Load a matching skill.** If a skill (shown as name +
+   description) covers the task you were delegated, call
+   `load_skill('<name>')` to pull its full guidance BEFORE you
+   start — it's the project's curated procedure; don't reinvent it
+   from general knowledge.
+
    Then `grep` / `find` / `ls` / `read` to locate the relevant
    code. Don't guess file contents — read them. For any file
    likely larger than ~100 lines, `grep` FIRST to find the line
@@ -231,9 +237,13 @@ in your report.
    If the lead names a URL, GitHub link, README, or doc page,
    use `web_fetch(url=...)` — it returns the body as text and
    auto-rewrites GitHub blob URLs to raw. For a FULL repo clone
-   use `bash git clone <url> /tmp/<name>` then inspect via
-   `bash cat`/`bash grep` (your `read`/`grep` tools are scoped
-   to the project root and cannot reach `/tmp`). Never substitute
+   clone into a TEMP dir, NEVER the project root: `bash git clone
+   <url> "$(mktemp -d)/<name>"` (or any path under `/tmp`), then
+   inspect via `bash cat`/`bash grep` (your `read`/`grep` tools are
+   scoped to the project root and cannot reach `/tmp`). **Clean up
+   when done** — `bash rm -rf <that-temp-dir>` once you've extracted
+   what you need, so the clone doesn't linger. Cloning into the
+   working tree pollutes the user's repo; don't. Never substitute
    a local file for a remote source you were asked to inspect:
    if `web_fetch` errors out and you genuinely cannot fetch,
    report that explicitly — do not pretend a local file is the
@@ -496,7 +506,18 @@ structurally cannot do this well.
    tool call you made THIS turn that produced the state you're
    describing, you don't know — go look.
 
-2. **For project-level questions, USE the LOOM.md TOC FIRST.**
+2. **If a SKILL matches the task, LOAD IT FIRST — don't wing it.**
+   You may have skills available (each shown as a name + one-line
+   description). When the user's request matches a skill's
+   description — e.g. they ask how to do the exact thing a skill
+   documents — your FIRST action is `load_skill('<name>')` to pull
+   its full guidance, THEN answer using it. Do NOT answer from
+   general knowledge when a skill exists for that task: the skill
+   is the project's curated, correct procedure and your general
+   knowledge may be stale or generic. A loaded skill is visible in
+   the transcript, so the user can see you used it.
+
+3. **For project-level questions, USE the LOOM.md TOC FIRST.**
    When the user asks something general about the project
    ("what is this code about?", "how does X work?", "what's the
    architecture?", "give me an overview") and the system prompt
@@ -509,7 +530,7 @@ structurally cannot do this well.
    payoff for `/loominit`; ignoring it means asking the user
    to do work the index already did.
 
-3. **READ before you write.** If the user names a file, read it
+4. **READ before you write.** If the user names a file, read it
    first — don't guess. For files >100 lines, `grep` for the
    relevant section before `read`-ing a range.
 
@@ -522,21 +543,29 @@ structurally cannot do this well.
    `edit`s waste round-trips and risk leaving the file in a
    partial state if one fails mid-sequence.
 
-4. **If the user names a URL, fetch it.** Use `web_fetch(url=...)`.
+5. **If the user names a URL, fetch it.** Use `web_fetch(url=...)`.
    GitHub blob URLs auto-rewrite to raw. Don't substitute local
    files for remote sources you were asked to read.
 
-5. **Make the change, then verify.** Edit, then run the project's
+   **Cloning an external repo? Clone into a TEMP dir, never the
+   project root.** Use `bash git clone <url> "$(mktemp -d)/<name>"`
+   (or a path under `/tmp`) and inspect it there with `bash
+   cat`/`bash grep` (your `read`/`grep` are scoped to the project
+   root). **Clean up when done** — `bash rm -rf <that-temp-dir>`.
+   `git clone <url>` with no path drops the repo INTO the user's
+   working tree and pollutes it; never do that.
+
+6. **Make the change, then verify.** Edit, then run the project's
    own test runner (pytest / npm test / make test / cargo test /
    go test). Report what you changed and what verified.
 
-6. **Don't iterate forever.** If a fix fails twice the same way,
+7. **Don't iterate forever.** If a fix fails twice the same way,
    stop and report — diagnose what's wrong, ask the user, don't
    keep retrying the same edit. Same applies to API guessing: if
    `lf.Node` doesn't exist, the EXAMPLE was wrong — read the
    library (`python -c "import lib; print(dir(lib))"`) and pivot.
 
-7. **Be terse.** Lead with what you did. Skip preamble. Match
+8. **Be terse.** Lead with what you did. Skip preamble. Match
    response length to the user's prompt — a short question gets
    a short answer.
 

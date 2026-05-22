@@ -24,9 +24,17 @@ from loomflow.architecture.router import RouterRoute
 from loomflow.team import Team
 from loomflow.workspace import LocalDiskWorkspace
 
+from .extensions import Extensions, safe_role_name
+from .hooks import attach_tool_hooks
 from .project import Project
 from .prompts import build_coordinator_instructions
-from .workers import build_simple_coder, build_workers
+from .trust import discover_trusted
+from .workers import (
+    BUILTIN_WORKER_NAMES,
+    build_custom_worker,
+    build_simple_coder,
+    build_workers,
+)
 
 
 # Bundled skills shipped with loom-code. Each entry is a directory
@@ -56,6 +64,43 @@ LOOM_DIR = ".loom"
 DEFAULT_MODEL = "gpt-4.1-mini"
 
 
+# Classifier prompt used ONLY when the project defines custom
+# subagents (.loom/agents/*.md), which we expose as extra routes. The
+# stock classifier just matches descriptions, and our SIMPLE route's
+# description is deliberately aggressive ("single-file question →
+# SIMPLE, when unsure prefer SIMPLE") — so an "audit this file" request
+# lands on SIMPLE before a domain specialist (e.g. discord-auditor)
+# ever gets considered. This variant establishes PRECEDENCE: check
+# specialists first, fall back to simple/complex only when none match.
+# Must keep the ``{route_descriptions}`` placeholder + the exact
+# two-line output contract the Router parser expects.
+_SPECIALIST_CLASSIFIER_PROMPT = """\
+You are a routing classifier. Given the user's request, decide which
+specialist handles it best.
+
+Available routes:
+{route_descriptions}
+
+How to choose, IN THIS ORDER:
+1. SPECIALIST FIRST. Any route whose name is NOT "simple" or
+   "complex" is a domain specialist (e.g. an auditor for
+   "audit / review / check X for Y" requests). If the user's request
+   clearly falls in one specialist's domain, pick THAT specialist —
+   even if the task touches only one file. Specialists outrank the
+   generic simple/complex routes when they match.
+2. Otherwise: "simple" for one focused change / question / lookup,
+   "complex" for work that needs parallel effort across multiple
+   files or concerns.
+
+Output exactly two lines, in this order:
+route: <one of the route names above>
+confidence: <number between 0 and 1>
+
+Then optionally one line of brief reasoning. The first two lines
+must match the format exactly so they can be parsed.
+"""
+
+
 def build_agent(
     project: Project,
     *,
@@ -68,6 +113,7 @@ def build_agent(
     auto_compact: bool = True,
     tool_result_summarizer: str | None = None,
     loom_retrieval: str = "agentic",
+    extensions: Extensions | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -183,13 +229,85 @@ def build_agent(
     # wherever execution lands.
     bundled_skills = _bundled_skill_paths()
 
+    # User + project extensions (the ``.loom`` folder — skills,
+    # subagents, hooks). The caller (REPL) discovers + trust-filters
+    # interactively and passes the bundle in. When NOT supplied — the
+    # desktop sidecar, scripts, tests — we self-discover but apply the
+    # trust gate with a DENY-BY-DEFAULT prompt: untrusted project
+    # hooks are dropped rather than auto-run. Without this, any direct
+    # build_agent caller would silently execute a cloned repo's
+    # PreToolUse/PostToolUse shell commands. Skills + subagents are not
+    # gated (they only run when the model invokes them, behind the
+    # approval gate). ``skill_paths`` are appended AFTER the bundled
+    # list so last-source-wins gives project > user > bundled.
+    if extensions is None:
+        extensions = discover_trusted(project.root)
+    all_skills = bundled_skills + extensions.skill_paths
+
+    # Auto-compact threshold — 80% of the model's context window.
+    # Computed BEFORE the workers are built so it lands on EVERY
+    # worker too (not just the coordinator). Without per-worker
+    # compaction a long delegation (many tool calls / large outputs)
+    # grows past the model's window and 400s with
+    # context_length_exceeded — the coordinator stayed safe but
+    # workers, which do the bulk of the tool work, did not.
+    # ``context_window_for`` substring-matches known model families;
+    # unknown models fall back to a conservative cap. ``None`` (when
+    # auto_compact=False) disables compaction everywhere.
+    auto_compact_at_tokens: int | None = None
+    if auto_compact:
+        from loomflow.agent.auto_compact import context_window_for
+        window = context_window_for(model)
+        auto_compact_at_tokens = int(window * 0.8)
+
     workers = build_workers(
         project,
         model=model,
         approval_handler=approval_handler,
         web_backend=web_backend,
-        skills=bundled_skills,
+        skills=all_skills,
+        auto_compact_at_tokens=auto_compact_at_tokens,
+        snip_window=snip_window,
     )
+
+    # Merge user/project subagents into the delegate roster AND expose
+    # each as a top-level router route. Two reachability paths:
+    #   * as a supervisor WORKER — the COMPLEX team can delegate to it
+    #     (their instructions lead with the frontmatter description, see
+    #     build_custom_worker).
+    #   * as a router ROUTE — the classifier can dispatch a matching
+    #     task DIRECTLY to it (visible as "routed to <role>"), so e.g.
+    #     "audit X for rate limits" reaches a discord-auditor without
+    #     having to land on COMPLEX first.
+    # A custom agent whose name collides with a builtin role is skipped:
+    # we never let a dropped-in spec shadow the known roster, above all
+    # ``coder`` (the sole writer).
+    custom_subagent_routes: list[RouterRoute] = []
+    for spec in extensions.agent_specs:
+        # loomflow worker/route names must be Python identifiers;
+        # Claude-Code-style names use hyphens, so normalise
+        # (security-auditor -> security_auditor).
+        role = safe_role_name(spec.name)
+        if role in BUILTIN_WORKER_NAMES or role in workers:
+            continue
+        worker = build_custom_worker(
+            project,
+            spec,
+            model=model,
+            approval_handler=approval_handler,
+            skills=all_skills,
+            auto_compact_at_tokens=auto_compact_at_tokens,
+            snip_window=snip_window,
+        )
+        workers[role] = worker
+        # Same Agent instance as both worker and route — the route's
+        # ``description`` (the frontmatter description) is what the
+        # router classifier matches on.
+        custom_subagent_routes.append(
+            RouterRoute(
+                name=role, agent=worker, description=spec.description
+            )
+        )
 
     # ``max_stop_hook_iterations`` bounds the framework Ralph loop.
     # ``living_plan=True`` auto-registers a StopHook that returns a
@@ -220,18 +338,6 @@ def build_agent(
     # the first runaway diagnosis) → 0 (after observing the
     # malformed plan_write reset → loop pattern even at 2).
     #
-    # Auto-compact threshold — 80% of the model's context window.
-    # The framework helper ``context_window_for`` does substring
-    # lookup against known model families; unknown models fall
-    # back to the conservative 8k cap (which would fire compaction
-    # aggressively — user can override by passing
-    # ``auto_compact=False`` at construction).
-    auto_compact_at_tokens: int | None = None
-    if auto_compact:
-        from loomflow.agent.auto_compact import context_window_for
-        window = context_window_for(model)
-        auto_compact_at_tokens = int(window * 0.8)
-
     # All token-optimisation knobs forward cleanly through
     # ``Team.supervisor`` (tool_result_summarizer since 0.10.13;
     # snip_window + auto_compact_* since 0.10.14;
@@ -275,7 +381,7 @@ def build_agent(
         workspace=workspace,
         living_plan=True,
         tools=coordinator_extra_tools or None,
-        skills=bundled_skills,
+        skills=all_skills,
         max_turns=max_turns,
         max_stop_hook_iterations=max_stop_hook_iterations,
         prompt_caching=True,
@@ -308,9 +414,22 @@ def build_agent(
         approval_handler=approval_handler,
         memory_url=memory_url,
         web_backend=web_backend,
-        skills=bundled_skills,
+        skills=all_skills,
         extra_tools=simple_coder_extra_tools or None,
+        auto_compact_at_tokens=auto_compact_at_tokens,
+        snip_window=snip_window,
     )
+
+    # PreToolUse/PostToolUse hooks attach to the agents that actually
+    # execute tools against the codebase — every worker (whichever the
+    # supervisor delegates to) and the simple coder. NOT the
+    # coordinator: it only calls delegate/send_message, so a tool hook
+    # there would fire on orchestration, not real work. No-op (and the
+    # fast-hooks path stays intact) when no tool hooks were declared.
+    for tool_agent in (*workers.values(), simple_coder):
+        attach_tool_hooks(
+            tool_agent, extensions.hook_specs, cwd=project.root
+        )
 
     # ROUTER — the actual entrypoint loom-code returns. One
     # LLM classification per user message picks SIMPLE or
@@ -376,6 +495,10 @@ def build_agent(
                     "when there's real parallelism to exploit."
                 ),
             ),
+            # User/project subagents (.loom/agents/*.md) as direct
+            # routes — the classifier picks them by frontmatter
+            # description. Empty unless the project defines subagents.
+            *custom_subagent_routes,
         ],
         model=model,
         memory=memory_url,
@@ -402,6 +525,16 @@ def build_agent(
         # turns) — empirically harmless since the model treats
         # them as context, not actionable history.
         conversation_scope="shared",
+        # When the project defines custom subagents (extra routes),
+        # swap in the specialist-precedence classifier so an
+        # "audit X" request reaches the auditor instead of being
+        # swallowed by SIMPLE's aggressive single-file description.
+        # No custom subagents → None → stock simple-vs-complex prompt.
+        classifier_prompt=(
+            _SPECIALIST_CLASSIFIER_PROMPT
+            if custom_subagent_routes
+            else None
+        ),
         # Single classification call per user message; the routed
         # agent then runs to completion. The router's StopHook
         # behavior is moot since classification doesn't have a

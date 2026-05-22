@@ -59,6 +59,7 @@ from loomflow.tools import (
 from .edit_tool import multi_edit_tool
 from .edit_tool import verifying_edit_tool as edit_tool
 from .escalate import escalate_to_team_tool
+from .extensions import AgentSpec
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .project import Project
 from .prompts import build_coder_prompt, build_simple_coder_prompt
@@ -225,6 +226,8 @@ def _build_coder(
     approval_handler: Callable[..., Awaitable[bool]] | None,
     has_web: bool = False,
     skills: list[Any] | None = None,
+    auto_compact_at_tokens: int | None = None,
+    snip_window: int = 0,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
@@ -260,6 +263,17 @@ def _build_coder(
         approval_handler=approval_handler,
         prompt_caching=True,
         max_turns=_CODER_MAX_TURNS,
+        # Bounded-window trim of the rehydrated history before each
+        # run — THE active context bound. Without it a worker
+        # rehydrating a heavily-used session's accumulated tool
+        # transcripts (many ≤50KB entries) overflows the model window
+        # and 400s (context_length_exceeded). The coordinator has it;
+        # workers must too. (``auto_compact_at_tokens`` below only
+        # fires between Ralph stop-hook iterations, which loom-code
+        # disables via max_stop_hook_iterations=0 — so snip is what
+        # actually protects a single run.)
+        snip_window=snip_window,
+        auto_compact_at_tokens=auto_compact_at_tokens,
         # Persistent tool-transcripts (loomflow 0.10.15+) — without
         # this the coder forgets every file read / edit / bash
         # output between delegations, even though its session_id
@@ -278,6 +292,8 @@ def _build_explorer(
     model: str,
     has_web: bool = False,
     skills: list[Any] | None = None,
+    auto_compact_at_tokens: int | None = None,
+    snip_window: int = 0,
 ) -> Agent:
     """Read-only investigator — no permissions needed (none of its
     tools are destructive). ``has_web`` toggles the `web_search`
@@ -290,6 +306,8 @@ def _build_explorer(
         skills=skills,
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
+        snip_window=snip_window,
+        auto_compact_at_tokens=auto_compact_at_tokens,
         # See ``_build_coder`` for the rationale. Explorer benefits
         # too: a question like "how does X work, then check Y" no
         # longer re-greps + re-reads X's files when Y comes in as
@@ -303,6 +321,8 @@ def _build_auditor(
     *,
     model: str,
     skills: list[Any] | None = None,
+    auto_compact_at_tokens: int | None = None,
+    snip_window: int = 0,
 ) -> Agent:
     """Read-only defect hunter — same tool scope as the explorer,
     different objective."""
@@ -314,6 +334,8 @@ def _build_auditor(
         skills=skills,
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
+        snip_window=snip_window,
+        auto_compact_at_tokens=auto_compact_at_tokens,
         # Same rationale as explorer — auditor accumulates context
         # about the focus area across rounds when its findings get
         # iterated on.
@@ -327,6 +349,8 @@ def _build_reviewer(
     model: str,
     approval_handler: Callable[..., Awaitable[bool]] | None,
     skills: list[Any] | None = None,
+    auto_compact_at_tokens: int | None = None,
+    snip_window: int = 0,
 ) -> Agent:
     """Independent verifier — read-only inspection plus `bash` to
     run the project's real test suite. `bash` is gated through the
@@ -343,6 +367,8 @@ def _build_reviewer(
         approval_handler=approval_handler,
         prompt_caching=True,
         max_turns=_REVIEWER_MAX_TURNS,
+        snip_window=snip_window,
+        auto_compact_at_tokens=auto_compact_at_tokens,
         # Reviewer benefits too: re-review cycles ("you flagged X,
         # the coder fixed it, recheck") no longer re-read every
         # changed file from scratch.
@@ -359,6 +385,8 @@ def build_simple_coder(
     web_backend: str | None = None,
     skills: list[Any] | None = None,
     extra_tools: list[Any] | None = None,
+    auto_compact_at_tokens: int | None = None,
+    snip_window: int = 0,
 ) -> Agent:
     """Build the SIMPLE-mode loom-code agent — single coder, no team.
 
@@ -421,6 +449,8 @@ def build_simple_coder(
         approval_handler=approval_handler,
         prompt_caching=True,
         max_turns=_CODER_MAX_TURNS,
+        snip_window=snip_window,
+        auto_compact_at_tokens=auto_compact_at_tokens,
         persist_tool_transcripts=True,
     )
 
@@ -432,6 +462,8 @@ def build_workers(
     approval_handler: Callable[..., Awaitable[bool]] | None = None,
     web_backend: str | None = None,
     skills: list[Any] | None = None,
+    auto_compact_at_tokens: int | None = None,
+    snip_window: int = 0,
 ) -> dict[str, Agent]:
     """Build the worker roster for ``Team.supervisor``.
 
@@ -461,16 +493,31 @@ def build_workers(
             approval_handler=approval_handler,
             has_web=has_web,
             skills=skills,
+            auto_compact_at_tokens=auto_compact_at_tokens,
+            snip_window=snip_window,
         ),
         "explorer": _build_explorer(
-            project, model=model, has_web=has_web, skills=skills
+            project,
+            model=model,
+            has_web=has_web,
+            skills=skills,
+            auto_compact_at_tokens=auto_compact_at_tokens,
+            snip_window=snip_window,
         ),
-        "auditor": _build_auditor(project, model=model, skills=skills),
+        "auditor": _build_auditor(
+            project,
+            model=model,
+            skills=skills,
+            auto_compact_at_tokens=auto_compact_at_tokens,
+            snip_window=snip_window,
+        ),
         "reviewer": _build_reviewer(
             project,
             model=model,
             approval_handler=approval_handler,
             skills=skills,
+            auto_compact_at_tokens=auto_compact_at_tokens,
+            snip_window=snip_window,
         ),
     }
     if has_web:
@@ -487,3 +534,106 @@ def build_workers(
         workers["coder"].add_tool(web)
         workers["explorer"].add_tool(web)
     return workers
+
+
+# Builtin worker role names — protected. A user-authored subagent that
+# names itself one of these is skipped rather than allowed to shadow
+# the known roster (especially ``coder``, the sole writer).
+BUILTIN_WORKER_NAMES = frozenset(
+    {"coder", "explorer", "auditor", "reviewer"}
+)
+
+# Tool names a custom subagent's ``tools:`` frontmatter may request,
+# mapped to the same builtin factories the builtin workers use.
+# ``web_search`` is intentionally absent — it needs backend wiring
+# (``/set_web``); custom agents get ``web_fetch`` (always available,
+# read-only, no shell/disk write) instead.
+_DESTRUCTIVE_TOOL_NAMES = frozenset(
+    {"write", "edit", "multi_edit", "bash"}
+)
+
+# When a spec declares no ``tools:``, this read-only kernel is the
+# default — we never hand a stranger's spec write/shell access
+# implicitly. Matches ``_read_only_tools``.
+_DEFAULT_CUSTOM_TOOLS = ("read", "grep", "find", "ls", "web_fetch")
+
+
+def _custom_tool_factories(root: Any) -> dict[str, Callable[[], Any]]:
+    """Map tool name → a zero-arg factory rooted at the project.
+
+    Unknown names a spec requests simply aren't in this map and are
+    skipped by :func:`build_custom_worker` — a typo'd tool name costs
+    that tool, not the whole agent."""
+    return {
+        "read": lambda: read_tool(root),
+        "write": lambda: write_tool(root),
+        "edit": lambda: edit_tool(root),
+        "multi_edit": lambda: multi_edit_tool(root),
+        "grep": lambda: grep_tool(root),
+        "find": lambda: find_tool(root),
+        "ls": lambda: ls_tool(root),
+        "bash": lambda: bash_tool(root, timeout=300.0),
+        "web_fetch": lambda: web_fetch_tool(),
+    }
+
+
+def build_custom_worker(
+    project: Project,
+    spec: AgentSpec,
+    *,
+    model: str,
+    approval_handler: Callable[..., Awaitable[bool]] | None,
+    skills: list[Any] | None = None,
+    auto_compact_at_tokens: int | None = None,
+    snip_window: int = 0,
+) -> Agent:
+    """Build a delegate-able worker Agent from a user-authored subagent
+    spec (``.loom/agents/<name>.md`` — see :mod:`loom_code.extensions`).
+
+    The worker's ``instructions`` LEAD with the frontmatter
+    ``description`` followed by the markdown body, because
+    ``Supervisor`` shows the coordinator only the first ~200 chars of
+    each worker's instructions (not a separate description field) — so
+    the description must come first for the coordinator to route to it
+    correctly.
+
+    Tools come from the spec's ``tools:`` list mapped through
+    :func:`_custom_tool_factories`; an empty list defaults to the
+    read-only kernel. Permissions + the approval handler are wired ONLY
+    when the requested tools include a destructive one
+    (write/edit/multi_edit/bash) — a read-only subagent needs no gate.
+    ``model`` falls back to the coordinator's model when the spec
+    doesn't override it.
+    """
+    root = project.root
+    factories = _custom_tool_factories(root)
+    requested = spec.tools or _DEFAULT_CUSTOM_TOOLS
+    tools: list[Any] = [
+        factories[name]() for name in requested if name in factories
+    ]
+    has_destructive = any(
+        name in _DESTRUCTIVE_TOOL_NAMES for name in requested
+    )
+
+    instructions = spec.description
+    if spec.system_prompt:
+        instructions = f"{spec.description}\n\n{spec.system_prompt}"
+
+    return Agent(
+        instructions,
+        model=spec.model or model,
+        architecture=ReAct(),
+        tools=tools,
+        skills=skills,
+        permissions=StandardPermissions() if has_destructive else None,
+        approval_handler=approval_handler if has_destructive else None,
+        prompt_caching=True,
+        # Writers get the full budget; read-only specialists answer a
+        # scoped question and exit (same split as the builtin roster).
+        max_turns=(
+            _CODER_MAX_TURNS if has_destructive else _SPECIALIST_MAX_TURNS
+        ),
+        snip_window=snip_window,
+        auto_compact_at_tokens=auto_compact_at_tokens,
+        persist_tool_transcripts=True,
+    )

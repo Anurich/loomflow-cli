@@ -14,15 +14,54 @@ human's answer.
 from __future__ import annotations
 
 import difflib
+import sys
+from collections.abc import Callable
 from typing import Any
 
 import anyio
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.text import Text
 
 from .render import console
+
+
+def _read_single_key() -> str:
+    """Read ONE keypress without waiting for Enter.
+
+    POSIX raw-mode read; falls back to ``msvcrt`` on Windows and to a
+    line read when stdin isn't a TTY (piped input, tests). Returning a
+    single character lets the approval prompt act like a button row —
+    the user reported the type-then-Enter form as a real obstacle.
+    """
+    if not sys.stdin.isatty():
+        # Non-interactive (piped/CI/tests) — degrade to a line read so
+        # the gate still resolves instead of blocking forever.
+        try:
+            return sys.stdin.readline().strip()[:1].lower()
+        except Exception:
+            return ""
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        try:
+            import msvcrt
+
+            return msvcrt.getch().decode("utf-8", "ignore")
+        except Exception:
+            try:
+                return sys.stdin.readline().strip()[:1].lower()
+            except Exception:
+                return ""
 
 
 async def auto_approve(call: Any, user_id: str | None = None) -> bool:
@@ -46,11 +85,23 @@ class ApprovalGate:
     Pass :meth:`handler` as the Agent's ``approval_handler``.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        pause_spinner: Callable[[], None] | None = None,
+        resume_spinner: Callable[[], None] | None = None,
+    ) -> None:
         # Once the user picks 'a' (allow all), every subsequent
         # destructive call this session auto-approves. Reset only
         # by restarting loom-code.
         self._allow_all = False
+        # The REPL drives a ``console.status`` spinner for the whole
+        # turn. Its Live refresh shares the cursor line, so leaving it
+        # running corrupts the approval prompt's keystrokes (mangled
+        # input → endless "select an option" re-prompt). We pause it
+        # around the prompt and resume after.
+        self._pause_spinner = pause_spinner or (lambda: None)
+        self._resume_spinner = resume_spinner or (lambda: None)
 
     async def handler(
         self, call: Any, user_id: str | None = None
@@ -63,15 +114,22 @@ class ApprovalGate:
         tool = getattr(call, "tool", "?")
         args = getattr(call, "args", {}) or {}
 
-        console.print()
-        console.print(
-            Text(f"  ⚠ {tool} wants to run:", style="bold yellow")
-        )
-        self._render_preview(tool, args)
+        # Pause the spinner BEFORE any console output — even the
+        # warning lines below get garbled if the Live is still
+        # repainting the cursor line.
+        self._pause_spinner()
+        try:
+            console.print()
+            console.print(
+                Text(f"  ⚠ {tool} wants to run:", style="bold yellow")
+            )
+            self._render_preview(tool, args)
 
-        # The prompt itself is blocking input() — push it to a
-        # worker thread so we don't stall the anyio event loop.
-        choice = await anyio.to_thread.run_sync(self._ask)
+            # Single keypress, on a worker thread so the raw-mode
+            # read doesn't stall the anyio event loop.
+            choice = await anyio.to_thread.run_sync(self._ask)
+        finally:
+            self._resume_spinner()
         if choice == "a":
             self._allow_all = True
             console.print(
@@ -90,34 +148,29 @@ class ApprovalGate:
     # ---- internals ------------------------------------------------------
 
     def _ask(self) -> str:
-        """Blocking choice prompt. Runs on a worker thread.
+        """Blocking single-keypress choice. Runs on a worker thread.
 
-        Renders a bordered "button-row" panel above the prompt line
-        so each choice is visually obvious — the prior one-line
-        ``allow? [y/n/a] (y):`` form was easy to miss and the
-        Enter-to-accept-default wasn't communicated. User reported
-        that as a real obstacle: "it must show the button or
-        something i can press because here i need to press enter
-        to make it go ahead".
+        Renders a bordered "button-row" panel, then reads ONE key —
+        no Enter required. Y / Enter = yes, N = no, A = allow all.
+        User reported the prior type-then-Enter form as a real
+        obstacle: "we can simply click on it don't have to write".
+        Single keypress is the closest a terminal gets to a button.
 
-        Three options, clearly labeled with their hotkey + the
-        Enter cue on the default ('yes'). Rich Prompt still
-        validates the typed answer, so unknown keys re-prompt
-        rather than silently misfiring.
+        Unknown keys are ignored (loop keeps waiting) rather than
+        re-prompting noisily; Ctrl-C / Esc resolve to 'no' so a
+        startled user can always back out safely.
         """
         button_row = Text.assemble(
-            ("  [", "dim"),
+            ("  ", ""),
             ("Y", "bold green"),
-            ("] yes  ", "green"),
-            ("(default — press ", "dim"),
+            (" yes  ", "green"),
+            ("(or press ", "dim"),
             ("Enter", "bold"),
             (")    ", "dim"),
-            ("[", "dim"),
             ("N", "bold red"),
-            ("] no    ", "red"),
-            ("[", "dim"),
+            (" no    ", "red"),
             ("A", "bold yellow"),
-            ("] yes to all this session", "yellow"),
+            (" yes to all this session", "yellow"),
         )
         console.print(
             Panel(
@@ -127,13 +180,24 @@ class ApprovalGate:
                 expand=False,
             )
         )
-        return Prompt.ask(
-            "  [bold]choose[/bold]",
-            choices=["y", "n", "a"],
-            default="y",
-            show_choices=False,
-            show_default=False,
-        ).strip().lower()
+        console.print(
+            "  [dim]press a key:[/dim] ", end="", highlight=False
+        )
+        while True:
+            ch = _read_single_key()
+            if ch in ("\r", "\n", "y", "Y"):
+                console.print("[green]yes[/green]")
+                return "y"
+            if ch in ("n", "N"):
+                console.print("[red]no[/red]")
+                return "n"
+            if ch in ("a", "A"):
+                console.print("[yellow]yes to all[/yellow]")
+                return "a"
+            if ch in ("\x03", "\x1b", ""):  # Ctrl-C, Esc, EOF
+                console.print("[red]no[/red]")
+                return "n"
+            # Any other key: ignore and keep waiting.
 
     def _render_preview(self, tool: str, args: dict[str, Any]) -> None:
         """Show the user exactly what's about to happen."""
