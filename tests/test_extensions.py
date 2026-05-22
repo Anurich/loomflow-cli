@@ -400,6 +400,26 @@ def test_specialist_classifier_only_with_subagents(
     )
 
 
+def test_effort_threads_to_work_agents_not_router(
+    project: Project,
+) -> None:
+    # Reasoning effort goes to the WORK agents (simple coder,
+    # supervisor, every worker) but NOT the router classifier — a
+    # one-shot routing decision shouldn't burn reasoning tokens.
+    coord, _ = build_agent(project, model="echo", effort="high")
+    assert getattr(coord, "_default_effort", "x") is None
+    routes = {r.name: r.agent for r in coord.architecture._routes}
+    assert routes["simple"]._default_effort == "high"
+    sup = routes["complex"]
+    assert sup._default_effort == "high"
+    for w in sup.architecture.declared_workers().values():
+        assert w._default_effort == "high"
+    # default: no effort dial anywhere
+    c2, _ = build_agent(project, model="echo")
+    s2 = {r.name: r.agent for r in c2.architecture._routes}["simple"]
+    assert s2._default_effort is None
+
+
 def test_prompts_nudge_loading_matching_skills() -> None:
     # The SIMPLE coder + team coder prompts must tell the model to
     # load_skill when a skill matches — otherwise weak models answer

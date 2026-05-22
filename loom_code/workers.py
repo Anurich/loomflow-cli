@@ -228,6 +228,7 @@ def _build_coder(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    effort: str | None = None,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
@@ -274,6 +275,7 @@ def _build_coder(
         # actually protects a single run.)
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        effort=effort,
         # Persistent tool-transcripts (loomflow 0.10.15+) — without
         # this the coder forgets every file read / edit / bash
         # output between delegations, even though its session_id
@@ -294,6 +296,7 @@ def _build_explorer(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    effort: str | None = None,
 ) -> Agent:
     """Read-only investigator — no permissions needed (none of its
     tools are destructive). ``has_web`` toggles the `web_search`
@@ -308,6 +311,7 @@ def _build_explorer(
         max_turns=_SPECIALIST_MAX_TURNS,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        effort=effort,
         # See ``_build_coder`` for the rationale. Explorer benefits
         # too: a question like "how does X work, then check Y" no
         # longer re-greps + re-reads X's files when Y comes in as
@@ -323,6 +327,7 @@ def _build_auditor(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    effort: str | None = None,
 ) -> Agent:
     """Read-only defect hunter — same tool scope as the explorer,
     different objective."""
@@ -336,6 +341,7 @@ def _build_auditor(
         max_turns=_SPECIALIST_MAX_TURNS,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        effort=effort,
         # Same rationale as explorer — auditor accumulates context
         # about the focus area across rounds when its findings get
         # iterated on.
@@ -351,6 +357,7 @@ def _build_reviewer(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    effort: str | None = None,
 ) -> Agent:
     """Independent verifier — read-only inspection plus `bash` to
     run the project's real test suite. `bash` is gated through the
@@ -369,6 +376,7 @@ def _build_reviewer(
         max_turns=_REVIEWER_MAX_TURNS,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        effort=effort,
         # Reviewer benefits too: re-review cycles ("you flagged X,
         # the coder fixed it, recheck") no longer re-read every
         # changed file from scratch.
@@ -387,6 +395,7 @@ def build_simple_coder(
     extra_tools: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    effort: str | None = None,
 ) -> Agent:
     """Build the SIMPLE-mode loom-code agent — single coder, no team.
 
@@ -451,6 +460,7 @@ def build_simple_coder(
         max_turns=_CODER_MAX_TURNS,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        effort=effort,
         persist_tool_transcripts=True,
     )
 
@@ -464,6 +474,7 @@ def build_workers(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    effort: str | None = None,
 ) -> dict[str, Agent]:
     """Build the worker roster for ``Team.supervisor``.
 
@@ -495,6 +506,7 @@ def build_workers(
             skills=skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            effort=effort,
         ),
         "explorer": _build_explorer(
             project,
@@ -503,6 +515,7 @@ def build_workers(
             skills=skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            effort=effort,
         ),
         "auditor": _build_auditor(
             project,
@@ -510,6 +523,7 @@ def build_workers(
             skills=skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            effort=effort,
         ),
         "reviewer": _build_reviewer(
             project,
@@ -518,6 +532,7 @@ def build_workers(
             skills=skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            effort=effort,
         ),
     }
     if has_web:
@@ -586,6 +601,7 @@ def build_custom_worker(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    effort: str | None = None,
 ) -> Agent:
     """Build a delegate-able worker Agent from a user-authored subagent
     spec (``.loom/agents/<name>.md`` — see :mod:`loom_code.extensions`).
@@ -635,5 +651,6 @@ def build_custom_worker(
         ),
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        effort=effort,
         persist_tool_transcripts=True,
     )

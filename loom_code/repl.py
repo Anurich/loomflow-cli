@@ -168,6 +168,7 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/good", "mark the last turn useful (credit notes)"),
     ("/bad", "mark the last turn unhelpful"),
     ("/model", "switch to a specific model by name"),
+    ("/effort", "reasoning effort: low | medium | high | off"),
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/loominit", "index this codebase → LOOM.md + knowledge graph"),
@@ -225,6 +226,10 @@ class Repl:
             resume_spinner=self._resume_active_spinner,
         )
         self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
+        # Reasoning effort (None | "low" | "medium" | "high"). None =
+        # provider default. Set via /effort; threaded into build_agent
+        # → every work agent. Inert on non-reasoning models.
+        self._effort: str | None = None
         # User + project extensions (the ``.loom`` folder). Discovered
         # once here so the SAME bundle drives both build_agent (skills,
         # subagents, tool hooks) and the REPL-lifecycle hooks fired
@@ -243,6 +248,7 @@ class Repl:
             approval_handler=self._gate.handler,
             max_stop_hook_iterations=self._auto_continue_limit,
             extensions=self._extensions,
+            effort=self._effort,
         )
         # LOOM.md retrieval. ``LoomRetriever.from_repo_root`` returns
         # ``None`` when LOOM.md is missing or empty — we treat that as
@@ -1036,6 +1042,8 @@ class Repl:
             await self._handle_resume()
         elif cmd == "/set_continue_cap":
             self._handle_set_continue_cap(arg)
+        elif cmd == "/effort":
+            self._handle_effort(arg)
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -1066,6 +1074,42 @@ class Repl:
             f"  [dim]switched to {model} — fresh conversation[/dim]"
         )
 
+    def _handle_effort(self, arg: str) -> None:
+        """``/effort [low|medium|high|off]`` — set the reasoning-effort
+        dial + rebuild. No arg shows the current value. ``off`` (or
+        ``none``/``default``) clears it back to the provider default.
+        Effort only affects reasoning-capable models (Claude extended
+        thinking, OpenAI o-series); it's inert on gpt-4.1/4o."""
+        choice = arg.strip().lower()
+        if not choice:
+            console.print(
+                f"  [dim]current effort: "
+                f"{self._effort or 'default'}[/dim] "
+                "[dim](usage: /effort low|medium|high|off)[/dim]"
+            )
+            return
+        if choice in ("off", "none", "default"):
+            new_effort: str | None = None
+        elif choice in ("low", "medium", "high"):
+            new_effort = choice
+        else:
+            console.print(
+                f"  [yellow]unknown effort {choice!r}[/yellow] — "
+                "use low | medium | high | off"
+            )
+            return
+        if new_effort == self._effort:
+            console.print(
+                f"  [dim]effort already {new_effort or 'default'}[/dim]"
+            )
+            return
+        self._effort = new_effort
+        self._rebuild_agent()
+        console.print(
+            f"  [dim]reasoning effort → {new_effort or 'default'} "
+            "— fresh conversation[/dim]"
+        )
+
     def _rebuild_agent(self) -> None:
         """Reconstruct the supervisor + workers using the current
         ``self.model`` and ``self._web_backend``. Used by
@@ -1079,6 +1123,8 @@ class Repl:
             approval_handler=self._gate.handler,
             web_backend=self._web_backend,
             max_stop_hook_iterations=self._auto_continue_limit,
+            extensions=self._extensions,
+            effort=self._effort,
         )
         self._compactor = Compactor(model=self.model)
         self._compact_tokens = 0

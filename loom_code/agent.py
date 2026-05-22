@@ -114,6 +114,7 @@ def build_agent(
     tool_result_summarizer: str | None = None,
     loom_retrieval: str = "agentic",
     extensions: Extensions | None = None,
+    effort: str | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code team for a given project.
 
@@ -268,6 +269,7 @@ def build_agent(
         skills=all_skills,
         auto_compact_at_tokens=auto_compact_at_tokens,
         snip_window=snip_window,
+        effort=effort,
     )
 
     # Merge user/project subagents into the delegate roster AND expose
@@ -298,6 +300,7 @@ def build_agent(
             skills=all_skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            effort=effort,
         )
         workers[role] = worker
         # Same Agent instance as both worker and route — the route's
@@ -388,6 +391,12 @@ def build_agent(
         tool_result_summarizer=tool_result_summarizer,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        # Reasoning effort (low/medium/high) — coordinator does the
+        # planning + result synthesis, so it benefits. Inert on non-
+        # reasoning models (the adapter ignores it). The router
+        # classifier deliberately does NOT get effort — classification
+        # is a cheap one-shot decision, not worth reasoning tokens.
+        effort=effort,
         # Persistent tool transcripts on the coordinator
         # (loomflow 0.10.16+ — Team.* now forwards the kwarg).
         # Workers already opt in via ``persist_tool_transcripts=True``
@@ -418,6 +427,7 @@ def build_agent(
         extra_tools=simple_coder_extra_tools or None,
         auto_compact_at_tokens=auto_compact_at_tokens,
         snip_window=snip_window,
+        effort=effort,
     )
 
     # PreToolUse/PostToolUse hooks attach to the agents that actually
