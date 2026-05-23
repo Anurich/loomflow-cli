@@ -154,27 +154,51 @@ def _tree_signature(root: Path) -> tuple[float, int]:
     return (newest, count)
 
 
-def repo_map_for_root_cached(
-    root: Path | str, *, max_tokens: int = 1500
-) -> str | None:
-    """``repo_map_for_root`` with a freshness-keyed cache: re-walks +
-    re-renders only when the source tree actually changed. This is the
-    "fresh-by-construction" path — always current after an edit, but no
-    redundant AST walk when nothing moved. Safe to call every turn.
-
-    On each (re)build it also mirrors the map to ``<root>/.loom/repomap.md``
-    so you can see exactly what's injected — the agent still reads the
-    map from memory; the file is purely for inspection."""
+def _repo_map_cached(
+    root: Path | str, max_tokens: int
+) -> tuple[str | None, bool]:
+    """Core cached build. Returns ``(map, rebuilt)`` — ``rebuilt`` is
+    True when the source tree changed and we re-walked, False on a
+    cache hit. Freshness-keyed (newest .py mtime + file count), so it
+    only re-parses when something actually moved. Mirrors the map to
+    ``<root>/.loom/repomap.md`` on every rebuild for inspection."""
     root_p = Path(root).resolve()
     key = str(root_p)
     sig = _tree_signature(root_p)
     cached = _REPO_MAP_CACHE.get(key)
     if cached is not None and cached[0] == sig:
-        return cached[1]
+        return cached[1], False
     rendered = repo_map_for_root(root_p, max_tokens=max_tokens)
     _REPO_MAP_CACHE[key] = (sig, rendered)
     _write_repomap_file(root_p, rendered)
-    return rendered
+    return rendered, True
+
+
+def repo_map_for_root_cached(
+    root: Path | str, *, max_tokens: int = 1500
+) -> str | None:
+    """Cached repo map (the "fresh-by-construction" path). Safe to call
+    every turn — re-walks only when the source tree changed. The agent
+    reads the map from its memory block; ``.loom/repomap.md`` mirrors it
+    for inspection."""
+    return _repo_map_cached(root, max_tokens)[0]
+
+
+def repo_map_meta_for_root_cached(
+    root: Path | str, *, max_tokens: int = 1500
+) -> dict[str, object]:
+    """Like :func:`repo_map_for_root_cached` but returns the map plus
+    metadata for UI surfaces: ``{map, rebuilt, symbols, chars}``.
+    ``rebuilt`` distinguishes a fresh re-index (tree changed) from a
+    cache hit, so the desktop can show "re-indexed" vs "cached"."""
+    body, rebuilt = _repo_map_cached(root, max_tokens)
+    text = body or ""
+    return {
+        "map": text,
+        "rebuilt": rebuilt,
+        "symbols": text.count("\n- `"),
+        "chars": len(text),
+    }
 
 
 def _write_repomap_file(root: Path, rendered: str | None) -> None:
