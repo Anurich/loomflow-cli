@@ -2018,3 +2018,8 @@ def _migrate_legacy_per_route_episodes(
         return 0
 
 
+async def run_repl(project: Project, model: str) -> int:
+    """Entry point for the interactive REPL — construct the Repl and
+    run its loop until the user exits."""
+    repl = Repl(project, model)
+    return await repl.run()
