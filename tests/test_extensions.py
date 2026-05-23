@@ -282,7 +282,7 @@ def test_custom_worker_unknown_tool_skipped(project: Project) -> None:
 # ---- build_agent integration ----------------------------------------
 
 
-def test_custom_subagent_joins_complex_roster(tmp_path: Path) -> None:
+def test_custom_subagent_joins_worker_roster(tmp_path: Path) -> None:
     proj = tmp_path / "repo"
     _write(
         proj / ".loom" / "agents" / "perf.md",
@@ -294,8 +294,7 @@ def test_custom_subagent_joins_complex_roster(tmp_path: Path) -> None:
         root=proj, is_git=False, context_file=None, context_text=""
     )
     coord, _ = build_agent(project, model="echo")
-    routes = {r.name: r.agent for r in coord.architecture._routes}
-    workers = routes["complex"].architecture.declared_workers()
+    workers = coord.architecture.declared_workers()
     # hyphen normalised to underscore in the delegate role name
     assert "perf_auditor" in workers
     assert workers["perf_auditor"].instructions.startswith(
@@ -313,8 +312,7 @@ def test_custom_subagent_cannot_shadow_builtin(tmp_path: Path) -> None:
         root=proj, is_git=False, context_file=None, context_text=""
     )
     coord, _ = build_agent(project, model="echo")
-    routes = {r.name: r.agent for r in coord.architecture._routes}
-    workers = routes["complex"].architecture.declared_workers()
+    workers = coord.architecture.declared_workers()
     # the builtin coder is intact, NOT the shadow
     assert not workers["coder"].instructions.startswith(
         "malicious shadow"
@@ -335,98 +333,31 @@ def test_build_agent_passes_extensions_through(
     )
     ext = Extensions(agent_specs=[spec])
     coord, _ = build_agent(project, model="echo", extensions=ext)
-    routes = {r.name: r.agent for r in coord.architecture._routes}
-    workers = routes["complex"].architecture.declared_workers()
+    workers = coord.architecture.declared_workers()
     assert "injected" in workers
 
 
-def test_custom_subagent_is_route_and_worker(tmp_path: Path) -> None:
-    # A custom subagent is exposed BOTH as a top-level router route
-    # (classifier-pickable by its description) AND as a supervisor
-    # worker — the same Agent instance for both.
-    proj = tmp_path / "repo"
-    _write(
-        proj / ".loom" / "agents" / "sec.md",
-        "---\nname: security-auditor\n"
-        "description: audit auth and crypto flaws\n"
-        "tools: [read, grep]\n---\nHunt vulns.\n",
-    )
-    project = Project(
-        root=proj, is_git=False, context_file=None, context_text=""
-    )
-    coord, _ = build_agent(project, model="echo")
-    routes = {r.name: r for r in coord.architecture._routes}
-    # top-level route, with the frontmatter description verbatim
-    assert "security_auditor" in routes
-    assert routes["security_auditor"].description == (
-        "audit auth and crypto flaws"
-    )
-    # AND still a supervisor worker — same Agent instance
-    workers = routes["complex"].agent.architecture.declared_workers()
-    assert "security_auditor" in workers
-    assert (
-        routes["security_auditor"].agent
-        is workers["security_auditor"]
-    )
-
-
-def test_specialist_classifier_only_with_subagents(
-    tmp_path: Path,
-) -> None:
-    # With a custom subagent present, the router must use the
-    # specialist-precedence classifier so an "audit X" request can
-    # outrank SIMPLE. Without subagents, the stock classifier stays.
-    proj = tmp_path / "repo"
-    _write(
-        proj / ".loom" / "agents" / "a.md",
-        "---\nname: x-auditor\ndescription: audit X for flaws\n---\nb\n",
-    )
-    project = Project(
-        root=proj, is_git=False, context_file=None, context_text=""
-    )
-    coord, _ = build_agent(project, model="echo")
-    assert "SPECIALIST FIRST" in coord.architecture._classifier_prompt
-
-    plain = Project(
-        root=tmp_path / "empty",
-        is_git=False,
-        context_file=None,
-        context_text="",
-    )
-    (tmp_path / "empty").mkdir()
-    c2, _ = build_agent(plain, model="echo")
-    assert "SPECIALIST FIRST" not in (
-        c2.architecture._classifier_prompt or ""
-    )
-
-
-def test_effort_threads_to_work_agents_not_router(
+def test_effort_threads_to_coordinator_and_workers(
     project: Project,
 ) -> None:
-    # Reasoning effort goes to the WORK agents (simple coder,
-    # supervisor, every worker) but NOT the router classifier — a
-    # one-shot routing decision shouldn't burn reasoning tokens.
+    # Reasoning effort threads to the coordinator (which now does work
+    # itself, so it benefits) AND every worker.
     coord, _ = build_agent(project, model="echo", effort="high")
-    assert getattr(coord, "_default_effort", "x") is None
-    routes = {r.name: r.agent for r in coord.architecture._routes}
-    assert routes["simple"]._default_effort == "high"
-    sup = routes["complex"]
-    assert sup._default_effort == "high"
-    for w in sup.architecture.declared_workers().values():
+    assert coord._default_effort == "high"
+    for w in coord.architecture.declared_workers().values():
         assert w._default_effort == "high"
     # default: no effort dial anywhere
     c2, _ = build_agent(project, model="echo")
-    s2 = {r.name: r.agent for r in c2.architecture._routes}["simple"]
-    assert s2._default_effort is None
+    assert c2._default_effort is None
 
 
 def test_prompts_nudge_loading_matching_skills() -> None:
-    # The SIMPLE coder + team coder prompts must tell the model to
+    # The coordinator + coder prompts must tell the model to
     # load_skill when a skill matches — otherwise weak models answer
     # from general knowledge and skip available skills.
     from loom_code.prompts import (
         build_coder_prompt,
-        build_simple_coder_prompt,
+        build_unified_coordinator_instructions,
     )
 
     project = Project(
@@ -435,7 +366,7 @@ def test_prompts_nudge_loading_matching_skills() -> None:
         context_file=None,
         context_text="",
     )
-    assert "load_skill" in build_simple_coder_prompt(project)
+    assert "load_skill" in build_unified_coordinator_instructions(project)
     assert "load_skill" in build_coder_prompt(project)
 
 
@@ -456,9 +387,10 @@ def test_build_agent_drops_untrusted_project_hooks(
         root=proj, is_git=False, context_file=None, context_text=""
     )
     coord, _ = build_agent(project, model="echo")
-    routes = {r.name: r.agent for r in coord.architecture._routes}
-    coder = routes["complex"].architecture.declared_workers()["coder"]
+    coder = coord.architecture.declared_workers()["coder"]
     assert len(coder._hooks.pre_tool_hooks) == 0  # noqa: SLF001
+    # the coordinator (which now executes tools) must also be clean
+    assert len(coord._hooks.pre_tool_hooks) == 0  # noqa: SLF001
 
 
 def test_unused_hookspec_import_kept() -> None:

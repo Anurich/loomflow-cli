@@ -175,6 +175,24 @@ def _load_graph(project_root: Path | str) -> Any:
     return json_graph.node_link_graph(data, edges="links")
 
 
+async def _load_or_build_graph(project_root: Path | str) -> Any:
+    """Load the persisted graph; if it's missing, build it ONCE
+    transparently then load.
+
+    Lets the agent ``query`` / ``explain`` / ``path_between`` work
+    with a single tool call instead of the brittle ``query → 'run
+    build first' error → build → query again`` dance that smaller
+    models routinely fail to recover from. Uses the same
+    ``graphify_build_impl`` the explicit ``build`` tool + post-commit
+    hook share; it deliberately does NOT install the git hook —
+    persistent refresh stays an explicit ``build`` side effect."""
+    try:
+        return _load_graph(project_root)
+    except FileNotFoundError:
+        await graphify_build_impl(project_root)
+        return _load_graph(project_root)
+
+
 @dataclass(frozen=True)
 class GraphifyBuildResult:
     """Structured outcome of one ``graphify_build_impl`` run.
@@ -354,7 +372,7 @@ async def query(question: str, path: str = ".") -> str:
     Limited to 20 results total (8 direct + 8 neighbors + 4
     community) to keep tool output bounded while showing breadth.
     """
-    graph_obj = _load_graph(path)
+    graph_obj = await _load_or_build_graph(path)
     terms = [t.lower() for t in question.split() if len(t) > 2]
     if not terms:
         return (
@@ -470,7 +488,7 @@ async def path_between(a: str, b: str, path: str = ".") -> str:
     useful graph query: "how does A get to B?" / "what connects
     X and Y?" — exactly what grep can't answer.
     """
-    graph_obj = _load_graph(path)
+    graph_obj = await _load_or_build_graph(path)
     a_match = _find_node(graph_obj, a)
     b_match = _find_node(graph_obj, b)
     if a_match is None:
@@ -505,7 +523,7 @@ async def path_between(a: str, b: str, path: str = ".") -> str:
 async def explain(node: str, path: str = ".") -> str:
     """Plain-language explanation of a single node: source
     location, immediate neighbours, community, edge count."""
-    graph_obj = _load_graph(path)
+    graph_obj = await _load_or_build_graph(path)
     nid = _find_node(graph_obj, node)
     if nid is None:
         return f"graphify__explain: no node matched {node!r}."

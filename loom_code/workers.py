@@ -58,11 +58,10 @@ from loomflow.tools import (
 
 from .edit_tool import multi_edit_tool
 from .edit_tool import verifying_edit_tool as edit_tool
-from .escalate import escalate_to_team_tool
 from .extensions import AgentSpec
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .project import Project
-from .prompts import build_coder_prompt, build_simple_coder_prompt
+from .prompts import build_coder_prompt
 from .web_fetch import web_fetch_tool
 
 # The coder does real, multi-step work — it gets a generous turn
@@ -380,87 +379,6 @@ def _build_reviewer(
         # Reviewer benefits too: re-review cycles ("you flagged X,
         # the coder fixed it, recheck") no longer re-read every
         # changed file from scratch.
-        persist_tool_transcripts=True,
-    )
-
-
-def build_simple_coder(
-    project: Project,
-    *,
-    model: str,
-    approval_handler: Callable[..., Awaitable[bool]] | None,
-    memory_url: str,
-    web_backend: str | None = None,
-    skills: list[Any] | None = None,
-    extra_tools: list[Any] | None = None,
-    auto_compact_at_tokens: int | None = None,
-    snip_window: int = 0,
-    effort: str | None = None,
-) -> Agent:
-    """Build the SIMPLE-mode loom-code agent — single coder, no team.
-
-    Used by the router (``Team.router`` in :mod:`loom_code.agent`)
-    when the classifier judges the user's request to be a single-
-    file change / focused question / quick fix. Strips the entire
-    team apparatus:
-
-    * No ``delegate`` / ``forward_message`` / ``send_message`` —
-      this agent talks to the user directly.
-    * No ``living_plan`` — plan tracking is overhead the simple
-      path doesn't need.
-    * No ``workspace`` notebook — single-agent doesn't need a
-      shared scratchpad. (Cross-mode notebook continuity comes
-      from the team-mode agent when the router picks complex.)
-    * Tool surface: full file-and-shell kernel
-      (read/write/edit/grep/find/ls/bash) + web_fetch — same as
-      the ``coder`` worker, just plumbed directly to the user
-      instead of through a coordinator delegation.
-
-    ``memory_url`` is the SAME sqlite path the team uses, so
-    sessions opened in simple mode and follow-ups answered in
-    team mode share recall across the boundary. Persistent
-    transcripts on so re-asks within the same session don't
-    re-read files.
-    """
-    root = project.root
-    has_web = web_backend is not None
-    tools: list[Any] = [
-        read_tool(root),
-        write_tool(root),
-        edit_tool(root),
-        multi_edit_tool(root),
-        grep_tool(root),
-        find_tool(root),
-        ls_tool(root),
-        bash_tool(root, timeout=300.0),
-        web_fetch_tool(),
-        # Last-resort escape hatch: SIMPLE can hand a too-hard task
-        # up to the supervisor team. The REPL detects the call +
-        # re-dispatches (the team inherits SIMPLE's context via the
-        # shared session). NOT on the team's coder — only the
-        # single-agent SIMPLE path can escalate.
-        escalate_to_team_tool(),
-    ]
-    if has_web:
-        from loomflow.tools import web_tool
-        tools.append(web_tool(backend=web_backend))  # type: ignore[arg-type]
-    if extra_tools:
-        tools.extend(extra_tools)
-
-    return Agent(
-        build_simple_coder_prompt(project, has_web=has_web),
-        model=model,
-        architecture=ReAct(),
-        tools=tools,
-        skills=skills,
-        memory=memory_url,
-        permissions=StandardPermissions(),
-        approval_handler=approval_handler,
-        prompt_caching=True,
-        max_turns=_CODER_MAX_TURNS,
-        snip_window=snip_window,
-        auto_compact_at_tokens=auto_compact_at_tokens,
-        effort=effort,
         persist_tool_transcripts=True,
     )
 

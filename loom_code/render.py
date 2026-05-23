@@ -19,8 +19,6 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.text import Text
 
-from .escalate import ESCALATE_TOOL_NAME
-
 console = Console()
 
 # Tools whose results are worth showing in full-ish; others get a
@@ -157,12 +155,6 @@ class StreamRenderer:
         # the agent having to report any of it itself.
         self.bash_commands: list[str] = []
         self.notes_written: list[tuple[str, str]] = []  # (kind, title)
-        # Set when the SIMPLE coder calls ``escalate_to_team`` — the
-        # REPL reads these after the run to re-dispatch the same
-        # prompt through the supervisor (which inherits the SIMPLE
-        # coder's partial context via the shared session).
-        self.escalation_requested: bool = False
-        self.escalation_reason: str = ""
 
     def handle(self, event: Any) -> None:
         """Render a single ``Event``. ``kind`` is a string enum;
@@ -279,13 +271,6 @@ class StreamRenderer:
             cmd = str(args.get("command") or "").strip()
             if cmd:
                 self.bash_commands.append(cmd)
-        elif tool == ESCALATE_TOOL_NAME:
-            # SIMPLE coder asked for the team. Record it; the REPL
-            # re-dispatches to the supervisor after the run.
-            self.escalation_requested = True
-            self.escalation_reason = str(
-                args.get("reason") or ""
-            ).strip()
         elif tool == "note":
             title = str(args.get("title") or "").strip()
             if title:

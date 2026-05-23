@@ -1,57 +1,63 @@
-"""Tests for build_agent — the Team.router(simple, complex) wiring."""
+"""Tests for build_agent — the unified Team.supervisor coordinator.
+
+``build_agent`` returns a single ``Team.supervisor`` Agent whose
+coordinator holds the full coding kernel AND a ``delegate`` tool. It
+decides inline whether to do focused work itself or delegate
+multi-file / parallel work to the worker roster (coder / explorer /
+auditor / reviewer).
+"""
 
 from __future__ import annotations
 
+from typing import Any
+
 from loomflow import Agent
 from loomflow.architecture import Supervisor
-from loomflow.architecture.router import Router
 from loomflow.workspace import LocalDiskWorkspace
 
 from loom_code.agent import LOOM_DIR, build_agent
 from loom_code.project import Project
 
 
-def test_build_agent_returns_router_coordinator(project: Project) -> None:
-    # As of the SIMPLE-mode fast-lane work, ``build_agent`` returns
-    # a ``Team.router`` Agent that classifies each user prompt and
-    # dispatches to SIMPLE (single coder) or COMPLEX (supervisor
-    # team). Test that the outer Agent is the router.
+def _tool_names(agent: Agent) -> set[str]:
+    """The agent's STATIC tool surface by name. (``delegate`` is
+    injected by the Supervisor architecture at run-time, so it is
+    intentionally NOT here.)"""
+    host: Any = agent._tool_host
+    tools = getattr(host, "_tools", None)
+    return set(tools.keys()) if tools is not None else set()
+
+
+def test_build_agent_returns_supervisor_coordinator(
+    project: Project,
+) -> None:
+    # build_agent returns a Team.supervisor Agent — the coordinator
+    # decides inline whether to act itself or delegate.
     coordinator, _workspace = build_agent(project, model="echo")
     assert isinstance(coordinator, Agent)
-    assert isinstance(coordinator.architecture, Router)
+    assert isinstance(coordinator.architecture, Supervisor)
 
 
-def test_router_has_simple_and_complex_routes(project: Project) -> None:
+def test_coordinator_has_full_worker_roster(project: Project) -> None:
+    # The four delegate workers must be wired; regressing this loses
+    # the team-pattern capability the coordinator delegates into.
     coordinator, _ = build_agent(project, model="echo")
-    route_names = {r.name for r in coordinator.architecture._routes}
-    assert route_names == {"simple", "complex"}
-
-
-def test_complex_route_is_the_supervisor_team(project: Project) -> None:
-    # The COMPLEX route must point at the supervisor (with the four
-    # workers); regressing this collapses both routes into single-
-    # agent mode and loses team-pattern capability.
-    coordinator, _ = build_agent(project, model="echo")
-    complex_route = next(
-        r for r in coordinator.architecture._routes if r.name == "complex"
-    )
-    assert isinstance(complex_route.agent.architecture, Supervisor)
-    workers = complex_route.agent.architecture.declared_workers()
+    workers = coordinator.architecture.declared_workers()
     assert set(workers) == {"coder", "explorer", "auditor", "reviewer"}
 
 
-def test_simple_route_is_a_plain_agent(project: Project) -> None:
-    # The SIMPLE route must NOT be a Supervisor/Router/Team — it's
-    # a single Agent with the full file-and-shell kernel. Regressing
-    # this defeats the whole purpose of the fast-lane.
+def test_coordinator_holds_the_coding_kernel(project: Project) -> None:
+    # The defining property of the unified coordinator: it can do
+    # focused work ITSELF, so it must carry the writer kernel
+    # (read/write/edit/multi_edit/grep/find/ls/bash). Regressing this
+    # collapses it back to a delegate-only router-style coordinator.
     coordinator, _ = build_agent(project, model="echo")
-    simple_route = next(
-        r for r in coordinator.architecture._routes if r.name == "simple"
-    )
-    # Plain Agent → ReAct architecture (default), not Supervisor/Router.
-    assert isinstance(simple_route.agent, Agent)
-    assert not isinstance(simple_route.agent.architecture, Supervisor)
-    assert not isinstance(simple_route.agent.architecture, Router)
+    names = _tool_names(coordinator)
+    expected = {
+        "read", "write", "edit", "multi_edit",
+        "grep", "find", "ls", "bash",
+    }
+    assert expected <= names, f"missing coding tools: {expected - names}"
 
 
 def test_build_agent_creates_loom_dir(project: Project) -> None:
@@ -125,25 +131,14 @@ def test_coordinator_persists_tool_transcripts(project: Project) -> None:
 def test_graphify_skill_registered_on_coordinator(
     project: Project,
 ) -> None:
-    """The bundled graphify skill in
-    ``loom_code/skills/graphify/`` must be auto-discovered by
-    ``build_agent`` and wired into the COMPLEX-route supervisor's
-    skill registry. Regression-pins the skill-discovery path
-    (importlib.resources lookup + package-data inclusion in
-    pyproject) so a future edit can't silently drop the
-    graphify integration."""
+    """The bundled graphify skill in ``loom_code/skills/graphify/``
+    must be auto-discovered by ``build_agent`` and wired into the
+    coordinator's skill registry. Regression-pins the skill-discovery
+    path (importlib.resources lookup + package-data inclusion in
+    pyproject) so a future edit can't silently drop the graphify
+    integration."""
     coordinator, _ = build_agent(project, model="echo")
-    from loomflow.architecture.router import Router
-
-    assert isinstance(coordinator.architecture, Router)
-    complex_route = next(
-        r for r in coordinator.architecture._routes if r.name == "complex"
-    )
-    supervisor_agent = complex_route.agent
-    # The Skill registry on the supervisor must list 'graphify'
-    # — that's what the agent sees when deciding to call
-    # ``load_skill('graphify')``. ``names()`` is the public listing.
-    skill_names = set(supervisor_agent.skills.names())
+    skill_names = set(coordinator.skills.names())
     assert "graphify" in skill_names, (
         f"graphify skill missing from coordinator's surface "
         f"(found: {skill_names}). Check pyproject.toml's "

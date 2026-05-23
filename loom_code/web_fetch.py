@@ -90,6 +90,17 @@ _GITHUB_TREE_RE = re.compile(
     r"(?P<owner>[^/]+)/(?P<repo>[^/]+)/tree/(?P<rest>.*)$"
 )
 
+# github.com/<owner>/<repo>(/)? — the REPO ROOT page. Same ~700kB of
+# React HTML as a /tree/ page (the README rendered + the whole file
+# tree + sidebars), and the model usually wants the README or the
+# file listing, not the chrome. Refuse + direct it at the cheap
+# routes. Anchored to end (with optional query/fragment) so it can't
+# swallow /blob/, /tree/, /pull/, /issues/, etc.
+_GITHUB_REPO_ROOT_RE = re.compile(
+    r"^https?://(?:www\.)?github\.com/"
+    r"(?P<owner>[^/?#]+)/(?P<repo>[^/?#]+)/?(?:[?#].*)?$"
+)
+
 
 def _normalize_url(url: str) -> tuple[str | None, str | None]:
     """Return ``(normalized_url, error)``. Exactly one is non-None.
@@ -134,6 +145,25 @@ def _normalize_url(url: str) -> tuple[str | None, str | None]:
             f"(github.com/{owner}/{repo}/blob/{ref}/<path>)\n"
             f"  - FETCH README:         "
             f"web_fetch https://github.com/{owner}/{repo}/blob/{ref}/README.md"
+        )
+    m_root = _GITHUB_REPO_ROOT_RE.match(url)
+    if m_root:
+        owner = m_root["owner"]
+        repo = m_root["repo"]
+        return None, (
+            f"ERROR: {url} is a GitHub REPO ROOT page (React HTML, "
+            f"~700kB). Fetching it wastes tokens; to explore the repo "
+            f"use one of:\n"
+            f"  - READ the README:   "
+            f"web_fetch https://github.com/{owner}/{repo}/blob/main/README.md\n"
+            f"  - LIST the root:     "
+            f"web_fetch https://api.github.com/repos/{owner}/{repo}/contents/\n"
+            f"  - LIST a subdir:     web_fetch "
+            f"https://api.github.com/repos/{owner}/{repo}/contents/<dir>\n"
+            f"  - CLONE + explore:   `bash git clone "
+            f"https://github.com/{owner}/{repo} \"$(mktemp -d)/{repo}\"` "
+            f"then inspect with `bash ls`/`bash cat` (your read/grep/ls "
+            f"are scoped to the LOCAL project and can't see the clone)"
         )
     m = _GITHUB_BLOB_RE.match(url)
     if m:

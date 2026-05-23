@@ -725,38 +725,6 @@ class Repl:
         if not ok:
             return
 
-        # Escalation: the SIMPLE coder called ``escalate_to_team``.
-        # Re-dispatch the same prompt through the supervisor — which
-        # inherits SIMPLE's partial conversation via the shared
-        # session_id (conversation_scope="shared"), so the work
-        # SIMPLE already did becomes the team's context, not waste.
-        # The supervisor has no escalate tool, so this can't loop.
-        if renderer.escalation_requested:
-            sup = getattr(self.agent, "_complex_agent", None)
-            pause_status()
-            reason = renderer.escalation_reason or "(no reason given)"
-            console.print(
-                f"\n  [yellow]→ escalating to the team:[/yellow] "
-                f"{reason}"
-            )
-            if sup is not None:
-                team_renderer = StreamRenderer(
-                    set_status=set_status, pause_status=pause_status
-                )
-                ok = await self._consume_agent_stream(
-                    sup, prompt, team_renderer, pause_status
-                )
-                if not ok:
-                    return
-                # The team's run is now the authoritative result for
-                # cost accounting + output + the rest of the turn.
-                renderer = team_renderer
-            else:
-                console.print(
-                    "  [dim](no team agent wired — staying in "
-                    "simple mode)[/dim]"
-                )
-
         if renderer.last_plan:
             self.last_plan = renderer.last_plan
         result = renderer.last_result
