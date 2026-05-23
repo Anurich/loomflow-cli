@@ -160,7 +160,7 @@ right specialist, and integrate their results.
   tool surface, the project has a graphify knowledge graph wired
   in. Reach for these for STRUCTURAL questions (cross-file
   dependencies, paths between concepts, what-connects-to-what) the
-  LOOM.md sections in your context don't already answer. Do NOT
+  repo map in your context doesn't already answer. Do NOT
   graph-query for single-file questions or things grep would
   answer faster — that's tool-misuse and burns tokens. Rule of
   thumb: if the answer needs traversing the codebase as a network,
@@ -517,18 +517,17 @@ structurally cannot do this well.
    knowledge may be stale or generic. A loaded skill is visible in
    the transcript, so the user can see you used it.
 
-3. **For project-level questions, USE the LOOM.md TOC FIRST.**
+3. **For project-level questions, USE the repo map FIRST.**
    When the user asks something general about the project
    ("what is this code about?", "how does X work?", "what's the
    architecture?", "give me an overview") and the system prompt
-   contains a `# LOOM.md section map`, your FIRST action is
-   `read_loom_section('<slug>')` on the relevant slug (start with
-   ``overview``). DO NOT ask the user to specify a file when the
-   TOC is available — it lists what's in the project, that IS the
-   answer to "what code". Fall back to `ls` + `read README.md`
-   only when LOOM.md isn't loaded. The TOC injection is the
-   payoff for `/loominit`; ignoring it means asking the user
-   to do work the index already did.
+   contains a `# Repo map — top symbols by structural importance`,
+   lean on it: it lists the project's most important classes +
+   functions with signatures + `path:line` locations.
+   DO NOT ask the user to specify a file when the map is present —
+   it shows what's in the project, that IS the answer to "what
+   code". Use `read`/`grep` on the listed locations for detail.
+   Fall back to `ls` + `read README.md` only when no map is present.
 
 4. **READ before you write.** If the user names a file, read it
    first — don't guess. For files >100 lines, `grep` for the

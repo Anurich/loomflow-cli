@@ -12,15 +12,13 @@ answers two questions cheaply, once, at startup:
    — and hand it to the system prompt so the agent starts already
    knowing the house rules.
 
-Note: ``LOOM.md`` is intentionally NOT in the static-bake candidate
-list. It's the loominit-generated codebase INDEX (large, sectioned,
-covers the whole repo), and as of loominit slice 3 it gets per-turn
-BM25 retrieval into the ``loom_index`` working block via
-:class:`loom_code.loominit.injection.LoomRetriever`. Baking it
-statically here would double-ship: once verbatim every turn, once
-as retrieved sections. ``CLAUDE.md`` / ``AGENTS.md`` stay as
-static bake because they encode "house rules" (small, every-turn
-relevant) — a different role from the codebase index.
+Note: the codebase structure is NOT baked here. A deterministic
+repo map (top symbols by structural importance) is injected per turn
+into the ``loom_index`` working block via
+:func:`loom_code.loominit.repomap.repo_map_for_root_cached`.
+``CLAUDE.md`` / ``AGENTS.md`` stay as static bake because they encode
+"house rules" (small, every-turn relevant) — a different role from
+the codebase map.
 """
 
 from __future__ import annotations

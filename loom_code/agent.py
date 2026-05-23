@@ -17,7 +17,6 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from importlib.resources import files as _pkg_files
 from pathlib import Path
-from typing import Any
 
 from loomflow import Agent
 from loomflow.architecture.router import RouterRoute
@@ -112,7 +111,6 @@ def build_agent(
     snip_window: int = 8,
     auto_compact: bool = True,
     tool_result_summarizer: str | None = None,
-    loom_retrieval: str = "agentic",
     extensions: Extensions | None = None,
     effort: str | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
@@ -348,24 +346,6 @@ def build_agent(
     # 0.10.16's Team-kwarg-forwarding sweep). No more post-
     # construction monkey-patching.
     #
-    if loom_retrieval not in ("bm25", "agentic"):
-        raise ValueError(
-            "loom_retrieval must be 'bm25' or 'agentic', "
-            f"got {loom_retrieval!r}"
-        )
-
-    # Agentic LOOM.md retrieval: wire the ``read_loom_section``
-    # tool into both the coordinator and the simple coder. The
-    # TOC injection (which tells the model the slugs) happens via
-    # the REPL's per-turn LoomRetriever; the tool fetches a
-    # specific section body on demand.
-    coordinator_extra_tools: list[Any] = []
-    simple_coder_extra_tools: list[Any] = []
-    if loom_retrieval == "agentic":
-        from .loom_section_tool import read_loom_section_tool
-        loom_tool = read_loom_section_tool(project.root)
-        coordinator_extra_tools.append(loom_tool)
-        simple_coder_extra_tools.append(loom_tool)
 
     supervisor = Team.supervisor(
         workers=workers,
@@ -383,7 +363,6 @@ def build_agent(
         # makes the band-aid unnecessary.
         workspace=workspace,
         living_plan=True,
-        tools=coordinator_extra_tools or None,
         skills=all_skills,
         max_turns=max_turns,
         max_stop_hook_iterations=max_stop_hook_iterations,
@@ -424,7 +403,6 @@ def build_agent(
         memory_url=memory_url,
         web_backend=web_backend,
         skills=all_skills,
-        extra_tools=simple_coder_extra_tools or None,
         auto_compact_at_tokens=auto_compact_at_tokens,
         snip_window=snip_window,
         effort=effort,
@@ -551,12 +529,6 @@ def build_agent(
         # plan — but pass it anyway for symmetry with supervisor.
         max_stop_hook_iterations=max_stop_hook_iterations,
     )
-    # Stamp the retrieval mode on the coordinator so the REPL's
-    # per-turn LoomRetriever build can read it back without
-    # plumbing yet another arg through every call site. The REPL
-    # checks ``getattr(self.agent, '_loom_retrieval_mode', 'bm25')``
-    # when instantiating LoomRetriever and the two stay in sync.
-    coordinator._loom_retrieval_mode = loom_retrieval  # type: ignore[attr-defined]
     # Stamp the supervisor (COMPLEX-route agent) on the coordinator
     # so the REPL can re-dispatch to it when the SIMPLE coder calls
     # ``escalate_to_team``. Running it with the same session_id

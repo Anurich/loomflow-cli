@@ -55,16 +55,6 @@ def main() -> int:
             refresh_fn=lambda: _refresh_graphify(project_root, graphify_dir),
         )
 
-    # Loominit: structural rebuild only (file walk + AST + graph
-    # scoring). NO LLM annotation — that's `/loominit refresh`,
-    # an explicit user-driven action. Keeps the post-commit hook
-    # zero-cost and zero-credentials.
-    if (loom_dir / "index.json").is_file():
-        _maybe_refresh(
-            counter_file=loom_dir / "_loominit_commits_since_refresh.txt",
-            refresh_fn=lambda: _refresh_loominit(project_root),
-        )
-
     return 0
 
 
@@ -123,17 +113,6 @@ def _refresh_graphify(project_root: Path, graphify_dir: Path) -> None:
     from .skills.graphify.tools import graphify_build_impl
 
     anyio.run(graphify_build_impl, project_root)
-
-
-def _refresh_loominit(project_root: Path) -> None:
-    """Re-run the structural pass and overwrite ``.loom/index.json``.
-    Pure Python (no LLM, no provider key). LOOM.md stays as-is —
-    its inline ``(stale: path:line)`` markers automatically appear
-    where the new index disagrees with old annotated claims."""
-    from .loominit.extractor import build_index
-    from .loominit.persistence import save_index
-    index = build_index(project_root)
-    save_index(project_root, index)
 
 
 if __name__ == "__main__":

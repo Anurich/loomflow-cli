@@ -304,6 +304,17 @@ async def build(path: str = ".") -> str:
     Returns a short summary the agent can quote back to the user.
     """
     result = await graphify_build_impl(path)
+    # Install the debounced post-commit hook so the graph refreshes
+    # itself every few commits. This used to be installed by
+    # ``/loominit`` (now removed); graphify owns its own lifecycle, so
+    # the hook lives here. Best-effort — a hook failure (e.g. non-git
+    # tree) must never fail the build.
+    try:
+        from ...git_hook import install as _install_hook
+
+        _install_hook(result.project_root)
+    except Exception:  # noqa: BLE001 — hook install is best-effort
+        pass
     if result.skipped_reason is not None:
         return (
             f"graphify__build: {result.skipped_reason} "

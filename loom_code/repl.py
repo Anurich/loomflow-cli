@@ -97,10 +97,6 @@ _SLASH_HELP = """\
   [cyan]/model[/cyan] <name>    switch to a specific model by name
   [cyan]/set_model[/cyan]       pick OpenAI / Anthropic + save API key
   [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
-  [cyan]/loominit[/cyan]        index this codebase → LOOM.md + a
-                   bundled knowledge graph (graphify) so the agent
-                   can skip re-reading source AND has cross-file
-                   structural queries available from turn one
   [cyan]/resume[/cyan]          resume the last session — rehydrates prior
                    turns from loomflow memory so you pick up where
                    you left off
@@ -176,7 +172,6 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/discard", "discard the isolated session's edits"),
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
-    ("/loominit", "index this codebase → LOOM.md + knowledge graph"),
     ("/resume", "resume the last session (rehydrate prior turns)"),
     ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
     ("/clear", "fresh conversation (new session)"),
@@ -260,25 +255,6 @@ class Repl:
             max_stop_hook_iterations=self._auto_continue_limit,
             extensions=self._extensions,
             effort=self._effort,
-        )
-        # LOOM.md retrieval. ``LoomRetriever.from_repo_root`` returns
-        # ``None`` when LOOM.md is missing or empty — we treat that as
-        # "no per-turn injection, fall back to whatever the static
-        # context block in project.context_text already wired." When
-        # the retriever loads, the per-turn ``_inject_loom_context``
-        # call before ``_turn`` updates the ``loom_index`` working
-        # block.
-        #
-        # ``mode`` is pulled from the coordinator
-        # (``_loom_retrieval_mode``, stamped in ``build_agent``) so
-        # the retriever's strategy stays in sync with whether the
-        # agent has the ``read_loom_section`` tool. ``"agentic"``
-        # injects a stable TOC (good for cache hits); ``"bm25"``
-        # (default) keeps the per-turn keyword-ranked section dump.
-        from .loominit.injection import LoomRetriever
-        mode = getattr(self.agent, "_loom_retrieval_mode", "bm25")
-        self._loom_retriever = LoomRetriever.from_repo_root(
-            project.root, mode=mode
         )
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
@@ -393,12 +369,6 @@ class Repl:
             "  [dim]▸ [cyan]/set_web[/cyan]       enable web "
             "search (Serper / DuckDuckGo)[/dim]"
         )
-        console.print(
-            "  [dim]▸ [cyan]/loominit[/cyan]      index this "
-            "codebase + build a knowledge graph (so future turns "
-            "skip re-reading source AND get structural queries)"
-            "[/dim]"
-        )
         # Show the resume hint ONLY when a prior session pointer
         # exists — no point telling first-time users about a
         # feature they can't use yet.
@@ -477,10 +447,10 @@ class Repl:
             # A new task with no prior complaint → the previous
             # turn must have been fine. Credit it, then run.
             await self._attribute_pending(success=True, quiet=False)
-            # Per-turn LOOM.md retrieval — populates the
-            # ``loom_index`` working block with sections BM25-relevant
-            # to ``line``. Loomflow auto-injects working blocks into
-            # the next system prompt.
+            # Per-turn repo-map injection — populates the
+            # ``loom_index`` working block with the deterministic repo
+            # map. Loomflow auto-injects working blocks into the next
+            # system prompt.
             await self._inject_loom_context(line)
             await self._turn(line)
 
@@ -501,24 +471,31 @@ class Repl:
     # ---- a task turn ----------------------------------------------------
 
     async def _inject_loom_context(self, prompt: str) -> None:
-        """Update the ``loom_index`` working block with the top-N
-        LOOM.md sections most relevant to ``prompt``.
+        """Update the ``loom_index`` working block with a deterministic
+        repo map — the most structurally-important symbols (signatures +
+        locations) — which loomflow folds into the next system prompt.
 
-        No-op when there's no retriever (LOOM.md absent) or when BM25
-        scores no overlap with the prompt — in both cases we leave
-        the prior block untouched (loomflow keeps the last written
-        value), so a follow-up turn like ``"why?"`` still has the
-        previous turn's context to lean on.
+        Built from the structural index (AST walk, no model calls), so
+        it needs no ``/loominit`` and is fresh-by-construction: the
+        cached builder re-walks only when the tree changed. ``prompt``
+        is unused (the map is a stable global overview, which keeps the
+        system prompt cache-stable across turns).
 
-        Failures are swallowed (never let memory I/O kill a turn) —
-        the same defensive pattern the session-summary writer uses.
+        Failures are swallowed (never let memory I/O kill a turn).
         """
-        if self._loom_retriever is None:
-            return
-        body = self._loom_retriever.relevant(prompt)
-        if not body:
-            return
+        del prompt  # map is global, not prompt-ranked
         try:
+            from .loominit.repomap import repo_map_for_root_cached
+
+            # Deterministic repo map (top symbols by structural
+            # importance) built from the structural index — no LLM, no
+            # LOOM.md/loominit needed, and fresh-by-construction
+            # (re-walked only when the tree changed). Replaces the old
+            # BM25-over-LLM-narrative retrieval that drifted as the
+            # agent edited code.
+            body = repo_map_for_root_cached(self.project.root)
+            if not body:
+                return
             await self.agent.memory.update_block(
                 "loom_index", body, user_id=_USER_ID
             )
@@ -1047,8 +1024,6 @@ class Repl:
             await self._handle_set_model()
         elif cmd == "/set_web":
             await self._handle_set_web()
-        elif cmd == "/loominit":
-            await self._handle_loominit()
         elif cmd == "/resume":
             await self._handle_resume()
         elif cmd == "/set_continue_cap":
@@ -1638,7 +1613,7 @@ class Repl:
         """Where we stash the last-used session_id for this project.
 
         Lives under ``.loom/`` (same dir loom-code already uses for
-        per-project state — notebook, memory db, LOOM.md index).
+        per-project state — notebook, memory db, repo map).
         One file per project, single line: the session_id ULID.
         """
         return self.project.root / ".loom" / "last_session.txt"
@@ -1814,188 +1789,6 @@ class Repl:
                 f"  [dim]+ {skipped} earlier turn(s) recovered "
                 "(visible to the agent, not shown here)[/dim]"
             )
-
-    # ---- /loominit ------------------------------------------------------
-
-    async def _handle_loominit(self) -> None:
-        """Run the full codebase-indexing pipeline.
-
-        Phase 1 (structural, sub-second): walk the repo, AST-parse
-        every .py, build the symbol + import graph, score by
-        PageRank, mine entry points, cluster by path. Writes
-        ``.loom/index.json``.
-
-        Phase 2 (LLM annotation, parallel): for the project as a
-        whole + each cluster, spawn a loomflow ``Agent`` (no tools,
-        ``output_schema``-validated JSON) that produces the
-        narrative chunk. Stitched into ``LOOM.md`` at the repo root.
-
-        Costs one model run per cluster + one for the overview —
-        bounded by ``annotator.DEFAULT_CONCURRENCY``. Re-run via
-        ``/loominit`` any time; surgical refresh / staleness
-        tracking lands in later slices.
-        """
-        # Imports kept local so a slim ``loom-code`` startup doesn't
-        # pull in the AST walker + pydantic models for users who
-        # never run /loominit.
-        from .loominit.annotator import annotate
-        from .loominit.extractor import build_index
-        from .loominit.persistence import (
-            markdown_path,
-            save_index,
-            write_markdown,
-        )
-        from .skills.graphify.tools import (
-            GraphifyBuildResult,
-            graphify_build_impl,
-        )
-
-        console.print()
-        console.print(
-            "  [dim]indexing codebase (this may take a few "
-            "seconds for the structural pass + 5-30s for the "
-            "LLM annotation)…[/dim]"
-        )
-        status = console.status(
-            "[dim]building structural index…[/dim]", spinner="dots"
-        )
-        status.start()
-        # Graph build runs BEFORE annotation so its summary can be
-        # embedded into LOOM.md by the assembler. Wrapped in its own
-        # try/except so a graphify failure (e.g. tree-sitter missing
-        # for an exotic file mix) doesn't kill the loominit pass —
-        # LOOM.md still gets written, just without the
-        # ``## Knowledge Graph`` section.
-        graphify_result: GraphifyBuildResult | None = None
-        graphify_error: str | None = None
-        try:
-            index = build_index(self.project.root)
-            if not index.files:
-                status.stop()
-                console.print(
-                    "  [yellow]no indexable source files found — "
-                    "nothing to do[/yellow]"
-                )
-                return
-            save_index(self.project.root, index)
-
-            status.update(
-                "[dim]building knowledge graph "
-                "(graphify — tree-sitter + Leiden)…[/dim]"
-            )
-            try:
-                graphify_result = await graphify_build_impl(
-                    self.project.root
-                )
-            except Exception as gx:  # noqa: BLE001
-                # Capture for a status line; do NOT abort loominit.
-                graphify_error = f"{type(gx).__name__}: {gx}"
-
-            status.update(
-                f"[dim]annotating {len(index.clusters)} cluster(s) "
-                "via the model — this is the LLM-cost step…[/dim]"
-            )
-            metadata = _read_pyproject_metadata(self.project.root)
-            graphify_section: str | None = None
-            if (
-                graphify_result is not None
-                and graphify_result.skipped_reason is None
-            ):
-                graphify_section = _render_graphify_section(
-                    graph_rel_path=str(
-                        graphify_result.graph_path.relative_to(
-                            graphify_result.project_root
-                        )
-                    ),
-                    n_nodes=graphify_result.n_nodes,
-                    n_edges=graphify_result.n_edges,
-                    n_communities=graphify_result.n_communities,
-                    source=graphify_result.source,
-                )
-            body = await annotate(
-                index,
-                model=self.model,
-                project_metadata=metadata,
-                graphify_section=graphify_section,
-            )
-            write_markdown(self.project.root, body)
-        except Exception as exc:  # noqa: BLE001 — REPL must survive
-            status.stop()
-            console.print(
-                f"  [bold red]/loominit failed: {exc}[/bold red]"
-            )
-            return
-        finally:
-            status.stop()
-
-        n_symbols = len(index.symbols)
-        n_clusters = len(index.clusters)
-        n_files = len(index.files)
-        out_path = markdown_path(self.project.root)
-        console.print(
-            f"  [green]✓[/green] wrote [cyan]{out_path.name}[/cyan] "
-            f"— {n_files} files, {n_symbols} symbols, "
-            f"{n_clusters} cluster(s)"
-        )
-        # Separate status line for graphify — three branches: ✓
-        # (built), ⚠ (skipped — no extractable files), ✗ (error).
-        if (
-            graphify_result is not None
-            and graphify_result.skipped_reason is None
-        ):
-            rel = graphify_result.graph_path.relative_to(
-                graphify_result.project_root
-            )
-            console.print(
-                f"  [green]✓[/green] wrote [cyan]{rel}[/cyan] "
-                f"— {graphify_result.n_nodes} nodes, "
-                f"{graphify_result.n_edges} edges, "
-                f"{graphify_result.n_communities} communities "
-                f"(via {graphify_result.source})"
-            )
-        elif graphify_result is not None and graphify_result.skipped_reason:
-            console.print(
-                f"  [yellow]graphify: skipped — "
-                f"{graphify_result.skipped_reason}[/yellow]"
-            )
-        elif graphify_error is not None:
-            console.print(
-                f"  [yellow]graphify: failed — {graphify_error}"
-                "[/yellow] (LOOM.md still written)"
-            )
-        console.print(
-            "  [dim]future turns will reference this file. Re-run "
-            "[cyan]/loominit[/cyan] after major refactors.[/dim]"
-        )
-        # Install the debounced post-commit hook so the structural
-        # index refreshes itself every N commits. ``LOOM.md`` stays
-        # whatever the annotator wrote; the structural refresh
-        # updates ``.loom/index.json`` so per-turn injection picks
-        # up file changes + the inline ``(stale: path:line)``
-        # markers in LOOM.md surface when annotated claims drift.
-        # Idempotent + git-aware (silent skip on non-git).
-        from .git_hook import install as install_hook
-        hook_status = install_hook(self.project.root)
-        if hook_status in ("installed", "updated"):
-            console.print(
-                f"  [dim]post-commit hook {hook_status} "
-                "— structural index refreshes every 5 commits[/dim]"
-            )
-
-        # Rebuild the LoomRetriever so the next turn picks up the
-        # freshly-written LOOM.md. Without this, ``/loominit`` on a
-        # fresh repo writes the file but ``self._loom_retriever``
-        # stays at whatever ``__init__`` set it to (typically
-        # ``None`` on a first-time launch), and the agentic TOC
-        # injection never fires until the REPL is restarted. Mode
-        # is pulled from the coordinator so it stays in sync with
-        # ``build_agent(loom_retrieval=...)`` — same logic as the
-        # initial build in ``__init__``.
-        from .loominit.injection import LoomRetriever
-        mode = getattr(self.agent, "_loom_retrieval_mode", "bm25")
-        self._loom_retriever = LoomRetriever.from_repo_root(
-            self.project.root, mode=mode
-        )
 
 
 def _truncate_one_line(text: str, max_chars: int) -> str:
@@ -2225,93 +2018,3 @@ def _migrate_legacy_per_route_episodes(
         return 0
 
 
-def _render_graphify_section(
-    *,
-    graph_rel_path: str,
-    n_nodes: int,
-    n_edges: int,
-    n_communities: int,
-    source: str,
-) -> str:
-    """Format graphify build stats into the body of LOOM.md's
-    ``## Knowledge Graph`` section. Returned text gets the heading
-    added by ``_assemble_markdown``; we just supply the body.
-
-    Why this lives in the REPL (not the annotator): the annotator
-    deliberately doesn't import ``skills/graphify/`` so it stays a
-    standalone module. The REPL owns the cross-package wiring.
-    Takes plain primitives — the caller unpacks the
-    ``GraphifyBuildResult`` so this function has no coupling to the
-    graphify skill's types.
-
-    The body is structured as load-bearing context for the agent:
-    artifact path + counts up top (so the agent knows the graph
-    exists and how big it is) followed by per-tool usage hints (so
-    the agent picks the right call without needing to
-    ``load_skill('graphify')`` first to read the docstrings). That's
-    the whole efficiency win — graph tools become discoverable from
-    the always-injected LOOM.md, not only from the skill listing.
-    """
-    return (
-        f"Pre-built knowledge graph at `{graph_rel_path}` "
-        f"({n_nodes} nodes, {n_edges} edges, "
-        f"{n_communities} communities — generated by "
-        f"graphify, AST-only, deterministic, no LLM cost). "
-        f"Source files discovered via `{source}`.\n\n"
-        "**When to query the graph instead of grepping**:\n"
-        "- `graphify__query(question)` — BFS from nodes matching "
-        "question keywords. Use for *structural* questions like "
-        "\"what's involved in auth\" or \"which symbols touch the "
-        "config loader\" — graph returns the neighbourhood, grep "
-        "returns string hits.\n"
-        "- `graphify__path(a, b)` — shortest path between two named "
-        "concepts. The one graph query grep genuinely can't do: "
-        "\"how does A reach B in this codebase?\".\n"
-        "- `graphify__explain(node)` — one-symbol report (source "
-        "file/line, neighbours, community). Faster than reading the "
-        "file when the user asks \"what is X\".\n"
-        "- `graphify__build(path)` — rebuild from scratch. Already "
-        "run by `/loominit`; only call manually after a large "
-        "refactor (the post-commit hook auto-refreshes every 5 "
-        "commits).\n\n"
-        "**When NOT to use it**: single-file content questions (use "
-        "`read` / `grep`), or asking for raw source text (the graph "
-        "stores *structure*, not bodies). For one-file changes, "
-        "skip the graph entirely — it costs context without adding "
-        "anything."
-    )
-
-
-def _read_pyproject_metadata(repo_root) -> dict[str, str]:
-    """Best-effort read of pyproject.toml ``[project]`` metadata —
-    feeds the annotator's overview prompt. Quiet failure mode:
-    returns ``{}`` on any read/parse error; the annotator handles
-    missing fields gracefully."""
-    import tomllib
-
-    pyproject = repo_root / "pyproject.toml"
-    if not pyproject.exists():
-        return {}
-    try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except (tomllib.TOMLDecodeError, OSError):
-        return {}
-    project = data.get("project", {})
-    if not isinstance(project, dict):
-        return {}
-    out: dict[str, str] = {}
-    for key in ("name", "description"):
-        val = project.get(key)
-        if isinstance(val, str):
-            out[key] = val
-    req = project.get("requires-python")
-    if isinstance(req, str):
-        out["requires_python"] = req
-    return out
-
-
-async def run_repl(project: Project, model: str) -> int:
-    """Entry point for the interactive REPL. Graphify is opt-in
-    via ``/graphify on`` from within the session."""
-    repl = Repl(project, model)
-    return await repl.run()

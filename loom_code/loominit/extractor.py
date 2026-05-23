@@ -20,9 +20,9 @@ private helper in the package into one deterministic pipeline:
 8. :func:`_graph.cluster_by_path_prefix` — group files into
    subsystem clusters with hash buckets for diff-aware refresh.
 
-The result is a :class:`schema.LoomIndex` ready for
-:func:`persistence.save_index` to write to disk. No LLM calls
-anywhere here — slice 1 is deterministic by design.
+The result is a :class:`schema.LoomIndex`, consumed in-memory by
+:mod:`repomap` to render the per-turn repo map. No LLM calls anywhere
+here — the structural pass is deterministic by design.
 """
 
 from __future__ import annotations
@@ -55,9 +55,10 @@ from .schema import (
 def build_index(repo_root: Path) -> LoomIndex:
     """Run the full structural extraction pass and return the index.
 
-    Side effect: NONE. The caller persists via
-    :func:`persistence.save_index`. Keeping I/O separate makes the
-    pipeline trivially testable against in-memory fixtures.
+    Side effect: NONE — returns an in-memory :class:`LoomIndex` that
+    :mod:`repomap` renders into the per-turn repo map. Keeping it
+    I/O-free makes the pipeline trivially testable against in-memory
+    fixtures.
     """
     files = discover_files(repo_root)
     py_files = [f for f in files if f.lang == "python"]

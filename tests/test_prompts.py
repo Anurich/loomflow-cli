@@ -58,29 +58,23 @@ def test_context_file_inlined_in_both_prompts(tmp_path: Path) -> None:
     assert marker in build_coder_prompt(proj)
 
 
-def test_simple_coder_instructs_use_of_loom_md_toc(
+def test_simple_coder_instructs_use_of_repo_map(
     tmp_path: Path,
 ) -> None:
-    """The SIMPLE coder must be told to use the LOOM.md TOC +
-    ``read_loom_section`` tool when answering project-level
-    questions, instead of asking the user to specify a file.
+    """The SIMPLE coder must be told to use the repo map (injected
+    into the system prompt via the ``loom_index`` working block) when
+    answering project-level questions, instead of asking the user to
+    specify a file.
 
-    Without this directive the model receives the TOC in its
-    system prompt (via the agentic LoomRetriever's working block)
-    but doesn't connect 'what is this code about?' to
-    'call read_loom_section(\"overview\")'. Observed failure mode
-    in production: 'check what is this code about?' → 'Please
-    specify the file or snippet of code you want me to check' —
-    despite /loominit having just been run.
-
-    Pin the language so a future prompt rewrite can't silently
-    drop the connection between project-level prompts and the
-    LOOM.md TOC."""
+    Observed failure mode in production: 'what is this code about?' →
+    'Please specify the file or snippet of code you want me to check'
+    — despite the repo map being right there in context. Pin the
+    language so a future prompt rewrite can't silently drop the
+    connection between project-level prompts and the repo map."""
     proj = _proj(tmp_path)
     prompt = build_simple_coder_prompt(proj)
-    assert "LOOM.md section map" in prompt
-    assert "read_loom_section" in prompt
-    # Must explicitly forbid asking the user when the TOC exists.
+    assert "repo map" in prompt.lower()
+    # Must explicitly forbid asking the user when the map exists.
     assert "DO NOT ask the user to specify a file" in prompt
 
 
