@@ -46,18 +46,23 @@ def test_coordinator_has_full_worker_roster(project: Project) -> None:
     assert set(workers) == {"coder", "explorer", "auditor", "reviewer"}
 
 
-def test_coordinator_holds_the_coding_kernel(project: Project) -> None:
-    # The defining property of the unified coordinator: it can do
-    # focused work ITSELF, so it must carry the writer kernel
-    # (read/write/edit/multi_edit/grep/find/ls/bash). Regressing this
-    # collapses it back to a delegate-only router-style coordinator.
+def test_coordinator_is_read_only(project: Project) -> None:
+    # The coordinator is a READ-ONLY supervisor: it has read/grep/ls/
+    # find to understand + answer, but must NOT carry write/edit/bash —
+    # so it can't grind edits itself and MUST delegate every change to
+    # `coder`. Regressing this (handing it the writer kernel) brings
+    # back the "coordinator does everything itself, workers idle" bug.
     coordinator, _ = build_agent(project, model="echo")
     names = _tool_names(coordinator)
-    expected = {
-        "read", "write", "edit", "multi_edit",
-        "grep", "find", "ls", "bash",
-    }
-    assert expected <= names, f"missing coding tools: {expected - names}"
+    assert {"read", "grep", "ls", "find"} <= names, (
+        f"coordinator missing read-only tools: "
+        f"{ {'read','grep','ls','find'} - names }"
+    )
+    writers = {"write", "edit", "multi_edit", "bash"}
+    assert not (writers & names), (
+        f"coordinator must NOT hold writer/exec tools (found "
+        f"{writers & names}) — those belong to the coder worker"
+    )
 
 
 def test_build_agent_creates_loom_dir(project: Project) -> None:

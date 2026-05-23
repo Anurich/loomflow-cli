@@ -230,6 +230,52 @@ def test_multi_edit_applies_all_atomically(tmp_path: Path) -> None:
     assert f.read_text() == "a = 100\nb = 200\nc = 300\n"
 
 
+def test_multi_edit_flexible_whitespace_match(tmp_path: Path) -> None:
+    """When old_string is right except for indentation (the #1
+    cause of 'old_string not found'), multi_edit finds the unique
+    block ignoring whitespace, re-indents new_string to the file's
+    actual indent, and applies — instead of rejecting + spinning."""
+    f = tmp_path / "m.py"
+    f.write_text("def f():\n    x = 1\n    return x\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {
+                    # model dropped the 4-space indent on both lines
+                    "old_string": "x = 1\nreturn x",
+                    "new_string": "x = 2\nreturn x * 2",
+                }
+            ],
+        )
+    )
+    assert "✓ applied" in result, result
+    # re-indented to the file's 4-space block
+    assert f.read_text() == "def f():\n    x = 2\n    return x * 2\n"
+
+
+def test_multi_edit_ambiguous_flexible_match_errors(tmp_path: Path) -> None:
+    """If the whitespace-flexible match isn't unique, multi_edit must
+    NOT guess — it errors and writes nothing (safety: never edit the
+    wrong one of two near-identical blocks)."""
+    f = tmp_path / "m.py"
+    # same block at two indents → 2 flexible hits → ambiguous
+    f.write_text("  a = 1\n  b = 2\n\n    a = 1\n    b = 2\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[{"old_string": "a = 1\nb = 2", "new_string": "X"}],
+        )
+    )
+    assert result.startswith("ERROR"), result
+    # file untouched
+    assert f.read_text() == "  a = 1\n  b = 2\n\n    a = 1\n    b = 2\n"
+
+
 def test_multi_edit_atomic_failure_writes_nothing(
     tmp_path: Path,
 ) -> None:

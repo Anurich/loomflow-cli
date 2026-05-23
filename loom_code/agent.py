@@ -5,12 +5,15 @@ together. Everything here is configuration — no agent-loop logic,
 no tool implementations, no memory logic. If this file ever grows
 real behaviour, that behaviour belongs in loomflow.
 
-loom-code is a single ``Team.supervisor`` whose coordinator holds
-the full coding kernel AND a ``delegate`` tool. It decides inline —
-as a tool choice, after it has begun reading — whether to do
-focused work itself or to delegate multi-file / parallel work to a
-roster of worker Agents (``coder``, ``explorer``, ``auditor``,
-``reviewer`` — see :mod:`loom_code.workers`). ``Team.supervisor``
+loom-code is a single ``Team.supervisor``. The coordinator is a
+READ-ONLY tech lead: it has ``read``/``grep``/``ls``/``find``/
+``web_fetch`` to understand the code and answer questions, plus a
+``delegate`` tool — but NO writer/exec tools. So it plans, tracks,
+and manages, and hands every change (writes/edits) to ``coder`` and
+every test-run to ``reviewer``, with ``explorer``/``auditor`` for
+investigation (see :mod:`loom_code.workers`). Removing the writer
+kernel from the coordinator is deliberate: with it, the model just
+grinds edits itself and leaves the workers idle. ``Team.supervisor``
 returns a plain ``Agent``, so the rest of loom-code (REPL, CLI,
 renderer) treats it exactly like any agent.
 """
@@ -21,13 +24,11 @@ from collections.abc import Awaitable, Callable
 from importlib.resources import files as _pkg_files
 from pathlib import Path
 
-from loomflow import Agent, StandardPermissions
+from loomflow import Agent
 from loomflow.team import Team
-from loomflow.tools import bash_tool, find_tool, ls_tool, read_tool, write_tool
+from loomflow.tools import find_tool, ls_tool, read_tool
 from loomflow.workspace import LocalDiskWorkspace
 
-from .edit_tool import multi_edit_tool
-from .edit_tool import verifying_edit_tool as edit_tool
 from .extensions import Extensions, safe_role_name
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .hooks import attach_tool_hooks
@@ -76,7 +77,7 @@ def build_agent(
     approval_handler: Callable[..., Awaitable[bool]] | None = None,
     max_turns: int = 100,
     web_backend: str | None = None,
-    max_stop_hook_iterations: int = 0,
+    max_stop_hook_iterations: int = 2,
     snip_window: int = 8,
     auto_compact: bool = True,
     tool_result_summarizer: str | None = None,
@@ -90,25 +91,25 @@ def build_agent(
     handle to drive the self-improvement loop
     (``attribute_outcome`` after a run, ``prune`` for retention).
 
-    The coordinator holds the FULL coding kernel itself
-    (read/write/edit/multi_edit/grep/find/ls/bash/web) *and* a
-    ``delegate`` tool. The model decides inline — as a tool choice,
-    after it has begun reading — whether to do focused / single-file
-    work itself or to ``delegate`` multi-file / parallel work to the
-    worker roster. This mirrors how Claude Code / Cursor / Copilot
-    dispatch (one adaptive loop + delegation) and rides loomflow's
-    ``delegate`` → ``SubagentInvocation`` path, which streams worker
-    events to the parent and rolls up their token cost.
+    The coordinator is READ-ONLY: it holds ``read``/``grep``/``ls``/
+    ``find``/``web_fetch`` (+ ``delegate``) to understand the code
+    and answer questions, but has NO ``write``/``edit``/``bash`` —
+    so it CANNOT make changes itself and MUST delegate every
+    mutation to a worker. It rides loomflow's ``delegate`` →
+    ``SubagentInvocation`` path, which streams worker events to the
+    parent and rolls up their token cost. (Giving the coordinator
+    the writer kernel was tried and reverted: the model just ground
+    edits itself and never delegated, leaving the roster idle.)
 
     The whole brain in one builder call:
 
     * **workers** — the delegate roster (:func:`build_workers`):
-      ``coder`` (full file-and-shell kernel), plus read-only
-      ``explorer`` / ``auditor`` / ``reviewer``. Custom
+      ``coder`` (the ONLY writer — full file-and-shell kernel), plus
+      read-only ``explorer`` / ``auditor`` / ``reviewer``. Custom
       ``.loom/agents/*.md`` join as additional delegate workers.
-    * **coordinator** — ``Team.supervisor`` with the coding kernel
-      on ``tools=``; owns the living plan; delegates when work is
-      genuinely parallel / multi-file, otherwise does it itself.
+    * **coordinator** — ``Team.supervisor`` with read-only ``tools=``;
+      owns the living plan; plans, tracks, and delegates all writes
+      to ``coder`` and verification to ``reviewer``.
     * **living_plan** — on the coordinator; mirrors to the
       workspace so plans persist across sessions.
     * **workspace** — ``<root>/.loom/notebook`` — shared notebook,
@@ -187,29 +188,35 @@ def build_agent(
             effort=effort,
         )
 
-    # The coordinator's OWN tool kernel — the full writer surface, so
-    # it can do single-file work itself instead of always delegating.
+    # The coordinator is READ-ONLY: it reads to understand + answers
+    # questions, but has NO writer/exec tools — so it CANNOT grind
+    # edits itself and MUST delegate every change to ``coder`` (and
+    # test-runs to ``reviewer``). Removing the writer kernel is what
+    # stops the coordinator doing everything itself and leaving the
+    # worker roster idle — a prompt nudge alone didn't hold.
     root = project.root
     coordinator_tools: list[object] = [
         read_tool(root),
-        write_tool(root),
-        edit_tool(root),
-        multi_edit_tool(root),
         grep_tool(root),
         find_tool(root),
         ls_tool(root),
-        bash_tool(root, timeout=300.0),
         web_fetch_tool(),
     ]
     if web_backend is not None:
         from loomflow.tools import web_tool
         coordinator_tools.append(web_tool(backend=web_backend))
 
-    # ``max_stop_hook_iterations`` bounds the framework Ralph loop.
-    # Default 0 (2026-05): hooks NEVER re-prompt — when the model
-    # emits a final answer the run is OVER (Claude-Code-shaped). The
-    # living plan is a tracking aid, not a contract forcing
-    # continuation. ``/set_continue_cap`` exposes the knob.
+    # ``max_stop_hook_iterations`` bounds the framework Ralph loop:
+    # while the LivingPlan still has todo/doing steps after the model
+    # stops, the StopHook re-prompts it to continue — up to this many
+    # times. The cap only bites when the agent is STUCK (a converging
+    # task drains its plan before hitting it), so keep it LOW: a high
+    # value just re-prompts a confused model into a re-planning spin
+    # (observed: 8 → the model re-plans + re-asks for input it already
+    # has, 650k tokens). Default 2 — one or two continuation nudges,
+    # then stop. In-turn persistence (the "own the run" prompt rule)
+    # is the primary mechanism; this is just a small safety net.
+    # ``/set_continue_cap`` tunes it per session.
     coordinator = Team.supervisor(
         workers=workers,
         instructions=build_unified_coordinator_instructions(project),
@@ -227,15 +234,15 @@ def build_agent(
         auto_compact_at_tokens=auto_compact_at_tokens,
         effort=effort,
         persist_tool_transcripts=True,
-        # The coordinator executes destructive tools itself, so it
-        # needs the permission gate + approval bridge.
-        permissions=StandardPermissions(),
-        approval_handler=approval_handler,
+        # No permissions/approval on the coordinator — its tools are
+        # read-only. The destructive-tool gate + approval bridge live
+        # on the workers (coder/reviewer), where edits and bash run.
     )
 
-    # Tool hooks attach to every agent that executes tools against the
-    # codebase — the coordinator (it does work itself) plus all
-    # workers. No-op (fast-hooks path intact) when none are declared.
+    # Tool hooks attach to every agent that touches the codebase. The
+    # coordinator only reads, but a user PreToolUse hook can match
+    # ``read``/``grep`` too, so keep it in the set; the workers (which
+    # write + run bash) are the main target. No-op when none declared.
     for tool_agent in (coordinator, *workers.values()):
         attach_tool_hooks(
             tool_agent, extensions.hook_specs, cwd=project.root

@@ -5,12 +5,11 @@ Before loomflow 0.10.17, the destructive flag dropped between
 (179 LOC, fully built) silently never fired — every write/edit/bash
 auto-approved. 0.10.17 fixes the framework's propagation chain;
 this test pins the loom-code-side wiring so a future edit to
-``build_agent`` / ``build_workers`` can't silently drop
-``permissions=`` or ``approval_handler=`` and re-introduce the
-auto-approve regression.
+``build_workers`` can't silently drop ``permissions=`` or
+``approval_handler=`` and re-introduce the auto-approve regression.
 
-Targets the unified coordinator (``build_agent``): it now holds the
-destructive tools itself, so its gate is the one that matters.
+Targets the ``coder`` worker: the coordinator is read-only, so the
+destructive tools (and their approval gate) live on ``coder``.
 
 Doesn't run a real model or a TTY — uses ``ScriptedModel`` to
 emit a canned ``edit`` tool call and a recording handler that
@@ -25,8 +24,8 @@ import pytest
 from loomflow import ScriptedModel, ScriptedTurn
 from loomflow.core.types import ToolCall
 
-from loom_code.agent import build_agent
 from loom_code.project import Project
+from loom_code.workers import build_workers
 
 pytestmark = pytest.mark.anyio
 
@@ -41,12 +40,23 @@ def project(tmp_path: Path) -> Project:
     )
 
 
-async def test_coordinator_consults_approval_handler_on_edit(
+def _coder(project: Project, scripted: ScriptedModel, handler: object):
+    # build_workers takes a precomputed ``auto_compact_at_tokens`` (we
+    # leave it None) so it never calls context_window_for on the
+    # scripted model — which has no str name to lower().
+    return build_workers(
+        project,
+        model=scripted,  # type: ignore[arg-type]
+        approval_handler=handler,  # type: ignore[arg-type]
+    )["coder"]
+
+
+async def test_coder_consults_approval_handler_on_edit(
     project: Project, tmp_path: Path
 ) -> None:
-    """The coordinator routes a destructive ``edit`` call through the
-    provided ``approval_handler``. Recorder captures the call;
-    returning True approves and the edit actually runs."""
+    """The coder routes a destructive ``edit`` through the provided
+    ``approval_handler``. Recorder captures the call; returning True
+    approves and the edit actually runs."""
     target = tmp_path / "foo.py"
     target.write_text("def hello():\n    return 'world'\n")
 
@@ -76,14 +86,9 @@ async def test_coordinator_consults_approval_handler_on_edit(
             ScriptedTurn(text="done"),
         ]
     )
-    coordinator, _ = build_agent(
-        project,
-        model=scripted,  # type: ignore[arg-type]
-        approval_handler=recording_handler,
-        auto_compact=False,  # context_window_for needs a str model name
-    )
+    coder = _coder(project, scripted, recording_handler)
 
-    await coordinator.run("edit foo.py")
+    await coder.run("edit foo.py")
 
     # Gate consulted exactly once with the right call.
     assert len(handler_calls) == 1, (
@@ -95,7 +100,7 @@ async def test_coordinator_consults_approval_handler_on_edit(
     assert "loomflow" in target.read_text()
 
 
-async def test_coordinator_denial_blocks_the_edit(
+async def test_coder_denial_blocks_the_edit(
     project: Project, tmp_path: Path
 ) -> None:
     """Handler returning False MUST prevent the tool from running.
@@ -128,14 +133,9 @@ async def test_coordinator_denial_blocks_the_edit(
             ScriptedTurn(text="done"),
         ]
     )
-    coordinator, _ = build_agent(
-        project,
-        model=scripted,  # type: ignore[arg-type]
-        approval_handler=deny_handler,
-        auto_compact=False,  # context_window_for needs a str model name
-    )
+    coder = _coder(project, scripted, deny_handler)
 
-    await coordinator.run("edit foo.py")
+    await coder.run("edit foo.py")
     assert target.read_text() == original, (
         "denied edit still ran — gate is decorative, not enforcing"
     )
@@ -168,14 +168,9 @@ async def test_read_only_call_bypasses_handler(
             ScriptedTurn(text="done"),
         ]
     )
-    coordinator, _ = build_agent(
-        project,
-        model=scripted,  # type: ignore[arg-type]
-        approval_handler=recorder,
-        auto_compact=False,  # context_window_for needs a str model name
-    )
+    coder = _coder(project, scripted, recorder)
 
-    await coordinator.run("read foo.py")
+    await coder.run("read foo.py")
     assert handler_calls == [], (
         "handler called for non-destructive read — would spam the "
         "user with prompts for every read/grep/find/ls"

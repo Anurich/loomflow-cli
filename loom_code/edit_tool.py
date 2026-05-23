@@ -307,6 +307,61 @@ def _coerce_edits(value: Any) -> list[dict[str, str]] | str:
     return out
 
 
+def _leading_ws(s: str) -> str:
+    """Leading whitespace of the first non-blank line of ``s``."""
+    for line in s.split("\n"):
+        if line.strip():
+            return line[: len(line) - len(line.lstrip())]
+    return ""
+
+
+def _flexible_apply(working: str, old: str, new: str) -> str | None:
+    """Whitespace-tolerant fallback for when ``old`` doesn't match
+    ``working`` byte-for-byte.
+
+    The #1 cause of "old_string not found" is a model that copied the
+    code with slightly wrong indentation / trailing whitespace. So:
+    locate the UNIQUE contiguous block whose lines equal ``old``'s
+    lines *ignoring per-line leading/trailing whitespace*. If exactly
+    one such block exists, re-indent ``new`` from ``old``'s base
+    indent to the file block's actual indent and splice it in.
+
+    Returns the edited text, or ``None`` when there's no match or it's
+    ambiguous (>1) — the caller then errors. Only ever used after an
+    exact match fails, and only when the match is unique, so it can't
+    silently edit the wrong place.
+    """
+    if old == "":
+        return None
+    h_lines = working.split("\n")
+    n_lines = old.split("\n")
+    target = [ln.strip() for ln in n_lines]
+    hits: list[int] = []
+    span = len(n_lines)
+    for i in range(0, len(h_lines) - span + 1):
+        if [ln.strip() for ln in h_lines[i : i + span]] == target:
+            hits.append(i)
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    matched = "\n".join(h_lines[i : i + span])
+    # Re-indent ``new`` from old's base indent to the file block's,
+    # so a model that under/over-indented its old_string doesn't
+    # leave the replacement mis-indented (would break .py).
+    old_base = _leading_ws(old)
+    file_base = _leading_ws(matched)
+    new_lines = new.split("\n")
+    if old_base != file_base:
+        new_lines = [
+            (file_base + ln[len(old_base):])
+            if ln.startswith(old_base)
+            else ln
+            for ln in new_lines
+        ]
+    edited = h_lines[:i] + new_lines + h_lines[i + span:]
+    return "\n".join(edited)
+
+
 def multi_edit_tool(workdir: Path | str) -> Tool:
     """Build the loom-code ``multi_edit`` tool — apply MANY edits to
     ONE file in a single ATOMIC call.
@@ -369,12 +424,21 @@ def multi_edit_tool(workdir: Path | str) -> Tool:
             )
             count = working.count(old)
             if count == 0:
+                # Exact match failed — try whitespace-flexible match
+                # (rescues an old_string that's right except for
+                # indentation / trailing space, the common failure).
+                flexed = _flexible_apply(working, old, new)
+                if flexed is not None:
+                    working = flexed
+                    continue
                 return (
                     f"ERROR: edit #{i + 1} old_string not found in "
-                    f"{path} (after applying edits 1..{i}). It must "
-                    "match EXACTLY (whitespace, indentation, line "
-                    "breaks). NOTHING was written — fix this edit "
-                    "and resubmit the whole batch."
+                    f"{path} (after applying edits 1..{i}) — not even "
+                    "with whitespace-flexible matching, so it's either "
+                    "absent or appears in multiple near-identical "
+                    "spots. Re-`read` the exact lines and copy them "
+                    "verbatim (with more surrounding context if it's "
+                    "ambiguous). NOTHING was written."
                 )
             if count > 1 and not replace_all:
                 return (
