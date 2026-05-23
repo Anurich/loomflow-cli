@@ -227,20 +227,35 @@ def verifying_edit_tool(workdir: Path | str) -> Tool:
     )(edit)
 
 
+def _loads_lenient(text: str) -> Any:
+    """Parse a model-serialised string into a Python object, tolerating
+    BOTH JSON (double quotes) and Python-repr (single quotes) — weak
+    models emit either, and ``json.loads`` rejects the single-quote
+    form. Raises ``ValueError`` when neither parses."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError) as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def _coerce_edits(value: Any) -> list[dict[str, str]] | str:
     """Coerce the model's serialisation of the ``edits`` list into
     a native list of ``{old_string, new_string}`` dicts. Returns
     the list, or an error string the tool returns verbatim.
 
     Weak models serialise list-of-objects args inconsistently — a
-    JSON string, a list of JSON strings, a dict with an ``edits``
-    key — so we salvage every shape, same lenient approach
-    ``plan_write`` uses for its ``steps`` arg.
+    JSON string, a list of JSON strings, a Python-repr (single-quote)
+    string, a dict with an ``edits`` key — so we salvage every shape,
+    same lenient approach ``plan_write`` uses for its ``steps`` arg.
     """
     if isinstance(value, str):
         try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
+            value = _loads_lenient(value)
+        except ValueError:
             return (
                 "ERROR: `edits` must be a list of "
                 "{old_string, new_string} objects (or a JSON "
@@ -259,8 +274,8 @@ def _coerce_edits(value: Any) -> list[dict[str, str]] | str:
     for i, item in enumerate(value):
         if isinstance(item, str):
             try:
-                item = json.loads(item)
-            except json.JSONDecodeError:
+                item = _loads_lenient(item)
+            except ValueError:
                 return (
                     f"ERROR: edit #{i + 1} is a string that isn't "
                     "valid JSON. Each edit must be an object with "

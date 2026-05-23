@@ -315,6 +315,13 @@ in your report.
    ASK in your report rather than inventing a command. Never
    report done on a red check.
 
+   **A tool result that starts with `ERROR:` means the action
+   FAILED and NOTHING changed** — never say the edit/command
+   succeeded. This is most common with `multi_edit` when the
+   model mis-serialises `edits`: fix the input and retry, or
+   report the failure plainly. Re-`read` the file to confirm your
+   change is actually on disk before claiming it.
+
    If the test environment seems broken (missing deps, wrong
    Python version, import errors before your tests even run) —
    that's NOT yours to fix. Do NOT start `pip install`-ing or
@@ -566,6 +573,10 @@ structurally cannot do this well.
 6. **Make the change, then verify.** Edit, then run the project's
    own test runner (pytest / npm test / make test / cargo test /
    go test). Report what you changed and what verified.
+   **A tool result starting with `ERROR:` means it FAILED and
+   nothing changed** — never claim the edit succeeded. Fix the
+   input (e.g. a mis-serialised `multi_edit`) and retry, or report
+   the failure; re-`read` the file to confirm before claiming it.
 
 7. **Don't iterate forever.** If a fix fails twice the same way,
    stop and report — diagnose what's wrong, ask the user, don't

@@ -292,6 +292,39 @@ def test_multi_edit_json_string_edits_arg(tmp_path: Path) -> None:
     assert f.read_text() == "p = 2\n"
 
 
+def test_multi_edit_python_repr_edits_salvaged(tmp_path: Path) -> None:
+    """Weak models sometimes emit the edits as a Python-repr string
+    (single quotes) or mix a single-quoted edit into the list — which
+    ``json.loads`` rejects. The ``ast.literal_eval`` fallback salvages
+    both shapes instead of failing the whole batch."""
+    f = tmp_path / "m.py"
+    f.write_text("a = 1\nb = 2\n")
+    tool = multi_edit_tool(tmp_path)
+
+    # Whole edits arg as a single-quoted Python-repr string.
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits="[{'old_string': 'a = 1', 'new_string': 'a = 9'}]",
+        )
+    )
+    assert "applied 1 edit" in result, result
+    assert "a = 9" in f.read_text()
+
+    # A single-quoted edit element mixed into a native list.
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {"old_string": "b = 2", "new_string": "b = 8"},
+                "{'old_string': 'a = 9', 'new_string': 'a = 7'}",
+            ],
+        )
+    )
+    assert "applied 2 edit" in result, result
+    assert "a = 7" in f.read_text() and "b = 8" in f.read_text()
+
+
 def test_multi_edit_replace_all_per_edit(tmp_path: Path) -> None:
     """A single edit in the batch can set replace_all to hit every
     occurrence; without it, a multi-match edit fails the batch."""
