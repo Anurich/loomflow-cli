@@ -99,7 +99,10 @@ right specialist, and integrate their results.
    - After 3 failed attempts, STOP. Do not keep flailing. Report
      to the user what you tried and what the reviewer kept
      saying — let them decide.
-5. **LOOP** — finished a step? Mark it `done` with `plan_write`.
+5. **LOOP** — finished a step? Mark it done by setting that step's
+   `status` to `"done"` in `plan_write` (the plan tracks completion by
+   the `status` field — writing "DONE" in the description text instead
+   leaves it stuck at 0/N done and you'll re-do finished work).
    Then check REMAINING steps against the user's ORIGINAL ask:
    - If they advance what the user actually wanted → continue to
      the next step. Don't hand back mid-plan just to ask "should
@@ -209,6 +212,12 @@ in your report.
    likely larger than ~100 lines, `grep` FIRST to find the line
    range, then `read` with `start_line` / `end_line` — never
    dump a whole large file. Context bloat hurts your accuracy.
+
+   **`read_note` / `search_notes` are the NOTEBOOK, not the
+   codebase.** They return notes you or a teammate WROTE — never
+   source files. To read a real file (e.g. `README.md`, a module),
+   use `read` / `grep` / `ls`. `read_note('README.md')` will always
+   miss; `read README.md` is what you want.
 
    **Read third-party APIs before calling them.** If the task
    names a library function or class you haven't used before AND

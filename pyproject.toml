@@ -35,7 +35,7 @@ dependencies = [
     # without disabling fact extraction. Loom-code relies on
     # this — without it the previous explicit auto_extract=False
     # band-aid would have to come back.
-    "loomflow[litellm,web]>=0.10.21",
+    "loomflow[litellm,web]>=0.10.22",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user
