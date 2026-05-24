@@ -160,6 +160,7 @@ def _flatten_exception_group(
 # no need to also update the autocomplete separately.
 _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/help", "show all commands"),
+    ("/init-loom", "create a starter AGENTS.md rules file"),
     ("/plan", "show the current plan, or start one"),
     ("/cost", "session cost + token totals"),
     ("/good", "mark the last turn useful (credit notes)"),
@@ -847,6 +848,23 @@ class Repl:
             return False
         if cmd == "/help":
             console.print(_SLASH_HELP)
+        elif cmd == "/init-loom":
+            from .rules import init_agents_md
+
+            path, created = init_agents_md(self.project.root)
+            if created:
+                console.print(
+                    f"[green]created {path.name}[/green] — a starter "
+                    "rules file loom-code reads every session. Edit it, "
+                    'or just state rules in chat (e.g. "never edit X") '
+                    "and loom-code will save them here."
+                )
+            else:
+                console.print(
+                    f"[dim]{path.name} already exists — loom-code "
+                    "already reads it. Edit it directly, or state rules "
+                    "in chat.[/dim]"
+                )
         elif cmd == "/plan":
             if arg:
                 # "/plan <task>" reads as "plan and do <task>" — run

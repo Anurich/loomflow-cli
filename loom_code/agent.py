@@ -34,6 +34,7 @@ from .grep_tool import enhanced_grep_tool as grep_tool
 from .hooks import attach_tool_hooks
 from .project import Project
 from .prompts import build_unified_coordinator_instructions
+from .rules import remember_rule_tool
 from .trust import discover_trusted
 from .web_fetch import web_fetch_tool
 from .workers import (
@@ -201,6 +202,10 @@ def build_agent(
         find_tool(root),
         ls_tool(root),
         web_fetch_tool(),
+        # Lets the coordinator persist a durable, user-stated rule to
+        # AGENTS.md (always-in-prompt next session) instead of trusting
+        # probabilistic recall. See loom_code.rules.
+        remember_rule_tool(root),
     ]
     if web_backend is not None:
         from loomflow.tools import web_tool
