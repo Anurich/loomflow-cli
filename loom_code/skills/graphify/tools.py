@@ -171,7 +171,7 @@ def _load_graph(project_root: Path | str) -> Any:
             "project."
         )
     from networkx.readwrite import json_graph
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     return json_graph.node_link_graph(data, edges="links")
 
 

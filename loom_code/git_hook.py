@@ -65,7 +65,7 @@ def _git_hooks_dir(project_root: Path) -> Path | None:
 def _resolve_dotgit_file(git_file: Path) -> Path:
     """Worktrees + submodules: ``.git`` is a regular file with a
     ``gitdir: <abs path>`` pointer. Follow it to the real git dir."""
-    text = git_file.read_text().strip()
+    text = git_file.read_text(encoding="utf-8").strip()
     for line in text.splitlines():
         if line.startswith("gitdir:"):
             return Path(line.split(":", 1)[1].strip())
@@ -81,7 +81,7 @@ def is_installed(project_root: Path) -> bool:
     hook_path = hooks_dir / _HOOK_NAME
     if not hook_path.is_file():
         return False
-    return _MARKER in hook_path.read_text()
+    return _MARKER in hook_path.read_text(encoding="utf-8")
 
 
 def install(project_root: Path) -> str:
@@ -119,7 +119,7 @@ def install(project_root: Path) -> str:
 
     updated = False
     if hook_path.is_file():
-        existing = hook_path.read_text()
+        existing = hook_path.read_text(encoding="utf-8")
         if _MARKER in existing:
             # Replace the existing section.
             existing = _strip_loomcode_section(existing)
@@ -130,7 +130,7 @@ def install(project_root: Path) -> str:
         new_content = "#!/bin/sh\n" + loomcode_block
 
     try:
-        hook_path.write_text(new_content)
+        hook_path.write_text(new_content, encoding="utf-8")
         # Mark executable (mode 0o755) — git won't run a hook
         # without +x on POSIX.
         st = hook_path.stat()
@@ -151,7 +151,7 @@ def uninstall(project_root: Path) -> str:
     hook_path = hooks_dir / _HOOK_NAME
     if not hook_path.is_file():
         return "not present"
-    existing = hook_path.read_text()
+    existing = hook_path.read_text(encoding="utf-8")
     if _MARKER not in existing:
         return "not present"
     stripped = _strip_loomcode_section(existing)
@@ -164,7 +164,7 @@ def uninstall(project_root: Path) -> str:
             return f"skipped: unlink failed: {exc}"
     else:
         try:
-            hook_path.write_text(stripped)
+            hook_path.write_text(stripped, encoding="utf-8")
         except OSError as exc:
             return f"skipped: write failed: {exc}"
     return "removed"

@@ -105,9 +105,11 @@ in your report.
    use `web_fetch(url=...)` — it returns the body as text and
    auto-rewrites GitHub blob URLs to raw. For a FULL repo clone
    clone into a TEMP dir, NEVER the project root: `bash git clone
-   <url> "$(mktemp -d)/<name>"` (or any path under `/tmp`), then
-   inspect via `bash cat`/`bash grep` (your `read`/`grep` tools are
-   scoped to the project root and cannot reach `/tmp`). **Clean up
+   <url> "$(mktemp -d)/<name>"` — `mktemp -d` resolves to the OS temp
+   dir (`/tmp` on macOS/Linux, `%TEMP%` on Windows), so don't hardcode
+   `/tmp`. Then inspect via `bash cat`/`bash grep` (your `read`/`grep`
+   tools are scoped to the project root and cannot reach the temp dir).
+   **Clean up
    when done** — `bash rm -rf <that-temp-dir>` once you've extracted
    what you need, so the clone doesn't linger. Cloning into the
    working tree pollutes the user's repo; don't. Never substitute
@@ -125,7 +127,7 @@ in your report.
      returns JSON with file names + raw download URLs in one
      call. (The contents-API URL is printed in the directive
      error you get when you fetch a `/tree/` page — copy it.)
-   - File system (under `/tmp/<clone>`): `bash ls <parent-dir>`
+   - File system (under the temp clone dir): `bash ls <parent-dir>`
      or `bash find <root> -name <pattern>`.
    - Arbitrary HTTP: `bash curl -sL <parent-url>` and skim the
      link list.
@@ -517,7 +519,7 @@ into each delegation.
 - **Exploring a remote repo? Use the GitHub contents API — do NOT
   use `find`/`ls` and do NOT reflexively `git clone`.**
   `find`/`grep`/`ls`/`read` only see THIS project's files; they
-  CANNOT see a GitHub repo, a URL, or a `/tmp` clone (they error
+  CANNOT see a GitHub repo, a URL, or a temp-dir clone (they error
   "escapes workdir"). So "explore github.com/x/y" is NEVER answered
   by `find examples/*`. The reliable path needs only `web_fetch`,
   no clone:
@@ -530,7 +532,7 @@ into each delegation.
   HTML) and returns these exact next steps — follow them. You can
   `web_fetch` the contents API + raw files yourself. For a FULL
   clone (the whole tree at once), DELEGATE to `coder` — only its
-  `bash` can `git clone` and read `/tmp`; your read-only tools
+  `bash` can `git clone` and read the temp dir; your read-only tools
   can't. Heavy remote exploration should be delegated so the bulk
   lands in the worker's context, not yours.
 - **Structural cross-file questions → the `graphify` skill.** For

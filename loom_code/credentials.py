@@ -52,7 +52,7 @@ def load_credentials() -> None:
     """
     if not _CREDENTIALS_FILE.exists():
         return
-    for raw in _CREDENTIALS_FILE.read_text().splitlines():
+    for raw in _CREDENTIALS_FILE.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -74,7 +74,7 @@ def save_credential(name: str, value: str) -> None:
     out: list[str] = []
     replaced = False
     if _CREDENTIALS_FILE.exists():
-        for raw in _CREDENTIALS_FILE.read_text().splitlines():
+        for raw in _CREDENTIALS_FILE.read_text(encoding="utf-8").splitlines():
             stripped = raw.strip()
             if (
                 stripped
@@ -88,10 +88,13 @@ def save_credential(name: str, value: str) -> None:
                 out.append(raw)
     if not replaced:
         out.append(f"{name}={value}")
-    _CREDENTIALS_FILE.write_text("\n".join(out) + "\n")
+    _CREDENTIALS_FILE.write_text("\n".join(out) + "\n", encoding="utf-8")
     # User-only read/write; cheap defence vs. accidental world-
-    # readability (e.g. if HOME ends up shared).
-    _CREDENTIALS_FILE.chmod(0o600)
+    # readability (e.g. if HOME ends up shared). POSIX-only — on
+    # Windows chmod can't express owner-only perms (the file inherits
+    # NTFS ACLs from the user profile dir, which is already private).
+    if os.name == "posix":
+        _CREDENTIALS_FILE.chmod(0o600)
 
 
 def required_env_for_model(model: str) -> str | None:
