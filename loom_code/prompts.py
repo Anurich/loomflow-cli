@@ -290,16 +290,23 @@ _CITATION_HINT = (
 )
 
 
-def _project_context_block(project: Project) -> str:
+def _project_context_block(
+    project: Project, *, include_context_file: bool = True
+) -> str:
     """The git/no-git hint plus the inlined project context file
-    (if any). Shared by the coordinator and the coder — both need
-    to know the repo shape and the house rules."""
+    (if any). Shared by the coordinator and the coder.
+
+    ``include_context_file=False`` skips the static context-file bake —
+    used by the coordinator, which instead receives the rules file FRESH
+    each turn via the ``project_rules`` working block (so mid-session
+    edits to AGENTS.md apply without a restart). The coder keeps the
+    static bake (``True``); the coordinator gatekeeps delegations."""
     parts: list[str] = []
     if project.is_git:
         parts.append(_GIT_HINT.format(root=project.root))
     else:
         parts.append(_NO_GIT_HINT.format(root=project.root))
-    if project.context_text:
+    if include_context_file and project.context_text:
         rel = (
             project.context_file.name
             if project.context_file
@@ -548,7 +555,11 @@ def build_unified_coordinator_instructions(project: Project) -> str:
     multi-file / parallel work to the worker team. Merges the
     delegation roster from the router-mode coordinator with the
     coding discipline from SIMPLE mode."""
-    return _UNIFIED_COORDINATOR + _project_context_block(project)
+    # Coordinator gets the rules file FRESH each turn via the
+    # ``project_rules`` working block (auto-reload), so it's skipped here.
+    return _UNIFIED_COORDINATOR + _project_context_block(
+        project, include_context_file=False
+    )
 
 
 def build_coder_prompt(project: Project, *, has_web: bool = False) -> str:

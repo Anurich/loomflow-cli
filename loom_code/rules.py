@@ -91,6 +91,29 @@ def current_rules_text(root: Path | str) -> str:
         return ""
 
 
+def project_rules_block(root: Path | str) -> str:
+    """Framed body for the per-turn ``project_rules`` working block.
+
+    The active rules file, re-read FRESH each turn so a mid-session edit
+    applies on the next turn (no restart) — unlike the static
+    startup-baked path. Empty string when there's no rules file."""
+    fp = detect_rules_file(root)
+    if fp is None:
+        return ""
+    try:
+        text = fp.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    return (
+        f"# Project rules ({fp.name})\n"
+        "House rules for this project — conventions, and things to do or "
+        "AVOID. Follow them in everything you do and delegate.\n\n"
+        f"{text}"
+    )
+
+
 def init_agents_md(root: Path | str) -> tuple[Path, bool]:
     """Create a starter ``AGENTS.md`` if the repo has no context file.
 

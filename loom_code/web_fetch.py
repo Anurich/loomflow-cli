@@ -46,15 +46,26 @@ from typing import Any
 
 from loomflow import Tool
 
+# Cap the TEXT returned to the model — distinct from the 5MB byte cap on
+# the raw HTTP response. A large page (or a giant HTML *error* page) must
+# never blow the context window: a single uncapped fetch of a ~1MB 404
+# page once hit ~261k tokens and crashed a 200k-window model. 100KB
+# matches Claude Code's WebFetch text cap. Error (non-2xx) bodies are
+# rarely useful content, so they get a much smaller snippet.
+_MAX_RESULT_CHARS = 100_000
+_MAX_ERROR_CHARS = 4_000
+
 _TOOL_DESCRIPTION = (
     "Fetch the body of an HTTPS URL and return it as text. Use "
     "for READMEs, raw source files on GitHub, documentation "
     "pages, JSON/YAML configs. For a full repository prefer "
     "`git clone` via bash. GitHub blob URLs are auto-rewritten "
     "to raw URLs so you can paste the human URL and get file "
-    "content. Responses over 5MB are rejected. Returns the body "
-    "as a string prefixed with status + final URL; errors come "
-    "back as `ERROR: ...` strings, not exceptions."
+    "content. Responses over 5MB are rejected; larger pages are "
+    "truncated to ~100KB of text (fetch a more specific URL for the "
+    "part you need). Returns the body as a string prefixed with "
+    "status + final URL; errors come back as `ERROR: ...` strings, "
+    "not exceptions."
 )
 
 _URL_SCHEMA: dict[str, Any] = {
@@ -234,6 +245,23 @@ def web_fetch_tool(
                 f"more specific URL."
             )
 
+        # Cap the body BEFORE it enters the conversation (where it gets
+        # re-sent every turn). Successful pages truncate at 100KB; error
+        # pages (non-2xx) get a small snippet since the body is an error
+        # page, not content the model needs.
+        body = r.text
+        ok = 200 <= r.status_code < 300
+        cap = _MAX_RESULT_CHARS if ok else _MAX_ERROR_CHARS
+        if len(body) > cap:
+            omitted = len(body) - cap
+            reason = "page too large" if ok else "error page"
+            body = (
+                body[:cap]
+                + f"\n\n… [{reason} — truncated {omitted} of {len(r.text)} "
+                "chars. Fetch a more specific URL, or `git clone` via bash "
+                "for a whole repo.]"
+            )
+
         # Render with a small header so the model knows what it
         # got — the final URL (after redirects + GitHub rewriting)
         # and status are both load-bearing for follow-ups.
@@ -241,7 +269,7 @@ def web_fetch_tool(
             f"# {r.url}\n"
             f"status: {r.status_code}\n"
             f"\n"
-            f"{r.text}"
+            f"{body}"
         )
 
     return Tool(

@@ -495,10 +495,21 @@ class Repl:
             # BM25-over-LLM-narrative retrieval that drifted as the
             # agent edited code.
             body = repo_map_for_root_cached(self.project.root)
-            if not body:
-                return
+            if body:
+                await self.agent.memory.update_block(
+                    "loom_index", body, user_id=_USER_ID
+                )
+            # Auto-reload the project rules file (AGENTS.md): re-read it
+            # FRESH each turn into the ``project_rules`` working block, so
+            # a mid-session edit applies on the next turn without a
+            # restart. The coordinator's static prompt no longer bakes
+            # the rules file (see build_unified_coordinator_instructions).
+            from .rules import project_rules_block
+
             await self.agent.memory.update_block(
-                "loom_index", body, user_id=_USER_ID
+                "project_rules",
+                project_rules_block(self.project.root),
+                user_id=_USER_ID,
             )
         except Exception:  # noqa: BLE001 — injection is best-effort
             pass
