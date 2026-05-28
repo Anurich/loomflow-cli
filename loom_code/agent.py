@@ -71,6 +71,23 @@ LOOM_DIR = ".loom"
 DEFAULT_MODEL = "gpt-4.1-mini"
 
 
+def _is_openai_model(model: str) -> bool:
+    """True when ``model`` is served by OpenAI (so its embeddings are
+    paid for by the same key). Used to pin the memory embedder to the
+    selected chat model's provider — OpenAI models get OpenAI
+    embeddings, everything else (Claude, Gemini, local) uses the
+    zero-key ``hash`` embedder so recall never makes a cross-provider
+    OpenAI call. Anthropic / Gemini / Ollama have no embeddings API we
+    use, so the test is simply 'is this an OpenAI chat model'."""
+    m = model.lower()
+    # OpenAI chat models: gpt-*, the o-series (o1/o3/o4...), and the
+    # ``openai/`` litellm prefix. Anthropic/Gemini/etc. never match.
+    return (
+        m.startswith(("gpt-", "gpt", "o1", "o3", "o4", "openai/", "chatgpt"))
+        or m in {"o1", "o3", "o4"}
+    )
+
+
 def build_agent(
     project: Project,
     *,
@@ -129,7 +146,21 @@ def build_agent(
     loom_dir.mkdir(exist_ok=True)
 
     workspace = LocalDiskWorkspace(str(loom_dir / "notebook"))
-    memory_url = f"sqlite:{loom_dir / 'memory.db'}"
+    # Embedder follows the SELECTED chat model's provider. An OpenAI
+    # model uses OpenAI embeddings (the key is already present + funded
+    # for OpenAI users); every other provider (Claude, Gemini, local)
+    # uses the zero-key ``hash`` embedder so memory recall NEVER makes a
+    # cross-provider OpenAI call. Without this, loomflow's default
+    # embedder auto-picks OpenAI whenever OPENAI_API_KEY happens to be
+    # set — which crashed Claude-only runs with an OpenAI 429 during
+    # fact recall. Passing memory as a dict (not the ``sqlite:`` string)
+    # is what lets us pin the embedder.
+    embedder = "openai" if _is_openai_model(model) else "hash"
+    memory_cfg: dict[str, str] = {
+        "backend": "sqlite",
+        "path": str(loom_dir / "memory.db"),
+        "embedder": embedder,
+    }
 
     # Bundled skills (graphify today, more later) computed before the
     # workers + coordinator so the SAME list lands on every agent.
@@ -227,7 +258,7 @@ def build_agent(
         instructions=build_unified_coordinator_instructions(project),
         tools=coordinator_tools,
         model=model,
-        memory=memory_url,
+        memory=memory_cfg,
         workspace=workspace,
         living_plan=True,
         skills=all_skills,
