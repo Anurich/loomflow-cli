@@ -62,7 +62,8 @@ from prompt_toolkit.completion import (
 from prompt_toolkit.document import Document
 from rich.text import Text
 
-from . import worktree
+from . import checkpoint as _checkpoint
+from . import file_history, worktree
 from .agent import LOOM_DIR, build_agent
 from .approval import ApprovalGate
 from .compact import Compactor, default_compact_threshold
@@ -94,6 +95,8 @@ _SLASH_HELP = """\
   [cyan]/cost[/cyan]            session cost + token totals
   [cyan]/good[/cyan]            mark the last turn useful (credits notes)
   [cyan]/bad[/cyan]             mark the last turn unhelpful
+  [cyan]/undo[/cyan]            restore the working tree to the last checkpoint
+  [cyan]/checkpoints[/cyan]     list auto-checkpoints (taken before each edit)
   [cyan]/model[/cyan] <name>    switch to a specific model by name
   [cyan]/set_model[/cyan]       pick OpenAI / Anthropic + save API key
   [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
@@ -187,6 +190,8 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/cost", "session cost + token totals"),
     ("/good", "mark the last turn useful (credit notes)"),
     ("/bad", "mark the last turn unhelpful"),
+    ("/undo", "restore the working tree to the last checkpoint"),
+    ("/checkpoints", "list auto-checkpoints (taken before each edit)"),
     ("/model", "switch to a specific model by name"),
     ("/effort", "reasoning effort: low | medium | high | off"),
     ("/isolate", "run this session in its own git worktree"),
@@ -523,6 +528,12 @@ class Repl:
             # system prompt.
             await self._inject_loom_context(line)
             await self._inject_file_history(line)
+            # Auto-checkpoint before the turn runs: snapshot the working
+            # tree so the user can /undo this turn's edits even if the
+            # agent goes off the rails. Silent on success (a checkpoint
+            # per turn would be noise); only /undo + /checkpoints surface
+            # them. Best-effort — a non-git repo / git failure no-ops.
+            self._checkpoint_before_turn(line)
             await self._turn(line)
 
     # ---- input ----------------------------------------------------------
@@ -632,6 +643,22 @@ class Repl:
                             f"hotspot ({rec.touch_count} edits)[/dim]"
                         )
         except Exception:  # noqa: BLE001 — anticipation is best-effort
+            pass
+
+    def _checkpoint_before_turn(self, prompt: str) -> None:
+        """Snapshot the working tree before a turn (auto-checkpoint).
+
+        Silent on success — a per-turn confirmation line would be noise;
+        the snapshots only surface via /undo + /checkpoints. Best-effort:
+        a non-git repo or git failure no-ops without disturbing the run.
+        Skipped when the session is already isolated in a worktree
+        (the worktree IS the isolation; double-snapshotting is redundant
+        and would snapshot the wrong tree)."""
+        if getattr(self, "_isolated_wt", None) is not None:
+            return
+        try:
+            _checkpoint.checkpoint(self.project.root, summary=prompt)
+        except Exception:  # noqa: BLE001 — checkpointing is best-effort
             pass
 
     async def _consume_agent_stream(
