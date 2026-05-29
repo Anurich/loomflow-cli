@@ -24,6 +24,7 @@ state silently).
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 from pathlib import Path
 from typing import Any
@@ -362,6 +363,104 @@ def _flexible_apply(working: str, old: str, new: str) -> str | None:
     return "\n".join(edited)
 
 
+# Fuzzy-apply only when a block is at least this similar to ``old`` AND no
+# other block comes within _FUZZY_MARGIN of it. The bar is high on purpose:
+# this runs ONLY after exact + whitespace-flexible both miss, and it must
+# never land an edit in a vaguely-similar block. Refuse-on-ambiguity (the
+# margin) is the safety net — we'd rather error (model re-reads) than risk
+# editing the wrong place.
+_FUZZY_THRESHOLD = 0.90
+_FUZZY_MARGIN = 0.05
+
+
+def _best_fuzzy_window(
+    working: str, old: str
+) -> tuple[int, float, float]:
+    """Find the line-window in ``working`` most similar to ``old``.
+
+    Returns ``(start_line_index, best_ratio, runner_up_ratio)``. Scans
+    every contiguous window of ``len(old)`` lines and scores it against
+    ``old`` with :class:`difflib.SequenceMatcher` on the whitespace-
+    stripped forms (indentation drift is already handled by
+    ``_flexible_apply``; this catches CONTENT drift — a renamed var, a
+    reflowed comment — on top). The runner-up lets the caller refuse a
+    near-tie. Returns ``(-1, 0, 0)`` when ``old`` is empty."""
+    if old == "":
+        return -1, 0.0, 0.0
+    h_lines = working.split("\n")
+    n = len(old.split("\n"))
+    old_norm = "\n".join(ln.strip() for ln in old.split("\n"))
+    best_i, best_r, second_r = -1, 0.0, 0.0
+    sm = difflib.SequenceMatcher()
+    sm.set_seq2(old_norm)
+    for i in range(0, len(h_lines) - n + 1):
+        window = "\n".join(ln.strip() for ln in h_lines[i : i + n])
+        sm.set_seq1(window)
+        r = sm.ratio()
+        if r > best_r:
+            best_i, second_r, best_r = i, best_r, r
+        elif r > second_r:
+            second_r = r
+    return best_i, best_r, second_r
+
+
+def _fuzzy_apply(working: str, old: str, new: str) -> str | None:
+    """Content-drift fallback: apply ``new`` to the single block in
+    ``working`` that is >=_FUZZY_THRESHOLD similar to ``old`` — but only
+    when that block clears the runner-up by _FUZZY_MARGIN (else it's
+    ambiguous and we refuse). Returns the edited text or ``None``.
+
+    Runs ONLY after exact + ``_flexible_apply`` both miss, so it can't
+    override a clean match. Re-indents ``new`` to the matched block's
+    base indent (same as ``_flexible_apply``) so the splice stays valid."""
+    i, best_r, second_r = _best_fuzzy_window(working, old)
+    if i < 0 or best_r < _FUZZY_THRESHOLD:
+        return None
+    if best_r - second_r < _FUZZY_MARGIN:
+        return None  # ambiguous — two blocks both plausible; refuse
+    h_lines = working.split("\n")
+    span = len(old.split("\n"))
+    matched = "\n".join(h_lines[i : i + span])
+    old_base = _leading_ws(old)
+    file_base = _leading_ws(matched)
+    new_lines = new.split("\n")
+    if old_base != file_base:
+        new_lines = [
+            (file_base + ln[len(old_base):])
+            if ln.startswith(old_base)
+            else ln
+            for ln in new_lines
+        ]
+    edited = h_lines[:i] + new_lines + h_lines[i + span:]
+    return "\n".join(edited)
+
+
+def _closest_block_hint(working: str, old: str) -> str:
+    """A unified diff of ``old`` vs the nearest block in ``working`` —
+    appended to the not-found error so the model sees WHAT is actually on
+    disk and re-sends exact text, instead of retrying blind."""
+    i, ratio, _ = _best_fuzzy_window(working, old)
+    if i < 0:
+        return ""
+    h_lines = working.split("\n")
+    span = len(old.split("\n"))
+    nearest = h_lines[i : i + span]
+    diff = "\n".join(
+        difflib.unified_diff(
+            old.split("\n"),
+            nearest,
+            fromfile="what you sent",
+            tofile=f"nearest text in file (line {i + 1}, "
+            f"{ratio:.0%} similar)",
+            lineterm="",
+        )
+    )
+    if not diff:
+        return ""
+    capped = diff if len(diff) <= 1200 else diff[:1200] + "\n… (truncated)"
+    return "Closest block in the file:\n" + capped
+
+
 def multi_edit_tool(workdir: Path | str) -> Tool:
     """Build the loom-code ``multi_edit`` tool — apply MANY edits to
     ONE file in a single ATOMIC call.
@@ -431,15 +530,28 @@ def multi_edit_tool(workdir: Path | str) -> Tool:
                 if flexed is not None:
                     working = flexed
                     continue
-                return (
+                # Whitespace-flex also missed → CONTENT drift (renamed
+                # var, reflowed comment). Last resort: high-bar
+                # similarity match (single unambiguous block only).
+                fuzzed = _fuzzy_apply(working, old, new)
+                if fuzzed is not None:
+                    working = fuzzed
+                    continue
+                # No safe match — fail with the closest block as a diff
+                # so the retry is informed, not blind.
+                hint = _closest_block_hint(working, old)
+                msg = (
                     f"ERROR: edit #{i + 1} old_string not found in "
                     f"{path} (after applying edits 1..{i}) — not even "
-                    "with whitespace-flexible matching, so it's either "
-                    "absent or appears in multiple near-identical "
-                    "spots. Re-`read` the exact lines and copy them "
-                    "verbatim (with more surrounding context if it's "
+                    "with whitespace-flexible or similarity matching, so "
+                    "it's either absent or appears in multiple near-"
+                    "identical spots. Re-`read` the exact lines and copy "
+                    "them verbatim (with more surrounding context if it's "
                     "ambiguous). NOTHING was written."
                 )
+                if hint:
+                    msg += "\n\n" + hint
+                return msg
             if count > 1 and not replace_all:
                 return (
                     f"ERROR: edit #{i + 1} old_string appears "

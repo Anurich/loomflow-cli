@@ -20,7 +20,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from loom_code.edit_tool import multi_edit_tool, verifying_edit_tool
+from loom_code.edit_tool import (
+    _best_fuzzy_window,
+    multi_edit_tool,
+    verifying_edit_tool,
+)
 
 
 def test_happy_path_appends_edit_preview(tmp_path: Path) -> None:
@@ -431,3 +435,95 @@ def test_multi_edit_tool_name_and_destructive(tmp_path: Path) -> None:
     tool = multi_edit_tool(tmp_path)
     assert tool.name == "multi_edit"
     assert tool.destructive is True
+
+
+# ---- multi_edit: content-drift fuzzy fallback ----------------------
+
+
+def test_multi_edit_fuzzy_content_drift_applies(tmp_path: Path) -> None:
+    """old_string has a one-char typo the file doesn't ('valeu'). Exact +
+    whitespace-flex both miss; the similarity fallback applies it to the
+    single near-identical block instead of failing + spinning."""
+    f = tmp_path / "m.py"
+    f.write_text("def process(self, value):\n    return value * 2\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {
+                    "old_string": "def process(self, valeu):\n"
+                    "    return value * 2",
+                    "new_string": "def process(self, value):\n"
+                    "    return value * 3",
+                }
+            ],
+        )
+    )
+    assert "✓ applied" in result, result
+    assert "value * 3" in f.read_text()
+    assert "value * 2" not in f.read_text()
+
+
+def test_multi_edit_low_similarity_does_not_apply(tmp_path: Path) -> None:
+    """A totally different old_string must NOT fuzzy-apply to unrelated
+    code — it errors and writes nothing."""
+    f = tmp_path / "m.py"
+    f.write_text("alpha = 1\nbeta = 2\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {
+                    "old_string": "def totally_different(x, y, z):\n"
+                    "    return x",
+                    "new_string": "X",
+                }
+            ],
+        )
+    )
+    assert result.startswith("ERROR"), result
+    assert f.read_text() == "alpha = 1\nbeta = 2\n"  # untouched
+
+
+def test_multi_edit_not_found_error_shows_closest_block(
+    tmp_path: Path,
+) -> None:
+    """The not-found error surfaces the nearest block as a diff so the
+    model can re-send exact text instead of retrying blind."""
+    f = tmp_path / "m.py"
+    f.write_text("def alpha(x):\n    return x + 1\n")
+    tool = multi_edit_tool(tmp_path)
+
+    result = asyncio.run(
+        tool.fn(
+            path="m.py",
+            edits=[
+                {
+                    "old_string": "def alpha(x):\n"
+                    "    return x + 1\n    extra_line_not_present",
+                    "new_string": "X",
+                }
+            ],
+        )
+    )
+    assert result.startswith("ERROR")
+    assert "Closest block" in result
+    assert "what you sent" in result or "nearest text" in result
+
+
+def test_best_fuzzy_window_finds_closest_block() -> None:
+    working = "import os\ndef foo(a, b):\n    return a + b\nx = 1"
+    i, best, _second = _best_fuzzy_window(working, "def foo(a, c):")
+    assert i == 1  # the "def foo" line
+    assert best > 0.8
+
+
+def test_best_fuzzy_window_empty_old() -> None:
+    i, best, second = _best_fuzzy_window("anything\n", "")
+    assert i == -1
+    assert best == 0.0
+    assert second == 0.0
