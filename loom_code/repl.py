@@ -134,6 +134,28 @@ _USER_ID = "loom-code"
 _AUTO_CONTINUE_LIMIT_DEFAULT = 15
 
 
+def _context_high_water(
+    prev: int, *, tokens_in: int, cached_in: int
+) -> int:
+    """Update the compaction trigger's context-occupancy estimate.
+
+    The last turn's INPUT tokens (uncached ``tokens_in`` + ``cached_in``)
+    already represent the *entire* conversation sent to the model that
+    turn — so their sum is a direct read of how full the context window
+    is right now. We track the **high-water mark**, never a running sum:
+    summing per-turn inputs double-counts, because each turn's input
+    re-includes all prior history, so a cumulative counter races far past
+    true occupancy and trips compaction much too early — discarding live
+    file/edit state into a lossy prose summary mid-task.
+
+    ``max`` (not plain assignment) so a brief dip — a short follow-up
+    turn whose input momentarily shrinks — doesn't un-arm a compaction
+    the conversation has genuinely grown to need. The counter is reset to
+    0 by the caller on a fresh thread (compaction / clear / model switch /
+    resume), where occupancy genuinely starts over.
+    """
+    return max(prev, tokens_in + cached_in)
+
 
 def _flatten_exception_group(
     eg: BaseExceptionGroup,
@@ -772,7 +794,13 @@ class Repl:
             self._pending_slugs = list(
                 result.get("cited_slugs") or []
             )
-            self._compact_tokens += tin + cached_in + tout
+            # Context-occupancy estimate for the compaction trigger.
+            # See ``_context_high_water`` — track the high-water mark of
+            # the last turn's INPUT, not a running sum (the old ``+=``
+            # double-counted resent history and compacted far too early).
+            self._compact_tokens = _context_high_water(
+                self._compact_tokens, tokens_in=tin, cached_in=cached_in
+            )
             agent_output = str(result.get("output") or "")
 
             # Surface framework-level stop-hook exhaustion so the
