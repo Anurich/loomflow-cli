@@ -40,7 +40,14 @@ _VERIFY_PATTERNS = (
 )
 
 
-async def _run_once(prompt: str, model: str, yes: bool) -> int:
+async def _run_once(
+    prompt: str,
+    model: str,
+    yes: bool,
+    *,
+    sandbox: bool = False,
+    sandbox_allow_network: bool = False,
+) -> int:
     """Detect project, build agent, stream one run. Returns an
     exit code.
 
@@ -54,7 +61,13 @@ async def _run_once(prompt: str, model: str, yes: bool) -> int:
     anyio event loop. loomflow's rule: anyio everywhere.
     """
     project = detect_project()
-    banner(model, str(project.root), project.is_git)
+    banner(
+        model,
+        str(project.root),
+        project.is_git,
+        sandbox=sandbox,
+        sandbox_allow_network=sandbox_allow_network,
+    )
     if project.context_file:
         console.print(
             f"  [dim]loaded context: "
@@ -63,9 +76,13 @@ async def _run_once(prompt: str, model: str, yes: bool) -> int:
 
     handler = auto_approve if yes else ApprovalGate().handler
     agent, workspace = build_agent(
-        project, model=model, approval_handler=handler
+        project,
+        model=model,
+        approval_handler=handler,
+        sandbox=sandbox,
+        sandbox_allow_network=sandbox_allow_network,
     )
-    renderer = StreamRenderer()
+    renderer = StreamRenderer(sandbox=sandbox)
     # "thinking..." spinner until the first user-visible event —
     # same pattern as the REPL so one-shot mode has the same
     # responsiveness feedback. ``started`` is internal framing;
@@ -292,7 +309,16 @@ def main() -> None:
 
     # One-shot mode.
     prompt = " ".join(args.prompt)
-    exit_code = anyio.run(_run_once, prompt, args.model, args.yes)
+    exit_code = anyio.run(
+        functools.partial(
+            _run_once,
+            prompt,
+            args.model,
+            args.yes,
+            sandbox=args.sandbox,
+            sandbox_allow_network=args.sandbox_allow_network,
+        )
+    )
     sys.exit(exit_code)
 
 

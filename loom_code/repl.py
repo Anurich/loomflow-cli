@@ -781,7 +781,9 @@ class Repl:
         self._active_resume_spinner = lambda: set_status("thinking...")
 
         renderer = StreamRenderer(
-            set_status=set_status, pause_status=pause_status
+            set_status=set_status,
+            pause_status=pause_status,
+            sandbox=self._sandbox,
         )
 
         # The Ralph loop now lives in loomflow itself (>=0.10.8) via

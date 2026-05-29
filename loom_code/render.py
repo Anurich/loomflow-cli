@@ -107,6 +107,7 @@ class StreamRenderer:
         *,
         set_status: Callable[[str], None] | None = None,
         pause_status: Callable[[], None] | None = None,
+        sandbox: bool = False,
     ) -> None:
         """``set_status(label)`` / ``pause_status()`` are optional
         callbacks the REPL wires to a Rich ``console.status``
@@ -114,7 +115,12 @@ class StreamRenderer:
         prose is streaming (it would corrupt the same line) and
         sets a new label on each tool boundary so the user has
         something to read between events. Both default to no-op so
-        non-REPL callers (one-shot CLI) keep working unchanged."""
+        non-REPL callers (one-shot CLI) keep working unchanged.
+
+        ``sandbox`` adds a 🔒 marker to each ``bash`` tool line so the
+        user can see — per command, not just at launch — that the
+        coder's shell is kernel-isolated. Off by default."""
+        self._sandbox = sandbox
         self._in_text = False
         # Whether ANY assistant prose has been shown this run — drives
         # the _on_completed fallback (print result["output"] only if
@@ -288,10 +294,15 @@ class StreamRenderer:
             if steps is not None:
                 self.last_plan_steps = steps
         arg_str = _summarise_args(args)
+        # Per-command sandbox marker: when --sandbox is on, a 🔒 on the
+        # bash line confirms the shell is kernel-isolated for THIS call
+        # — the launch banner alone left users unsure it still applied.
+        lock = " 🔒" if (self._sandbox and tool == "bash") else ""
         console.print(
             Text.assemble(
                 ("  → ", "bold cyan"),
                 (tool, "bold cyan"),
+                (lock, "bold green"),
                 (f"  {arg_str}", "dim"),
             )
         )
