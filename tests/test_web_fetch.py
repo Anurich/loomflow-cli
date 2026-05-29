@@ -11,7 +11,11 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from loom_code.web_fetch import _normalize_url, web_fetch_tool  # noqa: I001
+from loom_code.web_fetch import (  # noqa: I001
+    _host_is_blocked,
+    _normalize_url,
+    web_fetch_tool,
+)
 
 # --- URL normalization (pure) ---------------------------------
 
@@ -112,7 +116,12 @@ def test_tool_name_is_overridable() -> None:
 
 
 class _FakeResponse:
-    """Minimal duck-type of httpx.Response — only what _fetch reads."""
+    """Minimal duck-type of httpx.Response — only what _fetch reads.
+
+    ``_fetch`` follows redirects manually now, so it reads ``is_redirect``
+    + ``headers["location"]`` and calls ``url.join(...)`` on a redirect.
+    The fake's ``url`` is an httpx.URL so ``.join`` works like the real one.
+    Non-redirect responses (the common case) set ``is_redirect=False``."""
 
     def __init__(
         self,
@@ -120,11 +129,15 @@ class _FakeResponse:
         status_code: int,
         text: str,
         url: str = "https://example.com/x",
+        is_redirect: bool = False,
+        location: str | None = None,
     ) -> None:
         self.status_code = status_code
         self.text = text
         self.content = text.encode()
-        self.url = url
+        self.url = httpx.URL(url)
+        self.is_redirect = is_redirect
+        self.headers = {"location": location} if location else {}
 
 
 class _FakeAsyncClient:
@@ -211,3 +224,75 @@ async def test_fetch_non_http_url_short_circuits(
     out = await tool.execute({"url": "file:///etc/passwd"})
     assert out.startswith("ERROR:")
     assert not called["get"]
+
+
+# --- SSRF guard -----------------------------------------------
+
+
+def test_host_blocked_cloud_metadata() -> None:
+    # The classic SSRF target — AWS/GCP/Azure credential endpoint.
+    assert _host_is_blocked("169.254.169.254") is not None
+
+
+def test_host_blocked_loopback_literal() -> None:
+    assert _host_is_blocked("127.0.0.1") is not None
+
+
+def test_host_blocked_localhost_name() -> None:
+    # Resolves to loopback — must be caught by DNS resolution, not
+    # just literal-IP matching.
+    assert _host_is_blocked("localhost") is not None
+
+
+@pytest.mark.parametrize(
+    "ip", ["10.0.0.1", "192.168.1.1", "172.16.5.5", "0.0.0.0"]
+)
+def test_host_blocked_private_ranges(ip: str) -> None:
+    assert _host_is_blocked(ip) is not None
+
+
+@pytest.mark.parametrize("ip", ["8.8.8.8", "1.1.1.1"])
+def test_host_allowed_public_ips(ip: str) -> None:
+    assert _host_is_blocked(ip) is None
+
+
+@pytest.mark.anyio
+async def test_fetch_blocks_metadata_url_before_get(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An IP-literal SSRF attempt must be refused WITHOUT any HTTP call.
+    called = {"get": False}
+
+    class _ShouldNotCall(_FakeAsyncClient):
+        async def get(self, url: str) -> _FakeResponse:
+            called["get"] = True
+            return await super().get(url)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _ShouldNotCall)
+    tool = web_fetch_tool()
+    out = await tool.execute({"url": "http://169.254.169.254/latest/meta-data/"})
+    assert out.startswith("ERROR:")
+    assert "SSRF" in out
+    assert not called["get"]
+
+
+@pytest.mark.anyio
+async def test_fetch_blocks_redirect_to_internal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A PUBLIC URL that 302s to the metadata endpoint must be caught on
+    # the redirect hop — this is why redirects are followed manually.
+    _FakeAsyncClient.response = _FakeResponse(
+        status_code=302,
+        text="",
+        url="https://example.com/start",
+        is_redirect=True,
+        location="http://169.254.169.254/latest/meta-data/",
+    )
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+    tool = web_fetch_tool()
+    out = await tool.execute({"url": "https://example.com/start"})
+    assert out.startswith("ERROR:")
+    assert "SSRF" in out
+    # Restore the shared class default so later tests aren't affected.
+    _FakeAsyncClient.response = _FakeResponse(status_code=200, text="ok")

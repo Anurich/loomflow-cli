@@ -37,12 +37,20 @@ Implementation notes:
 - Errors return as strings (``ERROR: ...``), not raises — same
   convention as ``loomflow.tools.web.web_tool``. The agent sees
   the error and decides what to do (retry, change URL, escalate).
+- SSRF guard: the target host is resolved and rejected if it lands
+  in loopback / link-local / private / reserved IP space (incl. the
+  169.254.169.254 cloud-metadata endpoint). Redirects are followed
+  MANUALLY so the guard re-runs on every hop — a public URL can't
+  302 its way to an internal address.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 from typing import Any
+from urllib.parse import urlsplit
 
 from loomflow import Tool
 
@@ -185,6 +193,70 @@ def _normalize_url(url: str) -> tuple[str | None, str | None]:
     return url, None
 
 
+def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True if ``ip`` is a destination web_fetch must NOT reach.
+
+    Blocks the whole non-public space — loopback (127/8, ::1), link-local
+    (169.254/16 incl. the 169.254.169.254 cloud-metadata endpoint, fe80::/10),
+    RFC-1918 private (10/8, 172.16/12, 192.168/16), unique-local IPv6
+    (fc00::/7), unspecified (0.0.0.0, ::), and other reserved ranges. The
+    ``is_*`` properties on ``ipaddress`` cover each class; we OR them so a
+    new reserved range can't slip through a single missed check."""
+    # IPv4-mapped IPv6 (::ffff:127.0.0.1) would otherwise dodge the v4
+    # checks — unwrap to the embedded v4 address first.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_unspecified
+        or ip.is_reserved
+        or ip.is_multicast
+    )
+
+
+def _host_is_blocked(host: str) -> str | None:
+    """Resolve ``host`` and return a reason string if ANY resolved IP is
+    in a blocked range; ``None`` if every address is a public destination.
+
+    SSRF defense: an attacker-influenced URL (or a redirect hop) could
+    point at cloud-metadata (169.254.169.254), localhost services, or the
+    LAN. We resolve the name and reject if a literal IP or DNS result lands
+    in non-public space. Resolving (not just string-matching) is required —
+    a hostname can resolve to 127.0.0.1, and a single A record in a blocked
+    range is enough to refuse (no partial trust)."""
+    if not host:
+        return "no host in URL"
+    # Literal IP? Validate directly (covers the obvious 10.x / 127.x cases
+    # and avoids a needless DNS lookup).
+    try:
+        return (
+            f"host {host} resolves to a private/loopback/link-local "
+            f"address — refused (SSRF guard)"
+            if _ip_is_blocked(ipaddress.ip_address(host))
+            else None
+        )
+    except ValueError:
+        pass  # not a literal IP — fall through to DNS resolution
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        return f"could not resolve host {host}: {exc}"
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _ip_is_blocked(ip):
+            return (
+                f"host {host} resolves to {addr}, a private/loopback/"
+                f"link-local address — refused (SSRF guard)"
+            )
+    return None
+
+
 def web_fetch_tool(
     *,
     name: str = "web_fetch",
@@ -224,12 +296,30 @@ def web_fetch_tool(
         # `import loom_code.web_fetch` doesn't pay the httpx cost.
         import httpx
 
+        # Follow redirects MANUALLY so we re-run the SSRF guard on every
+        # hop. With httpx's follow_redirects=True a public URL could 302
+        # to http://169.254.169.254/ and we'd never see the final host —
+        # the guard has to gate each Location, not just the first URL.
+        assert normalized is not None  # err-None branch guarantees this
+        current = normalized
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=False,
                 timeout=timeout,
             ) as client:
-                r = await client.get(normalized)
+                for _ in range(10):  # redirect cap — matches httpx default
+                    host = urlsplit(current).hostname or ""
+                    blocked = _host_is_blocked(host)
+                    if blocked is not None:
+                        return f"ERROR: {blocked}"
+                    r = await client.get(current)
+                    if r.is_redirect and r.headers.get("location"):
+                        # Resolve relative Location against the current URL.
+                        current = str(r.url.join(r.headers["location"]))
+                        continue
+                    break
+                else:
+                    return "ERROR: too many redirects (>10)"
         except httpx.HTTPError as exc:
             return f"ERROR: fetch failed: {exc}"
 
