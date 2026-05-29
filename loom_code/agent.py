@@ -30,6 +30,7 @@ from loomflow.team import Team
 from loomflow.tools import find_tool, ls_tool, read_tool
 from loomflow.workspace import LocalDiskWorkspace
 
+from .code_index import codebase_search_tool
 from .extensions import Extensions, safe_role_name
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .hooks import attach_tool_hooks
@@ -223,6 +224,11 @@ def build_agent(
         mcp_registry=mcp_registry,
         sandbox=sandbox,
         sandbox_allow_network=sandbox_allow_network,
+        # Same embedder name memory uses (resolved above) so every
+        # worker's codebase_search hits the one shared index; the
+        # workspace handle fuses learned notes into results (Phase 1b).
+        embedder=embedder,
+        workspace=workspace,
     )
 
     # Custom .loom subagents join as delegate WORKERS. The coordinator
@@ -257,6 +263,13 @@ def build_agent(
     coordinator_tools: list[object] = [
         read_tool(root),
         grep_tool(root),
+        # Semantic search — finds code by MEANING where grep needs the
+        # literal string. Embeds in the SAME space (``embedder``) as
+        # memory, so the index and the note store fuse (Phase 1b): the
+        # ``workspace`` handle makes every search blend code symbols
+        # with what we've LEARNED about them. The coordinator gets it
+        # to locate the right subsystem before delegating.
+        codebase_search_tool(root, embedder, workspace=workspace),
         find_tool(root),
         ls_tool(root),
         web_fetch_tool(),

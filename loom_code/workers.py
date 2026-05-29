@@ -56,6 +56,7 @@ from loomflow.tools import (
     write_tool,
 )
 
+from .code_index import codebase_search_tool
 from .edit_tool import multi_edit_tool
 from .edit_tool import verifying_edit_tool as edit_tool
 from .extensions import AgentSpec
@@ -197,7 +198,11 @@ You are the last line before the user sees the work. Be skeptical.
 """
 
 
-def _read_only_tools(project: Project) -> list[Any]:
+def _read_only_tools(
+    project: Project,
+    embedder: str | None = None,
+    workspace: Any | None = None,
+) -> list[Any]:
     """The read-only inspection kernel — `read`/`grep`/`find`/`ls`
     scoped to the project root, plus `web_fetch` for reaching URLs
     and GitHub raw files (read-only by construction — no disk write,
@@ -207,15 +212,30 @@ def _read_only_tools(project: Project) -> list[Any]:
     ``web_fetch`` closes the URL-fetch gap that previously forced
     the read-only specialists to silently substitute local files
     for remote sources; preserves the sole-writer invariant because
-    the tool literally cannot write."""
+    the tool literally cannot write.
+
+    ``embedder`` (``"openai"`` / ``"hash"``) — when set, adds the
+    read-only ``codebase_search`` semantic tool so explorers/auditors
+    can find code by meaning, not just grep strings. ``None`` (the
+    default) keeps the legacy kernel for any caller that hasn't wired
+    the embedder yet."""
     root = project.root
-    return [
+    tools: list[Any] = [
         read_tool(root),
         grep_tool(root),
         find_tool(root),
         ls_tool(root),
         web_fetch_tool(),
     ]
+    if embedder is not None:
+        # Same embedder name the coordinator + memory use, so every
+        # agent searches the one shared index. ``workspace`` (when
+        # given) fuses learned notes into the results (Phase 1b).
+        # Read-only by construction — no disk write.
+        tools.insert(
+            2, codebase_search_tool(root, embedder, workspace=workspace)
+        )
+    return tools
 
 
 def _build_coder(
@@ -231,10 +251,16 @@ def _build_coder(
     mcp_registry: Any | None = None,
     sandbox: bool = False,
     sandbox_allow_network: bool = False,
+    embedder: str | None = None,
+    workspace: Any | None = None,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
     (write / edit / bash) through the shared approval handler.
+
+    ``embedder`` adds the read-only ``codebase_search`` tool — the
+    coder uses it to locate the right code to change before editing,
+    not just grep for strings.
 
     ``sandbox=True`` swaps the plain ``bash`` for the kernel-sandboxed
     one (``sandboxed_bash_tool``): the shell command runs inside
@@ -275,6 +301,10 @@ def _build_coder(
         bash,
         web_fetch_tool(),
     ]
+    if embedder is not None:
+        # Semantic search for the writer too — locate the code to
+        # change by meaning before editing. Same shared index.
+        static_tools.insert(5, codebase_search_tool(root, embedder, workspace=workspace))
     # Default: pass the static list straight through (framework wraps it
     # in an InProcessToolHost). With MCP, build that host ourselves and
     # compose it with the registry as one ToolHost.
@@ -337,15 +367,19 @@ def _build_explorer(
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
     effort: str | None = None,
+    embedder: str | None = None,
+    workspace: Any | None = None,
 ) -> Agent:
     """Read-only investigator — no permissions needed (none of its
     tools are destructive). ``has_web`` toggles the `web_search`
-    section in the prompt — must match ``build_workers``' wiring."""
+    section in the prompt — must match ``build_workers``' wiring.
+    ``embedder`` adds the read-only ``codebase_search`` semantic tool
+    (the explorer is the prime beneficiary — concept-level lookups)."""
     return Agent(
         _explorer_prompt(has_web),
         model=model,
         architecture=ReAct(),
-        tools=_read_only_tools(project),
+        tools=_read_only_tools(project, embedder, workspace),
         skills=skills,
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
@@ -368,6 +402,8 @@ def _build_auditor(
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
     effort: str | None = None,
+    embedder: str | None = None,
+    workspace: Any | None = None,
 ) -> Agent:
     """Read-only defect hunter — same tool scope as the explorer,
     different objective."""
@@ -375,7 +411,7 @@ def _build_auditor(
         _AUDITOR_PROMPT,
         model=model,
         architecture=ReAct(),
-        tools=_read_only_tools(project),
+        tools=_read_only_tools(project, embedder, workspace),
         skills=skills,
         prompt_caching=True,
         max_turns=_SPECIALIST_MAX_TURNS,
@@ -398,6 +434,8 @@ def _build_reviewer(
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
     effort: str | None = None,
+    embedder: str | None = None,
+    workspace: Any | None = None,
 ) -> Agent:
     """Independent verifier — read-only inspection plus `bash` to
     run the project's real test suite. `bash` is gated through the
@@ -408,7 +446,10 @@ def _build_reviewer(
         _REVIEWER_PROMPT,
         model=model,
         architecture=ReAct(),
-        tools=[*_read_only_tools(project), bash_tool(root, timeout=300.0)],
+        tools=[
+            *_read_only_tools(project, embedder, workspace),
+            bash_tool(root, timeout=300.0),
+        ],
         skills=skills,
         permissions=StandardPermissions(),
         approval_handler=approval_handler,
@@ -437,6 +478,8 @@ def build_workers(
     mcp_registry: Any | None = None,
     sandbox: bool = False,
     sandbox_allow_network: bool = False,
+    embedder: str | None = None,
+    workspace: Any | None = None,
 ) -> dict[str, Agent]:
     """Build the worker roster for ``Team.supervisor``.
 
@@ -472,6 +515,8 @@ def build_workers(
             mcp_registry=mcp_registry,
             sandbox=sandbox,
             sandbox_allow_network=sandbox_allow_network,
+            embedder=embedder,
+            workspace=workspace,
         ),
         "explorer": _build_explorer(
             project,
@@ -481,6 +526,8 @@ def build_workers(
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
             effort=effort,
+            embedder=embedder,
+            workspace=workspace,
         ),
         "auditor": _build_auditor(
             project,
@@ -489,6 +536,8 @@ def build_workers(
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
             effort=effort,
+            embedder=embedder,
+            workspace=workspace,
         ),
         "reviewer": _build_reviewer(
             project,
@@ -498,6 +547,8 @@ def build_workers(
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
             effort=effort,
+            embedder=embedder,
+            workspace=workspace,
         ),
     }
     if has_web:

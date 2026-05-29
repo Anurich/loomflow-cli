@@ -161,6 +161,12 @@ class StreamRenderer:
         # the agent having to report any of it itself.
         self.bash_commands: list[str] = []
         self.notes_written: list[tuple[str, str]] = []  # (kind, title)
+        # Files this run WROTE to — captured from edit/multi_edit/write
+        # tool calls (all use the ``path`` arg). Feeds file-touch
+        # history (loom_code.file_history): "last time you touched X,
+        # the change was marked bad." Read-only tools (read/grep) are
+        # NOT touches — only mutations land here.
+        self.files_touched: list[str] = []
 
     def handle(self, event: Any) -> None:
         """Render a single ``Event``. ``kind`` is a string enum;
@@ -277,6 +283,13 @@ class StreamRenderer:
             cmd = str(args.get("command") or "").strip()
             if cmd:
                 self.bash_commands.append(cmd)
+        elif tool in ("edit", "multi_edit", "write"):
+            # All three mutation tools take the file path as ``path``.
+            # Record it as a touch so file-touch history knows what
+            # this turn changed (outcome attached later by the repl).
+            p = str(args.get("path") or "").strip()
+            if p and p not in self.files_touched:
+                self.files_touched.append(p)
         elif tool == "note":
             title = str(args.get("title") or "").strip()
             if title:

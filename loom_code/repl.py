@@ -332,6 +332,16 @@ class Repl:
         # Self-improvement: cited slugs from the last turn, awaiting
         # a success/failure judgement (the moved-on heuristic).
         self._pending_slugs: list[str] = []
+        # Files the last turn WROTE to, awaiting the same judgement.
+        # Recorded immediately as "unknown" (so a crash before the
+        # verdict still leaves a touch record), then revised to
+        # success/fail when the moved-on / good / bad signal lands —
+        # the same lifecycle as ``_pending_slugs``. Feeds the file-
+        # touch history that powers proactive anticipation.
+        self._pending_files: list[str] = []
+        # The prompt that drove the last turn — used as the touch
+        # summary ("why was this file changed").
+        self._last_prompt: str = ""
         # Automatic compaction state. ``_compact_threshold = -1``
         # means "auto, recompute from model"; ``0`` means "off";
         # any positive int is an explicit user override. The
@@ -512,6 +522,7 @@ class Repl:
             # map. Loomflow auto-injects working blocks into the next
             # system prompt.
             await self._inject_loom_context(line)
+            await self._inject_file_history(line)
             await self._turn(line)
 
     # ---- input ----------------------------------------------------------
@@ -571,6 +582,56 @@ class Repl:
                 user_id=_USER_ID,
             )
         except Exception:  # noqa: BLE001 — injection is best-effort
+            pass
+
+    async def _inject_file_history(self, prompt: str) -> None:
+        """Proactive anticipation: before the agent runs, surface what
+        happened last time we touched the files this prompt is about.
+
+        THE soul of loom-code over a stateless coder — "last time you
+        edited src/auth.py the change was marked bad, be careful." Two
+        surfaces: a ``file_anticipation`` working block (loomflow folds
+        it into the next system prompt so the AGENT heeds it) AND a dim
+        ``recall:`` line so the USER sees the warning fire.
+
+        Silent when nothing's notable (a clean, rarely-touched file
+        produces no block + no line) — noise would train both the
+        model and the user to ignore the section. Best-effort: any
+        failure is swallowed; anticipation degrading to silence is
+        correct, a crash mid-turn is not."""
+        try:
+            candidates = file_history.candidate_paths_from_prompt(
+                self.project.root, prompt
+            )
+            if not candidates:
+                # Clear any stale block from a prior turn so last turn's
+                # warning doesn't bleed into an unrelated prompt.
+                await self.agent.memory.update_block(
+                    "file_anticipation", "", user_id=_USER_ID
+                )
+                return
+            records = file_history.history_for(
+                self.project.root, candidates
+            )
+            block = file_history.anticipation_block(records)
+            await self.agent.memory.update_block(
+                "file_anticipation", block, user_id=_USER_ID
+            )
+            if block:
+                # One concise user-visible line per warned file.
+                for rec in records:
+                    if rec.last_outcome == "fail" or rec.fail_count > 0:
+                        console.print(
+                            f"  [dim]↶ recall:[/dim] [yellow]last change "
+                            f"to {rec.path} was marked bad — being "
+                            f"careful[/yellow]"
+                        )
+                    elif rec.touch_count >= 4:
+                        console.print(
+                            f"  [dim]↶ recall: {rec.path} is a churn "
+                            f"hotspot ({rec.touch_count} edits)[/dim]"
+                        )
+        except Exception:  # noqa: BLE001 — anticipation is best-effort
             pass
 
     async def _consume_agent_stream(
@@ -816,6 +877,21 @@ class Repl:
             self._pending_slugs = list(
                 result.get("cited_slugs") or []
             )
+            # Record this turn's file touches immediately as "unknown".
+            # The outcome is revised to success/fail in
+            # ``_attribute_pending`` when the moved-on / good / bad
+            # signal arrives. Recording now (not at attribution time)
+            # means a crash before judgement still leaves the touch on
+            # record — better an unjudged touch than a lost one.
+            self._pending_files = list(renderer.files_touched)
+            self._last_prompt = prompt
+            if self._pending_files:
+                file_history.record_touches(
+                    self.project.root,
+                    self._pending_files,
+                    outcome="unknown",
+                    summary=prompt,
+                )
             # Context-occupancy estimate for the compaction trigger.
             # See ``_context_high_water`` — track the high-water mark of
             # the last turn's INPUT, not a running sum (the old ``+=``
@@ -897,6 +973,16 @@ class Repl:
         ``quiet`` suppresses the confirmation line — used for the
         implicit 'moved-on = success' path so the REPL doesn't
         chatter on every turn."""
+        # Revise the last turn's file touches from "unknown" to the
+        # now-known outcome. Independent of the slug path (a turn can
+        # edit files without citing notes), so do it first + always.
+        if self._pending_files:
+            file_history.update_last_outcome(
+                self.project.root,
+                self._pending_files,
+                "success" if success else "fail",
+            )
+            self._pending_files = []
         if not self._pending_slugs:
             return
         slugs = self._pending_slugs
