@@ -239,3 +239,70 @@ def test_as_bool_and_as_int_helpers() -> None:
     assert _as_bool(True) is True
     assert _as_bool("garbage", default=True) is True  # → default
     assert _as_bool("", default=True) is False  # empty → falsy
+
+
+# ---- ripgrep fast path + fallback parity --------------------------
+
+
+def _seed(d: Path) -> None:
+    (d / "a.py").write_text("def foo():\n    return 1\nfoo_bar = 2\n")
+    (d / "b.py").write_text("x = foo()\n# foo comment\n")
+    sub = d / "sub"
+    sub.mkdir()
+    (sub / "c.py").write_text("foo_again = 3\n")
+
+
+def test_rg_and_python_paths_agree(tmp_path: Path) -> None:
+    """The ripgrep fast path must produce byte-for-byte the same output
+    as the pure-Python fallback — the renderer is shared, rg only
+    changes HOW matches are found, never how they're shown."""
+    from unittest.mock import patch
+
+    _seed(tmp_path)
+    tool = enhanced_grep_tool(tmp_path)
+    rg_out = asyncio.run(tool.fn(pattern="foo", path="."))
+    with patch("loom_code.grep_tool._rg_path", return_value=None):
+        py_out = asyncio.run(tool.fn(pattern="foo", path="."))
+    assert rg_out == py_out
+
+
+def test_python_fallback_used_when_rg_absent(tmp_path: Path) -> None:
+    """When rg isn't on PATH the tool still works via the Python walk."""
+    from unittest.mock import patch
+
+    _seed(tmp_path)
+    tool = enhanced_grep_tool(tmp_path)
+    with patch("loom_code.grep_tool._rg_path", return_value=None):
+        out = asyncio.run(tool.fn(pattern="foo_bar", path="."))
+    assert "foo_bar" in out
+
+
+def test_lookahead_pattern_falls_back_to_python(tmp_path: Path) -> None:
+    """rg's Rust regex rejects lookahead (exit 2) → _collect_with_ripgrep
+    returns None → the tool falls back to Python, which supports it. No
+    capability regression for exotic regex."""
+    from loom_code.grep_tool import _collect_with_ripgrep
+
+    _seed(tmp_path)
+    # rg should reject this and signal fallback.
+    res = _collect_with_ripgrep(
+        tmp_path,
+        "foo(?=_)",
+        ignore_case=False,
+        glob="*",
+        type_filter=None,
+        max_files=30,
+        max_per_file=10,
+    )
+    assert res is None
+    # And the tool as a whole still resolves the lookahead via Python.
+    tool = enhanced_grep_tool(tmp_path)
+    out = asyncio.run(tool.fn(pattern="foo(?=_)", path="."))
+    assert "foo_bar" in out or "foo_again" in out
+
+
+def test_rg_path_returns_str_or_none() -> None:
+    from loom_code.grep_tool import _rg_path
+
+    val = _rg_path()
+    assert val is None or isinstance(val, str)

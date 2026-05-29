@@ -29,7 +29,10 @@ ergonomics without forking the framework.
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +124,86 @@ def _walk_files(
                 continue
         out.append(path)
     return out
+
+
+def _rg_path() -> str | None:
+    """Absolute path to the real ripgrep binary, or None if absent.
+
+    ``shutil.which`` finds the executable on PATH — not any shell
+    function shim (subprocess never sees shell functions anyway)."""
+    return shutil.which("rg")
+
+
+def _collect_with_ripgrep(
+    target: Path,
+    pattern: str,
+    *,
+    ignore_case: bool,
+    glob: str,
+    type_filter: tuple[str, ...] | None,
+    max_files: int,
+    max_per_file: int,
+) -> dict[Path, list[tuple[int, str]]] | None:
+    """Fast path: ripgrep does the matching; we parse its --json stream.
+
+    Returns ``matches_by_file`` (same shape the Python walk produces), or
+    ``None`` to signal "fall back to Python" — when rg is absent, the
+    pattern uses a feature rg's Rust regex rejects (lookahead /
+    backrefs → exit 2), or rg errors. Never raises, so the caller's
+    fallback stays a simple ``is None`` check.
+
+    rg respects .gitignore (correct for a code tool); we ALSO pass the
+    historical _NOISE_DIRS as --glob excludes so a non-git tree or an
+    un-ignored .venv stays quiet — a superset of the old walk, never a
+    regression."""
+    rg = _rg_path()
+    if rg is None:
+        return None
+    argv = [rg, "--json", "--no-messages"]
+    if ignore_case:
+        argv.append("--ignore-case")
+    if glob and glob != "*":
+        argv += ["--glob", glob]
+    for noise in _NOISE_DIRS:
+        argv += ["--glob", f"!**/{noise}/**"]
+    if type_filter:
+        # rg has no arbitrary-extension flag — express each as a glob.
+        for ext in type_filter:
+            argv += ["--glob", f"*.{ext}"]
+    argv += ["--regexp", pattern, str(target)]
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # rg exit codes: 0 = matches, 1 = no matches (NOT an error),
+    # 2 = real error (bad/unsupported regex) → fall back to the Python
+    # engine, which may accept the pattern.
+    if proc.returncode == 2:
+        return None
+    matches_by_file: dict[Path, list[tuple[int, str]]] = {}
+    for raw_line in proc.stdout.splitlines():
+        if not raw_line:
+            continue
+        try:
+            evt = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if evt.get("type") != "match":
+            continue
+        data = evt["data"]
+        fpath = Path(data["path"]["text"])
+        lineno = int(data["line_number"])
+        text = str(data["lines"]["text"]).rstrip("\n")
+        bucket = matches_by_file.setdefault(fpath, [])
+        if len(bucket) < max_per_file:
+            bucket.append((lineno, text))
+    # Honour the file cap deterministically (rg emits in walk order).
+    if len(matches_by_file) > max_files:
+        keep = sorted(matches_by_file)[:max_files]
+        matches_by_file = {k: matches_by_file[k] for k in keep}
+    return matches_by_file
 
 
 def _render_grouped(
@@ -235,30 +318,60 @@ def enhanced_grep_tool(
                 t.strip().lower() for t in type.split(",") if t.strip()
             )
 
-        # Walk + collect matches per file.
-        files = _walk_files(target, glob, type_filter)
+        # Collect raw per-file hits. FAST PATH: ripgrep (respects
+        # .gitignore, Rust-fast). FALLBACK: the pure-Python walk below,
+        # used when rg is absent or rejects the pattern (lookahead /
+        # backrefs) — so capability never regresses, only speed varies.
+        raw_hits: dict[Path, list[tuple[int, str]]] = {}
+        rg_result = _collect_with_ripgrep(
+            target,
+            pattern,
+            ignore_case=ignore_case,
+            glob=glob,
+            type_filter=type_filter,
+            max_files=max_files_with_matches * 4,
+            max_per_file=max_matches_per_file,
+        )
+        if rg_result is not None:
+            raw_hits = rg_result
+        else:
+            # Pure-Python walk: read every candidate file, regex each
+            # line. Identical regex dialect to the agent's `pattern`.
+            for fpath in _walk_files(target, glob, type_filter):
+                try:
+                    text = fpath.read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    continue
+                hits: list[tuple[int, str]] = []
+                for i, line in enumerate(text.splitlines(), start=1):
+                    if regex.search(line):
+                        hits.append((i, line))
+                        if len(hits) >= max_matches_per_file:
+                            break
+                if hits:
+                    raw_hits[fpath] = hits
+
+        # Shared post-process: apply the test-file collapse + file cap +
+        # build the context cache. Runs identically for both paths so rg
+        # and Python output are byte-for-byte the same.
         matches_by_file: dict[Path, list[tuple[int, str]]] = {}
         file_lines_cache: dict[Path, list[str]] = {}
         test_file_count = 0
         test_match_count = 0
-        for fpath in files:
-            try:
-                text = fpath.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            lines = text.splitlines()
-            hits: list[tuple[int, str]] = []
-            for i, line in enumerate(lines, start=1):
-                if regex.search(line):
-                    hits.append((i, line))
-                    if len(hits) >= max_matches_per_file:
-                        break
-            if not hits:
-                continue
+        for fpath in sorted(raw_hits):
+            hits = raw_hits[fpath]
             rel = fpath.relative_to(root)
             if (not include_tests) and _is_test_path(rel):
                 test_file_count += 1
                 test_match_count += len(hits)
+                continue
+            try:
+                lines = fpath.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+            except OSError:
                 continue
             matches_by_file[fpath] = hits
             file_lines_cache[fpath] = lines
