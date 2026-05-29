@@ -229,10 +229,19 @@ def _build_coder(
     snip_window: int = 0,
     effort: str | None = None,
     mcp_registry: Any | None = None,
+    sandbox: bool = False,
+    sandbox_allow_network: bool = False,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
     (write / edit / bash) through the shared approval handler.
+
+    ``sandbox=True`` swaps the plain ``bash`` for the kernel-sandboxed
+    one (``sandboxed_bash_tool``): the shell command runs inside
+    sandbox-exec (macOS) / bwrap (Linux) so it can only WRITE under the
+    project root and has NO network (unless ``sandbox_allow_network``).
+    Claude-Code-style — only ``bash`` (arbitrary code) is sandboxed;
+    ``edit``/``write`` keep the approval gate. Off by default.
     ``has_web`` toggles the `web_search` section in the prompt —
     keep this in lockstep with whether ``build_workers`` actually
     attaches the tool, else the prompt lies.
@@ -244,6 +253,17 @@ def _build_coder(
     ``McpAugmentedHost`` so MCP tools resolve lazily (connect-on-first-
     use) and static builtins win any name collision."""
     root = project.root
+    # bash is the one tool that runs arbitrary code, so it's the one we
+    # kernel-sandbox when asked. edit/write only touch where the model
+    # says + go through the approval gate, so they stay as-is.
+    if sandbox:
+        from .sandboxed_bash import sandboxed_bash_tool
+
+        bash = sandboxed_bash_tool(
+            root, allow_network=sandbox_allow_network, timeout=300.0
+        )
+    else:
+        bash = bash_tool(root, timeout=300.0)
     static_tools: list[Any] = [
         read_tool(root),
         write_tool(root),
@@ -252,7 +272,7 @@ def _build_coder(
         grep_tool(root),
         find_tool(root),
         ls_tool(root),
-        bash_tool(root, timeout=300.0),
+        bash,
         web_fetch_tool(),
     ]
     # Default: pass the static list straight through (framework wraps it
@@ -415,6 +435,8 @@ def build_workers(
     snip_window: int = 0,
     effort: str | None = None,
     mcp_registry: Any | None = None,
+    sandbox: bool = False,
+    sandbox_allow_network: bool = False,
 ) -> dict[str, Agent]:
     """Build the worker roster for ``Team.supervisor``.
 
@@ -448,6 +470,8 @@ def build_workers(
             snip_window=snip_window,
             effort=effort,
             mcp_registry=mcp_registry,
+            sandbox=sandbox,
+            sandbox_allow_network=sandbox_allow_network,
         ),
         "explorer": _build_explorer(
             project,

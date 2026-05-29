@@ -102,6 +102,8 @@ def build_agent(
     tool_result_summarizer: str | None = None,
     extensions: Extensions | None = None,
     effort: str | None = None,
+    sandbox: bool = False,
+    sandbox_allow_network: bool = False,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code agent for a given project.
 
@@ -219,6 +221,8 @@ def build_agent(
         snip_window=snip_window,
         effort=effort,
         mcp_registry=mcp_registry,
+        sandbox=sandbox,
+        sandbox_allow_network=sandbox_allow_network,
     )
 
     # Custom .loom subagents join as delegate WORKERS. The coordinator

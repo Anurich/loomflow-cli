@@ -234,9 +234,21 @@ class _SlashCompleter(Completer):
 class Repl:
     """One interactive loom-code session over one project."""
 
-    def __init__(self, project: Project, model: str) -> None:
+    def __init__(
+        self,
+        project: Project,
+        model: str,
+        *,
+        sandbox: bool = False,
+        sandbox_allow_network: bool = False,
+    ) -> None:
         self.project = project
         self.model = model
+        # Kernel-sandbox the coder's bash (Claude-Code-style). Stored so
+        # every (re)build of the agent — initial + /model switch + worktree
+        # isolate — passes them through ``_rebuild_agent``.
+        self._sandbox = sandbox
+        self._sandbox_allow_network = sandbox_allow_network
         # Per-turn spinner controls. The ApprovalGate must pause the
         # spinner while it prompts (its Live refresh otherwise mangles
         # the keystroke). ``_turn`` points these at the live closures;
@@ -279,6 +291,8 @@ class Repl:
             max_stop_hook_iterations=self._auto_continue_limit,
             extensions=self._extensions,
             effort=self._effort,
+            sandbox=self._sandbox,
+            sandbox_allow_network=self._sandbox_allow_network,
         )
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
@@ -1308,6 +1322,8 @@ class Repl:
             max_stop_hook_iterations=self._auto_continue_limit,
             extensions=self._extensions,
             effort=self._effort,
+            sandbox=self._sandbox,
+            sandbox_allow_network=self._sandbox_allow_network,
         )
         self._compactor = Compactor(model=self.model)
         self._compact_tokens = 0
@@ -2098,8 +2114,19 @@ def _migrate_legacy_per_route_episodes(
         return 0
 
 
-async def run_repl(project: Project, model: str) -> int:
+async def run_repl(
+    project: Project,
+    model: str,
+    *,
+    sandbox: bool = False,
+    sandbox_allow_network: bool = False,
+) -> int:
     """Entry point for the interactive REPL — construct the Repl and
     run its loop until the user exits."""
-    repl = Repl(project, model)
+    repl = Repl(
+        project,
+        model,
+        sandbox=sandbox,
+        sandbox_allow_network=sandbox_allow_network,
+    )
     return await repl.run()

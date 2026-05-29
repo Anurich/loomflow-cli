@@ -14,6 +14,7 @@ just loops and adds slash commands.
 from __future__ import annotations
 
 import argparse
+import functools
 import subprocess
 import sys
 
@@ -263,7 +264,15 @@ def main() -> None:
         # No task → interactive REPL. --yes is meaningless here
         # (the REPL is interactive by definition); ignore it.
         project = detect_project()
-        exit_code = anyio.run(run_repl, project, args.model)
+        exit_code = anyio.run(
+            functools.partial(
+                run_repl,
+                project,
+                args.model,
+                sandbox=args.sandbox,
+                sandbox_allow_network=args.sandbox_allow_network,
+            )
+        )
         sys.exit(exit_code)
 
     # One-shot mode.
