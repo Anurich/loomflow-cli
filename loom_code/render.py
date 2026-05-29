@@ -554,24 +554,48 @@ def _summarise_args(args: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-def banner(model: str, root: str, is_git: bool) -> None:
-    """Print the loom-code startup banner."""
+def banner(
+    model: str,
+    root: str,
+    is_git: bool,
+    *,
+    sandbox: bool = False,
+    sandbox_allow_network: bool = False,
+) -> None:
+    """Print the loom-code startup banner.
+
+    ``sandbox`` shows a visible badge in the header (``🔒 sandboxed``)
+    plus a one-line explanation, so the user can tell at a glance that
+    the coder's bash is kernel-isolated — otherwise the protection is
+    invisible (it only surfaces when a command tries to escape)."""
     git_tag = "git" if is_git else "no-git"
+    parts = [
+        ("loom-code", "bold"),
+        ("  ", ""),
+        (f"{model}", "cyan"),
+        ("  ·  ", "dim"),
+        (f"{root}", "dim"),
+        ("  ·  ", "dim"),
+        (git_tag, "dim"),
+    ]
+    if sandbox:
+        parts += [("  ·  ", "dim"), ("🔒 sandboxed", "bold green")]
     console.print()
-    console.print(
-        Text.assemble(
-            ("loom-code", "bold"),
-            ("  ", ""),
-            (f"{model}", "cyan"),
-            ("  ·  ", "dim"),
-            (f"{root}", "dim"),
-            ("  ·  ", "dim"),
-            (git_tag, "dim"),
-        )
-    )
+    console.print(Text.assemble(*parts))
     console.print(
         Text("  loomflow-native coding agent", style="dim italic")
     )
+    if sandbox:
+        net = (
+            "network ON" if sandbox_allow_network else "no network"
+        )
+        console.print(
+            Text(
+                f"  bash runs in an OS sandbox — writes limited to "
+                f"this repo, {net}",
+                style="dim green",
+            )
+        )
     console.print()
 
 

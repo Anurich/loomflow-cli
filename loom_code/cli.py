@@ -247,6 +247,21 @@ def main() -> None:
             "One-shot mode only."
         ),
     )
+    parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help=(
+            "Run the coder's bash inside an OS sandbox (macOS Seatbelt "
+            "/ Linux bwrap): commands may read anywhere but only WRITE "
+            "under the project root, with no network. edit/write keep "
+            "the approval gate. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--sandbox-allow-network",
+        action="store_true",
+        help="With --sandbox, permit network access from bash commands.",
+    )
     args = parser.parse_args()
 
     # 1. Read ~/.loom-code/credentials so any keys saved on a

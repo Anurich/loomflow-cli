@@ -397,7 +397,13 @@ class Repl:
         """The REPL loop body. Held as a separate method in case a
         future feature wants to wrap it in a context manager again
         — keeps the wrapping point obvious."""
-        banner(self.model, str(self.project.root), self.project.is_git)
+        banner(
+            self.model,
+            str(self.project.root),
+            self.project.is_git,
+            sandbox=self._sandbox,
+            sandbox_allow_network=self._sandbox_allow_network,
+        )
         if self.project.context_file:
             console.print(
                 f"  [dim]loaded context: "
