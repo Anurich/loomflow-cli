@@ -27,7 +27,7 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from .extensions import Extensions, HookSpec
+from .extensions import Extensions, HookSpec, McpEntry
 from .extensions import discover as _discover
 
 _DEFAULT_TRUST_STORE = Path.home() / ".loom-code" / "trusted_hooks.json"
@@ -82,74 +82,116 @@ def filter_trusted_hooks(
     On denial the project hooks are dropped — skills, subagents, and
     user hooks are kept untouched.
 
+    Project-scope MCP servers are gated the SAME way: connecting one runs
+    external code / hits an external endpoint, so a cloned repo's MCP
+    servers load only if the repo is trusted. Trust is one decision over
+    the combined (hooks + MCP) fingerprint; on denial both project hooks
+    and project MCP are dropped.
+
     ``trust_store`` overrides the on-disk record path (tests pass a tmp
     file)."""
     project_hooks = [
         h for h in extensions.hook_specs if h.source == "project"
     ]
-    if not project_hooks:
+    project_mcp = [
+        m for m in extensions.mcp_specs if m.source == "project"
+    ]
+    if not project_hooks and not project_mcp:
         return extensions
 
-    if is_trusted(project_root, project_hooks, trust_store=trust_store):
+    if is_trusted(
+        project_root, project_hooks, project_mcp, trust_store=trust_store
+    ):
         return extensions  # already trusted, unchanged
 
     if prompt(project_hooks):
-        record_trust(project_root, project_hooks, trust_store=trust_store)
+        record_trust(
+            project_root,
+            project_hooks,
+            project_mcp,
+            trust_store=trust_store,
+        )
         return extensions
 
-    # Denied — strip project hooks, keep everything else.
-    kept = [h for h in extensions.hook_specs if h.source != "project"]
+    # Denied — strip project hooks AND project MCP, keep everything else
+    # (skills, subagents, user-scope hooks + MCP).
+    kept_hooks = [h for h in extensions.hook_specs if h.source != "project"]
+    kept_mcp = [m for m in extensions.mcp_specs if m.source != "project"]
     return Extensions(
         skill_paths=extensions.skill_paths,
         agent_specs=extensions.agent_specs,
-        hook_specs=kept,
+        hook_specs=kept_hooks,
+        mcp_specs=kept_mcp,
     )
 
 
 def is_trusted(
     project_root: Path,
     project_hooks: list[HookSpec],
+    project_mcp: list[McpEntry] | None = None,
     *,
     trust_store: Path | None = None,
 ) -> bool:
-    """Has the user already trusted *exactly* these project hooks for
-    this repo?
+    """Has the user already trusted *exactly* this repo's gated config
+    (project hooks AND MCP servers)?
 
-    True when the project hooks' fingerprint matches the recorded one
-    for ``project_root`` (or when there are no project hooks). Lets an
+    True when the combined fingerprint matches the recorded one for
+    ``project_root`` (or when there's nothing gated to trust). Lets an
     async caller (the desktop sidecar) decide whether to prompt without
-    going through the sync ``filter_trusted_hooks`` callback."""
-    if not project_hooks:
+    going through the sync ``filter_trusted_hooks`` callback. ``project_mcp``
+    defaults to ``None`` so existing hook-only callers are unchanged."""
+    if not project_hooks and not project_mcp:
         return True
     store = trust_store if trust_store is not None else _DEFAULT_TRUST_STORE
     key = str(project_root.resolve())
-    return _load(store).get(key) == _fingerprint(project_hooks)
+    return _load(store).get(key) == _fingerprint(project_hooks, project_mcp)
 
 
 def record_trust(
     project_root: Path,
     project_hooks: list[HookSpec],
+    project_mcp: list[McpEntry] | None = None,
     *,
     trust_store: Path | None = None,
 ) -> None:
-    """Record the user's decision to trust exactly these project hooks
-    for this repo, so they aren't re-prompted until the hooks change."""
-    if not project_hooks:
+    """Record the user's decision to trust exactly this repo's gated
+    config (project hooks AND MCP servers), so they aren't re-prompted
+    until either changes."""
+    if not project_hooks and not project_mcp:
         return
     store = trust_store if trust_store is not None else _DEFAULT_TRUST_STORE
     _record(
-        store, str(project_root.resolve()), _fingerprint(project_hooks)
+        store,
+        str(project_root.resolve()),
+        _fingerprint(project_hooks, project_mcp),
     )
 
 
-def _fingerprint(specs: list[HookSpec]) -> str:
-    """A stable hash over the hooks' executable surface. Changing any
-    command / matcher / event / timeout invalidates trust (re-prompts);
-    reordering does not."""
-    payload = sorted(
-        (s.event, s.matcher, s.command, s.timeout) for s in specs
+def _fingerprint(
+    specs: list[HookSpec], mcp: list[McpEntry] | None = None
+) -> str:
+    """A stable hash over a repo's gated executable surface — hooks AND
+    MCP servers. Changing any hook command/matcher/event/timeout, or any
+    MCP server's name/transport/command/args/url, invalidates trust
+    (re-prompts); reordering does not. ``mcp`` defaults to ``None`` so
+    existing hook-only callers keep the same fingerprint."""
+    hook_payload = sorted(
+        ("hook", s.event, s.matcher, s.command, s.timeout) for s in specs
     )
-    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+    mcp_payload = sorted(
+        (
+            "mcp",
+            m.spec.name,
+            m.spec.transport,
+            m.spec.command or "",
+            tuple(m.spec.args),
+            m.spec.url or "",
+        )
+        for m in (mcp or [])
+    )
+    return hashlib.sha256(
+        repr(hook_payload + mcp_payload).encode("utf-8")
+    ).hexdigest()
 
 
 def _load(store: Path) -> dict[str, str]:

@@ -35,7 +35,11 @@ dependencies = [
     # without disabling fact extraction. Loom-code relies on
     # this — without it the previous explicit auto_extract=False
     # band-aid would have to come back.
-    "loomflow[litellm,web]>=0.10.22",
+    # mcp: bundle the MCP SDK so loom-code speaks MCP out of the box
+    # (Linear / Sentry / Postgres / Playwright / … servers). Matches the
+    # competition — Claude Code / Cursor / Codex don't make you install a
+    # plugin to use MCP. Discovery degrades gracefully if it's ever absent.
+    "loomflow[litellm,web,mcp]>=0.10.23",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

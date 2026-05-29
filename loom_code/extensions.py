@@ -45,6 +45,14 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Type-only import: the annotation is a string under
+    # ``from __future__ import annotations``, so this never loads the
+    # ``mcp`` extra at runtime. The actual spec is constructed lazily in
+    # ``_discover_mcp`` where the import is genuinely needed.
+    from loomflow.mcp import MCPServerSpec
 
 # The two scope roots. ``.loom`` (project) matches ``agent.LOOM_DIR``;
 # ``.loom-code`` (user, with the hyphen) matches
@@ -109,6 +117,23 @@ class HookSpec:
     source: str = "project"  # "user" | "project"
 
 
+@dataclass(frozen=True)
+class McpEntry:
+    """An MCP server declared in a ``[[mcp]]`` block of ``settings.toml``.
+
+    ``source`` is "user" or "project"; the trust gate keys off it exactly
+    as it does for :class:`HookSpec` — a project-declared server from an
+    untrusted repo is dropped, a user-scope server is your own config and
+    always kept (connecting an MCP server runs external code / hits an
+    external endpoint). ``spec`` is the framework's ``MCPServerSpec``,
+    built lazily in :func:`_discover_mcp` so importing this module never
+    requires the ``mcp`` extra.
+    """
+
+    source: str
+    spec: MCPServerSpec
+
+
 @dataclass
 class Extensions:
     """Everything discovered across the user + project layers.
@@ -122,9 +147,20 @@ class Extensions:
     skill_paths: list[Path] = field(default_factory=list)
     agent_specs: list[AgentSpec] = field(default_factory=list)
     hook_specs: list[HookSpec] = field(default_factory=list)
+    # MCP servers declared in settings.toml [[mcp]] blocks, each tagged
+    # with its source ("user" | "project") so the trust gate can drop
+    # project-declared servers from an untrusted repo — same posture as
+    # project hooks (connecting an MCP server runs external code / hits
+    # an external endpoint, so a cloned repo must not auto-connect one).
+    mcp_specs: list[McpEntry] = field(default_factory=list)
 
     def has_any(self) -> bool:
-        return bool(self.skill_paths or self.agent_specs or self.hook_specs)
+        return bool(
+            self.skill_paths
+            or self.agent_specs
+            or self.hook_specs
+            or self.mcp_specs
+        )
 
 
 def safe_role_name(name: str) -> str:
@@ -182,6 +218,11 @@ def discover(
     ext.agent_specs = list(merged.values())
 
     ext.hook_specs = _discover_hooks(user_base, "user") + _discover_hooks(
+        project_base, "project"
+    )
+    # MCP servers — additive across scopes like hooks. A project's
+    # [[mcp]] servers ride the same trust gate (see loom_code.trust).
+    ext.mcp_specs = _discover_mcp(user_base, "user") + _discover_mcp(
         project_base, "project"
     )
     return ext
@@ -310,6 +351,95 @@ def _discover_hooks(base: Path, source: str) -> list[HookSpec]:
                 source=source,
             )
         )
+    return out
+
+
+def _discover_mcp(base: Path, source: str) -> list[McpEntry]:
+    """Parse ``[[mcp]]`` blocks from ``<base>/settings.toml`` into
+    :class:`McpEntry` (source-tagged :class:`MCPServerSpec`).
+
+    Each block declares one MCP server. Recognised keys::
+
+        [[mcp]]
+        name = "linear"            # required, unique
+        transport = "stdio"        # "stdio" (default) or "http"
+        command = "npx"            # stdio: the server binary
+        args = ["-y", "linear-mcp"]
+        env = { LINEAR_API_KEY = "..." }
+        # or, for http:
+        # transport = "http"
+        # url = "https://mcp.example.com"
+        # headers = { Authorization = "Bearer ..." }
+
+    Bad entries are skipped (missing name, or stdio without a command /
+    http without a url) rather than aborting the session — matches the
+    lenient, never-crash posture of :func:`_discover_hooks`. Returns
+    ``[]`` when the ``mcp`` extra isn't installed (the lazy import
+    fails) so loom-code runs fine without it.
+    """
+    settings = base / "settings.toml"
+    if not settings.is_file():
+        return []
+    try:
+        data = tomllib.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    raw = data.get("mcp")
+    if not isinstance(raw, list):
+        return []
+    try:
+        from loomflow.mcp import MCPServerSpec
+    except ImportError:
+        # ``mcp`` extra not installed — silently skip MCP discovery.
+        return []
+    out: list[McpEntry] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        if not name:
+            continue
+        transport = str(entry.get("transport", "stdio")).strip() or "stdio"
+        command = str(entry.get("command", "")).strip() or None
+        url = str(entry.get("url", "")).strip() or None
+        # Skip specs that can't possibly connect — same "bad entry is
+        # dropped, not fatal" rule as hooks.
+        if transport == "stdio" and not command:
+            continue
+        if transport == "http" and not url:
+            continue
+        # MCPServerSpec is a frozen dataclass with hashable (tuple)
+        # fields, so coerce the TOML list/dict into tuples here.
+        args_raw = entry.get("args", [])
+        args = (
+            tuple(str(a) for a in args_raw)
+            if isinstance(args_raw, list)
+            else ()
+        )
+        env_raw = entry.get("env", {})
+        env = (
+            tuple((str(k), str(v)) for k, v in env_raw.items())
+            if isinstance(env_raw, dict)
+            else ()
+        )
+        headers_raw = entry.get("headers", {})
+        headers = (
+            tuple((str(k), str(v)) for k, v in headers_raw.items())
+            if isinstance(headers_raw, dict)
+            else ()
+        )
+        description = str(entry.get("description", "")).strip()
+        spec = MCPServerSpec(
+            name=name,
+            transport=transport,  # type: ignore[arg-type]
+            command=command,
+            args=args,
+            env=env,
+            url=url,
+            headers=headers,
+            description=description,
+        )
+        out.append(McpEntry(source=source, spec=spec))
     return out
 
 

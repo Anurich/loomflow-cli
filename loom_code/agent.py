@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from importlib.resources import files as _pkg_files
 from pathlib import Path
+from typing import Any
 
 from loomflow import Agent
 from loomflow.team import Team
@@ -187,6 +188,27 @@ def build_agent(
         window = context_window_for(model)
         auto_compact_at_tokens = int(window * 0.8)
 
+    # MCP servers (trust-gated above, so only servers from a trusted
+    # repo or the user's own config survive). Built into one registry
+    # and handed to the coder — the sole writer/executor — so its tools
+    # join the coder's kernel. The registry connects lazily (on first
+    # tool use), so an unreachable server costs nothing until called.
+    # Stashed on the coordinator (``_mcp_registry``) so the REPL/sidecar
+    # can ``await registry.aclose()`` on exit.
+    mcp_registry: Any | None = None
+    if extensions.mcp_specs:
+        try:
+            from loomflow.mcp import MCPRegistry
+
+            mcp_registry = MCPRegistry(
+                [entry.spec for entry in extensions.mcp_specs]
+            )
+        except ImportError:
+            # ``mcp`` extra not installed — skip MCP rather than fail the
+            # build. (Discovery already degrades, but a user could pass
+            # pre-built Extensions; belt-and-suspenders.)
+            mcp_registry = None
+
     workers = build_workers(
         project,
         model=model,
@@ -196,6 +218,7 @@ def build_agent(
         auto_compact_at_tokens=auto_compact_at_tokens,
         snip_window=snip_window,
         effort=effort,
+        mcp_registry=mcp_registry,
     )
 
     # Custom .loom subagents join as delegate WORKERS. The coordinator
@@ -283,6 +306,12 @@ def build_agent(
         attach_tool_hooks(
             tool_agent, extensions.hook_specs, cwd=project.root
         )
+
+    # Stash the MCP registry on the coordinator so the REPL / sidecar can
+    # tear it down (``await coordinator._mcp_registry.aclose()``) on exit
+    # — mirrors how the worker registry is carried on the coordinator.
+    # ``None`` when no MCP servers were discovered (the common case).
+    coordinator._mcp_registry = mcp_registry  # type: ignore[attr-defined]
 
     return coordinator, workspace
 

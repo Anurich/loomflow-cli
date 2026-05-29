@@ -228,29 +228,50 @@ def _build_coder(
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
     effort: str | None = None,
+    mcp_registry: Any | None = None,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
     (write / edit / bash) through the shared approval handler.
     ``has_web`` toggles the `web_search` section in the prompt —
     keep this in lockstep with whether ``build_workers`` actually
-    attaches the tool, else the prompt lies."""
+    attaches the tool, else the prompt lies.
+
+    ``mcp_registry`` (an ``MCPRegistry``, typed ``Any`` to avoid a hard
+    ``mcp``-extra import) adds the user's MCP-server tools to the coder
+    — the ONLY worker that gets them, since it's the sole writer/executor.
+    When set, the coder's static tools are wrapped in an
+    ``McpAugmentedHost`` so MCP tools resolve lazily (connect-on-first-
+    use) and static builtins win any name collision."""
     root = project.root
+    static_tools: list[Any] = [
+        read_tool(root),
+        write_tool(root),
+        edit_tool(root),
+        multi_edit_tool(root),
+        grep_tool(root),
+        find_tool(root),
+        ls_tool(root),
+        bash_tool(root, timeout=300.0),
+        web_fetch_tool(),
+    ]
+    # Default: pass the static list straight through (framework wraps it
+    # in an InProcessToolHost). With MCP, build that host ourselves and
+    # compose it with the registry as one ToolHost.
+    tools: Any = static_tools
+    if mcp_registry is not None:
+        from loomflow.tools.registry import InProcessToolHost
+
+        from .mcp_host import McpAugmentedHost
+
+        tools = McpAugmentedHost(
+            InProcessToolHost(static_tools), mcp_registry
+        )
     return Agent(
         build_coder_prompt(project, has_web=has_web),
         model=model,
         architecture=ReAct(),
-        tools=[
-            read_tool(root),
-            write_tool(root),
-            edit_tool(root),
-            multi_edit_tool(root),
-            grep_tool(root),
-            find_tool(root),
-            ls_tool(root),
-            bash_tool(root, timeout=300.0),
-            web_fetch_tool(),
-        ],
+        tools=tools,
         # Bundled skills (graphify, etc.) — registered on workers
         # too, not just the coordinator. Without this, when the
         # coordinator delegates "build the graph" to coder, the
@@ -393,6 +414,7 @@ def build_workers(
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
     effort: str | None = None,
+    mcp_registry: Any | None = None,
 ) -> dict[str, Agent]:
     """Build the worker roster for ``Team.supervisor``.
 
@@ -425,6 +447,7 @@ def build_workers(
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
             effort=effort,
+            mcp_registry=mcp_registry,
         ),
         "explorer": _build_explorer(
             project,

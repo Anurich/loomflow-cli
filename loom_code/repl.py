@@ -173,6 +173,7 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/discard", "discard the isolated session's edits"),
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
+    ("/mcp", "list connected MCP servers + their tools"),
     ("/resume", "resume the last session (rehydrate prior turns)"),
     ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
     ("/clear", "fresh conversation (new session)"),
@@ -332,13 +333,29 @@ class Repl:
 
         Skills (graphify and friends) are wired in at agent
         construction time via :func:`build_agent` — no per-session
-        spawning, no subprocess lifecycle to manage here. The
-        run-method's ``finally`` block used to ``aclose()`` an MCP
-        subprocess from the prior MCP-based graphify integration;
-        that's no longer needed now that graphify is a bundled
-        skill (Mode B Python tools, in-process).
+        spawning, no subprocess lifecycle to manage here.
+
+        The ``finally`` DOES tear down the MCP registry: ``build_agent``
+        stashes any connected MCP servers on ``agent._mcp_registry``,
+        and those hold live subprocess / HTTP sessions (stdio servers
+        are child processes). Closing them on every exit path — normal
+        quit, Ctrl-C, or an exception — avoids leaking processes.
         """
-        return await self._run_inner()
+        try:
+            return await self._run_inner()
+        finally:
+            await self._aclose_mcp()
+
+    async def _aclose_mcp(self) -> None:
+        """Best-effort teardown of the MCP registry's sessions. Never
+        raises — shutdown must not turn a clean exit into an error."""
+        registry = getattr(self.agent, "_mcp_registry", None)
+        if registry is None:
+            return
+        try:
+            await registry.aclose()
+        except Exception:  # noqa: BLE001 — teardown must not fail exit
+            pass
 
     async def _run_inner(self) -> int:
         """The REPL loop body. Held as a separate method in case a
@@ -1035,12 +1052,50 @@ class Repl:
             self._handle_merge()
         elif cmd == "/discard":
             self._handle_discard()
+        elif cmd == "/mcp":
+            await self._handle_mcp()
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
                 "/help for the list"
             )
         return True
+
+    async def _handle_mcp(self) -> None:
+        """List the connected MCP servers + their tools.
+
+        Reads the registry stashed on the coordinator by ``build_agent``.
+        Connecting is lazy, so this is the first thing that actually
+        opens the sessions — surfaces a misconfigured server here rather
+        than mid-task."""
+        registry = getattr(self.agent, "_mcp_registry", None)
+        if registry is None:
+            console.print(
+                "  [dim]No MCP servers configured. Add an [[mcp]] block "
+                "to .loom/settings.toml (or ~/.loom-code/settings.toml) "
+                "and restart.[/dim]"
+            )
+            return
+        names = registry.server_names
+        console.print(
+            f"  [cyan]MCP servers[/cyan] ({len(names)}): "
+            f"{', '.join(names) if names else '—'}"
+        )
+        try:
+            tools = await registry.list_tools()  # lazily connects
+        except Exception as exc:  # noqa: BLE001 — surface, don't crash
+            console.print(
+                f"  [red]failed to list MCP tools:[/red] {exc}"
+            )
+            return
+        if not tools:
+            console.print("  [dim]no tools exposed yet.[/dim]")
+            return
+        console.print(f"  [cyan]tools[/cyan] ({len(tools)}):")
+        for t in tools:
+            desc = (t.description or "").strip().splitlines()
+            first = desc[0] if desc else ""
+            console.print(f"    [green]{t.name}[/green]  [dim]{first}[/dim]")
 
     def _switch_model(self, model: str) -> None:
         """Rebuild the agent on a new model. Keeps the project +
