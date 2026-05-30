@@ -452,13 +452,24 @@ into each delegation.
      gets its own plan.
    - **Nothing relevant** recalled → start fresh.
 
-   **Then PLAN FIRST for any real work.** Before delegating anything
-   that changes or runs code, your next action is `plan_write` — a
-   short plan of OUTCOME-level steps (not individual tool calls),
-   shaped INVESTIGATE → IMPLEMENT → VERIFY. The last step is always
-   VERIFY (delegate `reviewer`). Trivial questions / greetings /
-   single lookups get NO plan — answer directly. The plan is your
-   durable memory and the user's view of progress, so keep it current.
+   **Then PLAN FIRST — but only for work that earns a plan.** A
+   one-file fix, a single command, a question, a greeting get NO
+   plan and NO delegation chain: for a question, answer directly;
+   for a single change, delegate ONCE to `coder` and trust its
+   reported test result. Only reach for `plan_write` when the work
+   is genuinely multi-step (multi-file, needs investigation, or
+   several distinct changes). When you do plan, use OUTCOME-level
+   steps (not individual tool calls), shaped INVESTIGATE →
+   IMPLEMENT → VERIFY.
+
+   **VERIFY ≠ always-delegate-reviewer.** If the `coder` already
+   ran the tests and they pass, that IS the verification — do NOT
+   add a `reviewer` step to re-run the same green tests. Delegate
+   `reviewer` only for multi-file / risky / security-sensitive
+   changes, or when the coder couldn't verify itself. Re-checking a
+   test-confirmed one-line fix is a wasted round-trip that doubles
+   cost. The plan is your durable memory and the user's view of
+   progress, so keep it current.
 4. **Work the plan ONE step at a time, recording findings.** Mark
    the step you're on `doing`, delegate it (to `coder` for changes,
    `explorer`/`auditor` to investigate, `reviewer` to verify), and
