@@ -61,6 +61,7 @@ from .edit_tool import multi_edit_tool
 from .edit_tool import verifying_edit_tool as edit_tool
 from .extensions import AgentSpec
 from .grep_tool import enhanced_grep_tool as grep_tool
+from .lsp_tools import lsp_tools
 from .project import Project
 from .prompts import build_coder_prompt
 from .web_fetch import web_fetch_tool
@@ -102,15 +103,19 @@ How you work:
 - If the question has sub-parts, answer each.
 - End with a short, direct summary the lead can act on.
 
-**Before you finish, write a finding note.** Call
-`note(kind="finding", title="<short, searchable>", content=<your
-findings, including path:line citations>)`. The lead and the
-next worker run in fresh sessions — your note in the notebook is
-how they avoid re-investigating what you just figured out. Make
-the title keyword-rich so `search_notes()` finds it.
+**When your finding is non-trivial, write ONE finding note.** If
+you uncovered something a teammate would otherwise have to re-
+investigate (where a subsystem lives, how a flow wires together, a
+gotcha), call `note(kind="finding", title="<short, searchable>",
+content=<your findings, including path:line citations>)` so the
+next fresh-session worker reuses it. Make the title keyword-rich.
+But for a quick lookup or a one-line answer, SKIP the note — your
+report to the lead is enough; a note that just restates a simple
+answer is noise that costs everyone tokens.
 
 Be exhaustive on facts, terse on prose — wasted words cost the
-lead context.
+lead context. No summary documents or banners; your report is the
+only thing read.
 """
 
 # Appended onto _EXPLORER_PROMPT only when the explorer was built
@@ -161,13 +166,16 @@ How you work:
 - If you find nothing real, say so — do NOT invent problems to
   look thorough.
 
-**Before you finish, write a finding note.** Call
+**When you found real issues, write ONE finding note.** If the
+audit turned up blockers/risks worth preserving, call
 `note(kind="finding", title="<area>: <severity gist>",
-content=<your tagged findings with path:line citations>)`. Cross-
-turn memory — the lead and the next worker pick this up via
-`search_notes()` instead of re-auditing the same area.
+content=<your tagged findings with path:line citations>)` so the
+lead and next worker pick it up via `search_notes()` instead of
+re-auditing. If you found nothing notable, SKIP the note and just
+say so in your report — don't write a note to record "no issues".
 
-End with a one-line summary: how many blockers / risks / nits.
+End with a one-line summary: how many blockers / risks / nits. No
+summary documents or banners — the report is the only thing read.
 """
 
 _REVIEWER_PROMPT = """\
@@ -226,6 +234,11 @@ def _read_only_tools(
         find_tool(root),
         ls_tool(root),
         web_fetch_tool(),
+        # LSP navigation (jedi) — go_to_definition / find_references /
+        # hover. Read-only by construction (static analysis, no disk
+        # write); given to every worker so explorers/auditors navigate
+        # by symbol, not grep. Python only; no embedder needed.
+        *lsp_tools(root),
     ]
     if embedder is not None:
         # Same embedder name the coordinator + memory use, so every
@@ -300,11 +313,16 @@ def _build_coder(
         ls_tool(root),
         bash,
         web_fetch_tool(),
+        # LSP navigation (jedi) — the writer locates the symbol to
+        # change by resolution, not grep, before editing. Read-only.
+        *lsp_tools(root),
     ]
     if embedder is not None:
         # Semantic search for the writer too — locate the code to
         # change by meaning before editing. Same shared index.
-        static_tools.insert(5, codebase_search_tool(root, embedder, workspace=workspace))
+        static_tools.insert(
+            5, codebase_search_tool(root, embedder, workspace=workspace)
+        )
     # Default: pass the static list straight through (framework wraps it
     # in an InProcessToolHost). With MCP, build that host ourselves and
     # compose it with the registry as one ToolHost.

@@ -58,6 +58,11 @@ dependencies = [
     # (tree-sitter grammars, NetworkX, Leiden); acceptable price
     # for zero-config knowledge-graph integration.
     "graphifyy",
+    # jedi powers the LSP navigation tools (go_to_definition /
+    # find_references / hover) — pure-Python static analysis, the
+    # engine behind most editors' Python intelligence. No
+    # language-server process; lightweight.
+    "jedi>=0.19",
 ]
 
 [project.optional-dependencies]

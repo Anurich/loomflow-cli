@@ -34,6 +34,7 @@ from .code_index import codebase_search_tool
 from .extensions import Extensions, safe_role_name
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .hooks import attach_tool_hooks
+from .lsp_tools import lsp_tools
 from .project import Project
 from .prompts import build_unified_coordinator_instructions
 from .rules import remember_rule_tool
@@ -270,6 +271,10 @@ def build_agent(
         # with what we've LEARNED about them. The coordinator gets it
         # to locate the right subsystem before delegating.
         codebase_search_tool(root, embedder, workspace=workspace),
+        # LSP navigation (jedi) — go_to_definition / find_references /
+        # hover resolve symbols through imports + scope like an IDE,
+        # where grep only matches strings. Read-only; Python only.
+        *lsp_tools(root),
         find_tool(root),
         ls_tool(root),
         web_fetch_tool(),
