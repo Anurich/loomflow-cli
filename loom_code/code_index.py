@@ -44,9 +44,10 @@ import hashlib
 import math
 import sqlite3
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from loomflow import tool
 from loomflow.tools.registry import Tool
@@ -290,7 +291,7 @@ class CodeIndexStore:
         half-indexed."""
         cur = self._conn
         cur.execute("DELETE FROM chunks WHERE path = ?", (rel_path,))
-        for chunk, vec in zip(chunks, vectors):
+        for chunk, vec in zip(chunks, vectors, strict=True):
             cur.execute(
                 "INSERT OR REPLACE INTO chunks "
                 "(id, path, qualname, kind, start_line, end_line, "
@@ -378,7 +379,9 @@ def _cosine(a: Sequence[float], b: Sequence[float], a_norm: float) -> float:
     bn = _norm(b)
     if bn == 0.0:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    # strict=False: a dim mismatch is already guarded above (returns
+    # 0.0), so don't raise here — just stop at the shorter vector.
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     return dot / (a_norm * bn)
 
 
@@ -439,7 +442,11 @@ async def search_code(
     cheap. Returns ``[]`` (never raises) on an empty index so the caller
     can degrade gracefully.
     """
-    root_p = Path(root).resolve()
+    # Sync filesystem ops in an async fn are intentional here: these are
+    # local-path resolves + a mkdir, microsecond-scale, and the rest of
+    # this module uses sqlite/pathlib synchronously by design. Pulling in
+    # anyio.path for one resolve buys nothing.
+    root_p = Path(root).resolve()  # noqa: ASYNC240
     db_path = root_p / ".loom" / "code_index.db"
     db_path.parent.mkdir(exist_ok=True)
     embedder = resolve_embedder(embedder_name)
