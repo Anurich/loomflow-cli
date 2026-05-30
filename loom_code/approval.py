@@ -25,6 +25,49 @@ from rich.text import Text
 
 from .render import console
 
+# History-/repo-destroying shell commands. These are NOT covered by the
+# "allow all this session" choice — even after the user picks 'a', one
+# of these still demands a fresh, explicit confirmation, because they're
+# irreversible in a way ordinary edits aren't. A real incident motivated
+# this: the agent ran ``rm -rf .git`` on request and silently deleted a
+# repo's entire history with no extra friction. Patterns are matched
+# against the normalized (lowercased, whitespace-collapsed) command.
+_DANGER_PATTERNS: tuple[str, ...] = (
+    "rm -rf .git",
+    "rm -r .git",
+    "rm -fr .git",
+    "rm -rf .git/",
+    "git reset --hard",
+    "git clean -fd",
+    "git clean -xfd",
+    "git push --force",
+    "git push -f",
+    "git push --force-with-lease",
+    "git branch -d",  # force-delete branch
+    "git update-ref -d",
+    "rm -rf /",
+)
+
+
+def _is_danger_command(tool: str, args: dict[str, Any]) -> str | None:
+    """Return a human label if this call is a history-/repo-destroying
+    bash command, else None. Only ``bash`` can carry these — edits and
+    writes are bounded to a single file and already gated.
+
+    The normalized match collapses ``rm   -rf    .git`` and quoting
+    variants down so a stray space can't slip a destructive command
+    past the check. False positives are acceptable here: an extra
+    confirmation on a benign ``git reset --hard`` to a known-safe ref
+    costs one keypress; a missed ``rm -rf .git`` costs the repo."""
+    if tool != "bash":
+        return None
+    cmd = str(args.get("command", "")).lower()
+    norm = " ".join(cmd.split())
+    for pat in _DANGER_PATTERNS:
+        if pat in norm:
+            return pat
+    return None
+
 
 def _read_single_key() -> str:
     """Read ONE keypress without waiting for Enter.
@@ -108,11 +151,20 @@ class ApprovalGate:
     ) -> bool:
         """The ``approval_handler`` loomflow calls. ``call`` is a
         ``ToolCall``; return True to allow, False to deny."""
-        if self._allow_all:
-            return True
-
         tool = getattr(call, "tool", "?")
         args = getattr(call, "args", {}) or {}
+
+        # History-/repo-destroying commands get a HARD gate that
+        # 'allow all this session' does NOT bypass — they're
+        # irreversible and a single careless 'a' earlier in the
+        # session must not silently green-light wiping git history.
+        # This check runs BEFORE the _allow_all shortcut on purpose.
+        danger = _is_danger_command(tool, args)
+        if danger is not None:
+            return await self._confirm_danger(danger, args)
+
+        if self._allow_all:
+            return True
 
         # Pause the spinner BEFORE any console output — even the
         # warning lines below get garbled if the Live is still
@@ -146,6 +198,48 @@ class ApprovalGate:
         return False
 
     # ---- internals ------------------------------------------------------
+
+    async def _confirm_danger(
+        self, label: str, args: dict[str, Any]
+    ) -> bool:
+        """High-friction confirm for an irreversible command. Unlike the
+        normal gate there is NO 'allow all', and the default (Enter /
+        any non-'y' key / Esc) is DENY — the user must deliberately type
+        'y' to proceed. Never auto-approves, regardless of session state
+        or ``--yes``-style handlers wrapped around this gate."""
+        self._pause_spinner()
+        try:
+            console.print()
+            console.print(
+                Text(
+                    f"  ⛔ DESTRUCTIVE: this would run '{label}' — it is "
+                    "IRREVERSIBLE",
+                    style="bold red",
+                )
+            )
+            cmd = str(args.get("command", ""))
+            console.print(Syntax(cmd, "bash", theme="ansi_dark"))
+            console.print(
+                Text(
+                    "  This permanently destroys history / data and is "
+                    "NOT covered by 'allow all'.",
+                    style="red",
+                )
+            )
+            console.print(
+                "  [bold]Type 'y' to confirm, anything else cancels:[/bold]"
+                " ",
+                end="",
+                highlight=False,
+            )
+            choice = await anyio.to_thread.run_sync(_read_single_key)
+        finally:
+            self._resume_spinner()
+        if choice in ("y", "Y"):
+            console.print("[red]confirmed[/red]")
+            return True
+        console.print("[green]cancelled[/green]")
+        return False
 
     def _ask(self) -> str:
         """Blocking single-keypress choice. Runs on a worker thread.
