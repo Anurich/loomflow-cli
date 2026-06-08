@@ -18,6 +18,11 @@ venv/
 # Tooling caches
 .pytest_cache/
 .ruff_cache/
+
+# Browser-operator (/computer) runtime artifacts — page snapshots,
+# console logs, screenshots. Not source.
+.playwright-mcp/
+last_page.png
 .mypy_cache/
 
 # loom-code per-project runtime state + generated indices

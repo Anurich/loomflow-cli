@@ -201,6 +201,7 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/mcp", "list connected MCP servers + their tools"),
+    ("/computer", "browser control — agent drives a real browser (Playwright)"),
     ("/resume", "resume the last session (rehydrate prior turns)"),
     ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
     ("/clear", "fresh conversation (new session)"),
@@ -286,6 +287,14 @@ class Repl:
         self._extensions = self._consume_trusted_extensions(
             discover_extensions(project.root)
         )
+        # /computer browser-control mode. When on, the agent gets the
+        # Playwright MCP server (browser_navigate/snapshot/click/type …)
+        # + a browser-oriented prompt. Off by default — toggled by the
+        # /computer command, which injects the spec + rebuilds the agent.
+        self._browser_mode: bool = False
+        # Model the session was on before /computer bumped to a stronger
+        # one — restored if operator mode is turned off.
+        self._pre_operator_model: str | None = None
         # Graphify and other bundled skills are auto-registered
         # by build_agent (see _bundled_skill_paths). No per-session
         # toggle needed — the agent decides when to load skills.
@@ -298,6 +307,7 @@ class Repl:
             effort=self._effort,
             sandbox=self._sandbox,
             sandbox_allow_network=self._sandbox_allow_network,
+            operator=self._browser_mode,
         )
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
@@ -1217,6 +1227,8 @@ class Repl:
             self._handle_discard()
         elif cmd == "/mcp":
             await self._handle_mcp()
+        elif cmd == "/computer":
+            await self._handle_computer(arg)
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -1279,6 +1291,11 @@ class Repl:
             return
         self.model = model
         self._rebuild_agent()
+        # Persist so this model is the default on the next launch — the
+        # user shouldn't have to re-pick it every time.
+        from .credentials import save_preferred_model
+
+        save_preferred_model(model)
         console.print(
             f"  [dim]switched to {model} — fresh conversation[/dim]"
         )
@@ -1422,6 +1439,66 @@ class Repl:
                 style = "default"
             console.print(Text(raw or " ", style=style))
 
+    async def _handle_computer(self, arg: str) -> None:
+        """``/computer [task]`` — turn on COMPUTER OPERATOR mode: the agent
+        gets loom-code's built-in browser engine (page_open/observe/act/
+        check) + media/app tools + files/shell, under an operator prompt.
+        Rebuilds the agent, then (if a task was given) runs it.
+
+        The browser engine is Playwright-based (already installed); a
+        visible Chromium window opens on the first page_open. Operator
+        mode also upgrades to a STRONGER reasoning model (browser
+        comprehension is hard for small models) when its key is
+        available — the coding session's model is restored on exit."""
+        if not self._browser_mode:
+            self._browser_mode = True
+            # Bump to a stronger reasoning model for browser comprehension
+            # (gpt-4.1-mini struggles with dense dynamic pages). Pick the
+            # first candidate whose API key is already set; else keep the
+            # current model. Remember the original to restore later.
+            self._pre_operator_model = self.model
+            strong = self._pick_operator_model()
+            if strong and strong != self.model:
+                self.model = strong
+            self._rebuild_agent()
+            console.print(
+                "  [green]✓[/green] computer operator on — driving a visible "
+                f"browser + files/shell/apps, on [cyan]{self.model}[/cyan]. "
+                "[dim]A Chromium window opens on the first web action.[/dim]"
+            )
+        if arg.strip():
+            await self._turn(arg.strip())
+
+    def _pick_operator_model(self) -> str | None:
+        """Choose a strong reasoning model for operator mode — the first
+        candidate whose API key is already configured (so we never prompt
+        or fail). Returns None to keep the current model if no stronger
+        one is usable."""
+        from .credentials import required_env_for_model
+
+        cur = self.model.lower()
+
+        # If already on a capable model, keep it (don't downgrade).
+        if cur in ("gpt-4.1", "claude-sonnet-4-6", "claude-opus-4-7") \
+                or "opus" in cur:
+            return None
+
+        # Choose the upgrade by which PROVIDER the user is already on, so
+        # we never switch to a provider whose account may be unfunded.
+        # A set key only proves the key exists, NOT that it has credits
+        # (Anthropic 400s "credit balance too low" otherwise) — so we
+        # stay within the current provider's family.
+        if "claude" in cur:
+            target = "claude-sonnet-4-6"
+        else:
+            # OpenAI family (gpt-*, o-series) → the strong OpenAI model.
+            target = "gpt-4.1"
+
+        env = required_env_for_model(target)
+        if env is None or os.environ.get(env):
+            return target
+        return None
+
     def _rebuild_agent(self) -> None:
         """Reconstruct the supervisor + workers using the current
         ``self.model`` and ``self._web_backend``. Used by
@@ -1445,6 +1522,7 @@ class Repl:
             effort=self._effort,
             sandbox=self._sandbox,
             sandbox_allow_network=self._sandbox_allow_network,
+            operator=self._browser_mode,
         )
         self._compactor = Compactor(model=self.model)
         self._compact_tokens = 0

@@ -106,6 +106,7 @@ def build_agent(
     effort: str | None = None,
     sandbox: bool = False,
     sandbox_allow_network: bool = False,
+    operator: bool = False,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code agent for a given project.
 
@@ -287,6 +288,44 @@ def build_agent(
         from loomflow.tools import web_tool
         coordinator_tools.append(web_tool(backend=web_backend))
 
+    # COMPUTER OPERATOR mode (/computer): the coordinator is the agent the
+    # user talks to, so in operator mode it must hold the ACTION tools
+    # DIRECTLY — not delegate to a worker (the bug that made browser tools
+    # unreachable). Add write/edit/bash (act on files + system) + native
+    # media/app tools + loom-code's OWN browser engine (page_open/observe/
+    # act/check — stable data-loom-id handles + overlay-safe acting +
+    # vision verify, replacing the Playwright MCP browser).
+    coordinator_instructions = build_unified_coordinator_instructions(project)
+    coordinator_tool_host: Any = coordinator_tools
+    if operator:
+        from loomflow.tools import bash_tool, edit_tool, write_tool
+
+        from .browse import browse_tools
+        from .operator import OPERATOR_PROMPT, media_app_tools
+
+        coordinator_tools.extend(
+            [
+                write_tool(root),
+                edit_tool(root),
+                bash_tool(root, timeout=300.0),
+                *media_app_tools(),
+                *browse_tools(model=model),
+            ]
+        )
+        coordinator_instructions = OPERATOR_PROMPT
+    # Compose the coordinator's tools with the MCP registry so the
+    # coordinator itself can call browser_* (and any other MCP) tools.
+    # In operator mode this is what makes browser control reachable by
+    # the agent the user talks to.
+    if mcp_registry is not None:
+        from loomflow.tools.registry import InProcessToolHost
+
+        from .mcp_host import McpAugmentedHost
+
+        coordinator_tool_host = McpAugmentedHost(
+            InProcessToolHost(coordinator_tools), mcp_registry
+        )
+
     # ``max_stop_hook_iterations`` bounds the framework Ralph loop:
     # while the LivingPlan still has todo/doing steps after the model
     # stops, the StopHook re-prompts it to continue — up to this many
@@ -298,10 +337,20 @@ def build_agent(
     # then stop. In-turn persistence (the "own the run" prompt rule)
     # is the primary mechanism; this is just a small safety net.
     # ``/set_continue_cap`` tunes it per session.
+    # In operator mode the coordinator runs destructive/real-world tools
+    # itself (write/edit/bash/browser), so it needs the approval gate +
+    # permissions — exactly as the coder does in coding mode. In coding
+    # mode the coordinator stays read-only (gate lives on the workers).
+    _coord_extra: dict[str, Any] = {}
+    if operator:
+        from loomflow import StandardPermissions
+
+        _coord_extra["permissions"] = StandardPermissions()
+        _coord_extra["approval_handler"] = approval_handler
     coordinator = Team.supervisor(
         workers=workers,
-        instructions=build_unified_coordinator_instructions(project),
-        tools=coordinator_tools,
+        instructions=coordinator_instructions,
+        tools=coordinator_tool_host,
         model=model,
         memory=memory_cfg,
         workspace=workspace,
@@ -315,9 +364,7 @@ def build_agent(
         auto_compact_at_tokens=auto_compact_at_tokens,
         effort=effort,
         persist_tool_transcripts=True,
-        # No permissions/approval on the coordinator — its tools are
-        # read-only. The destructive-tool gate + approval bridge live
-        # on the workers (coder/reviewer), where edits and bash run.
+        **_coord_extra,
     )
 
     # Tool hooks attach to every agent that touches the codebase. The

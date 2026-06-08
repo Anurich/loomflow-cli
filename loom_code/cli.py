@@ -244,9 +244,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
+        default=None,
         help=(
-            f"Model to use (default: {DEFAULT_MODEL}). Accepts any "
+            f"Model to use (default: last-used, else {DEFAULT_MODEL}). "
+            "Accepts any "
             "string loomflow's resolver routes: Anthropic names "
             "(claude-sonnet-4-6, claude-opus-4-7, ...), OpenAI "
             "names (gpt-4.1-mini, gpt-4.1, o4-mini, ...), local "
@@ -289,8 +290,19 @@ def main() -> None:
     # Both happen BEFORE any Agent is constructed — loomflow's
     # model adapter would crash at init on a missing key otherwise.
     load_credentials()
+    # Resolve the startup model: an explicit --model wins; else the model
+    # the user last chose (persisted via /model or /set_model); else the
+    # built-in default. This makes the chosen model STICK across launches.
+    if args.model is None:
+        from .credentials import load_preferred_model
+
+        args.model = load_preferred_model() or DEFAULT_MODEL
     if not ensure_key_for_model(args.model, console):
         sys.exit(1)
+    # Remember it so the next launch starts here too.
+    from .credentials import save_preferred_model
+
+    save_preferred_model(args.model)
 
     if not args.prompt:
         # No task → interactive REPL. --yes is meaningless here

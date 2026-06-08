@@ -33,6 +33,28 @@ from rich.console import Console
 # differentiator: "this is loom-code's GLOBAL config, not a project."
 _CREDENTIALS_DIR = Path.home() / ".loom-code"
 _CREDENTIALS_FILE = _CREDENTIALS_DIR / "credentials"
+# Remembers the user's chosen model across sessions, so launching
+# loom-code reuses the last model (via /model or /set_model) instead of
+# always reverting to the built-in default.
+_MODEL_FILE = _CREDENTIALS_DIR / "model"
+
+
+def save_preferred_model(model: str) -> None:
+    """Persist the chosen model to ``~/.loom-code/model``. Best-effort."""
+    try:
+        _CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        _MODEL_FILE.write_text(model.strip() + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_preferred_model() -> str | None:
+    """The model saved on a previous run, or None if none/unreadable."""
+    try:
+        m = _MODEL_FILE.read_text(encoding="utf-8").strip()
+        return m or None
+    except OSError:
+        return None
 
 # Where users go to grab a key, surfaced in the prompt so they
 # don't have to guess.
