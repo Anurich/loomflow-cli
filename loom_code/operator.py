@@ -109,7 +109,9 @@ def _open_app_tool() -> Tool:
 
 
 def _media_control_tool() -> Tool:
-    async def media_control(action: str, amount: int = 0) -> str:
+    async def media_control(
+        action: str, amount: int = 0, query: str = ""
+    ) -> str:
         """Control media playback / system volume."""
         action = action.strip().lower()
         if _OS != "Darwin":
@@ -119,6 +121,33 @@ def _media_control_tool() -> Tool:
             )
         # System media keys via AppleScript. Works for the active player
         # (Music/Spotify/browser media) on macOS.
+        # Play a SPECIFIC artist/song/playlist in Apple Music, if asked.
+        if action in ("play", "playpause", "toggle") and query.strip():
+            q = query.replace('"', '\\"')
+            # Open Music, search the catalog/library for the query, and
+            # play the first matching track. Uses Music's AppleScript
+            # play-by-search; falls back to a library artist filter.
+            script = (
+                'tell application "Music"\n'
+                '  activate\n'
+                '  try\n'
+                f'    play (every track whose artist contains "{q}")\n'
+                '  on error\n'
+                '    try\n'
+                f'      play (every track whose name contains "{q}")\n'
+                '    end try\n'
+                '  end try\n'
+                'end tell'
+            )
+            rc, _o, err = await _osascript(script)
+            if rc == 0:
+                return f'playing "{query}" in Apple Music'
+            return (
+                f'could not play "{query}" from your Music library '
+                f"({err or 'not found'}). It may not be in your library — "
+                "open Apple Music and search, or use the browser "
+                "(YouTube Music) instead."
+            )
         if action in ("play", "pause", "playpause", "toggle"):
             rc, _o, err = await _osascript(
                 'tell application "System Events" to key code 16 using {}'
@@ -155,11 +184,13 @@ def _media_control_tool() -> Tool:
     return tool(
         name="media_control",
         description=(
-            "Control music / media playback and system volume. Actions: "
-            "play, pause, next, previous, volume (pass amount 0-100), mute, "
-            "unmute. macOS only for now. To start a SPECIFIC song/playlist, "
-            "open_app('Spotify') or use the browser instead. Args: action; "
-            "amount (0-100, only for 'volume')."
+            "Control music / media playback + system volume (macOS). "
+            "Actions: play, pause, next, previous, volume (amount 0-100), "
+            "mute, unmute. To play a SPECIFIC artist/song, use "
+            "action='play' WITH query='Taylor Swift' — it searches your "
+            "Apple Music library and plays the match (if it's not in your "
+            "library, use the browser / YouTube Music instead). Args: "
+            "action; amount (for volume); query (artist/song to play)."
         ),
     )(media_control)
 
@@ -192,9 +223,50 @@ def _notify_tool() -> Tool:
     )(notify)
 
 
+def _reveal_tool() -> Tool:
+    async def reveal_in_finder(path: str) -> str:
+        """Open the file manager with the given file/folder highlighted."""
+        from pathlib import Path as _P
+
+        p = _P(path).expanduser()
+        # Resolve ~-relative + bare names against home so "Downloads/x"
+        # works like a human means it.
+        if not p.is_absolute():
+            p = _P.home() / path
+        target = str(p)
+        if _OS == "Darwin":
+            rc, _o, err = await _run(["open", "-R", target])
+            if rc != 0:  # -R fails if path missing; open the parent dir
+                await _run(["open", str(p.parent)])
+            return f"revealed {target} in Finder"
+        if _OS == "Windows":
+            await _run(["explorer", "/select,", target])
+            return f"revealed {target} in Explorer"
+        # Linux: open the containing folder.
+        if shutil.which("xdg-open"):
+            await _run(["xdg-open", str(p.parent)])
+            return f"opened {p.parent} in the file manager"
+        return f"file manager reveal not supported on {_OS}"
+
+    return tool(
+        name="reveal_in_finder",
+        description=(
+            "Open the file manager (Finder/Explorer) with a file or folder "
+            "highlighted, so the user SEES it. Use after creating or "
+            "changing a file the user will want to look at (e.g. after "
+            "writing ~/Downloads/test.py, reveal it). Arg: path."
+        ),
+    )(reveal_in_finder)
+
+
 def media_app_tools() -> list[Tool]:
     """The Tier 2 native media + app tools for the Operator."""
-    return [_open_app_tool(), _media_control_tool(), _notify_tool()]
+    return [
+        _open_app_tool(),
+        _media_control_tool(),
+        _notify_tool(),
+        _reveal_tool(),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +285,23 @@ whatever tool fits each step:
   page_look — it SCREENSHOTS the page and a vision model tells you what's
   actually on screen. Reach for page_look BEFORE giving up on finding
   info; seeing beats guessing.
-- Files / folders → read/write/edit/ls/find.
-- System / programs → bash; open apps with open_app; control music +
-  volume with media_control; surface results with notify.
+- Files / folders → read/write/edit/ls/find. These reach the user's
+  WHOLE machine (rooted at the home dir) — Downloads, Documents, Desktop,
+  anywhere. "create test.py in Downloads" → write ~/Downloads/test.py.
+  After CREATING a file the user will want to look at, reveal_in_finder
+  it so they SEE it pop up (writing is silent otherwise).
+- System / programs → bash (the user's real shell — use it freely for
+  system tasks), open apps with open_app, control music with
+  media_control (action='play', query='<artist>'), surface results with
+  notify.
+
+You CAN operate this computer. Don't refuse system tasks with "I don't
+have permission" — you have a real shell and home-rooted file access. For
+e.g. "check for system updates" run bash `softwareupdate -l`; "what's
+running" → `ps aux`; "free disk" → `df -h`. Actually DO the task with the
+tools; only the approval gate (which the user answers) can stop a
+destructive action. The one hard line is the SAFETY list below
+(purchases / mass-delete / sending on the user's behalf) — confirm first.
 
 How to work:
 - Break the request into small, observable steps and narrate each ("I'm

@@ -198,6 +198,28 @@ async def set_date(page: Any, loom_id: int | str, date_text: str) -> str:
     }
     """
 
+    # JS to close the open date dialog: click a "Done" (or confirm/search)
+    # button that lives inside the calendar dialog. Returns "clicked" |
+    # "none". We scope to a dialog/popup so we don't hit the page's main
+    # Search prematurely — but a "Done" anywhere visible is fine.
+    _CLOSE_CALENDAR_JS = r"""
+    () => {
+      const norm = (s) => (s || '').replace(/\s+/g,' ').trim().toLowerCase();
+      const wants = ['done', 'apply', 'ok', 'select', 'confirm'];
+      const els = document.querySelectorAll(
+        'button, [role="button"], [jsname]');
+      for (const el of els) {
+        const t = norm(el.innerText || el.textContent);
+        const al = norm(el.getAttribute('aria-label'));
+        if (wants.includes(t) || wants.includes(al)) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 2 && r.height > 2) { el.click(); return 'clicked'; }
+        }
+      }
+      return 'none';
+    }
+    """
+
     # Try to find the day; if not visible, click a "next month" control and
     # retry a few times (the target month may be ahead).
     for attempt in range(8):
@@ -210,9 +232,26 @@ async def set_date(page: Any, loom_id: int | str, date_text: str) -> str:
             return f"date-pick failed: {exc}"
         if res == "clicked":
             await asyncio.sleep(0.4)
+            # AUTO-CLOSE the calendar so the Search button becomes
+            # reachable. The model reliably fails to click "Done" itself
+            # (it clicks calendar arrows instead and gets stuck), so the
+            # tool does it: click a Done/Search/confirm control if one is
+            # in the open dialog, else press Escape.
+            closed = "no"
+            try:
+                closed = await page.evaluate(_CLOSE_CALENDAR_JS)
+            except Exception:  # noqa: BLE001
+                pass
+            if closed != "clicked":
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:  # noqa: BLE001
+                    pass
+            await asyncio.sleep(0.4)
             return (
-                f'selected {iso_target} ({long_frag}). page_observe to '
-                "continue (set the return date or click Search/Done)."
+                f'selected {iso_target} ({long_frag}) and closed the date '
+                "picker. page_observe → click the Search button to load "
+                "results, then page_read."
             )
         # Advance to the next month and retry.
         try:

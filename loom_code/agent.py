@@ -298,16 +298,29 @@ def build_agent(
     coordinator_instructions = build_unified_coordinator_instructions(project)
     coordinator_tool_host: Any = coordinator_tools
     if operator:
+        from pathlib import Path as _Path
+
         from loomflow.tools import bash_tool, edit_tool, write_tool
 
         from .browse import browse_tools
         from .operator import build_operator_prompt, media_app_tools
 
+        # OPERATOR mode = "operate my whole computer". The default coding
+        # tools are rooted at the PROJECT and reject paths outside it
+        # (".. escapes workdir"), which breaks "create a file in
+        # Downloads" / "read my Documents". So in operator mode, root the
+        # file + shell tools at HOME — the user's actual machine, like a
+        # human at the keyboard. The approval gate still confirms every
+        # write/destructive action. Coding mode stays project-scoped.
+        home = str(_Path.home())
         coordinator_tools.extend(
             [
-                write_tool(root),
-                edit_tool(root),
-                bash_tool(root, timeout=300.0),
+                read_tool(home),
+                ls_tool(home),
+                find_tool(home),
+                write_tool(home),
+                edit_tool(home),
+                bash_tool(home, timeout=300.0),
                 *media_app_tools(),
                 *browse_tools(model=model),
             ]
