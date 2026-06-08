@@ -41,7 +41,7 @@ dependencies = [
     # plugin to use MCP. Discovery degrades gracefully if it's ever absent.
     # >=0.10.25 carries the tool-call arg coercion + PEP 563 schema-typing
     # fix that loom-code's typed tools (edit replace_all=bool, etc.) rely on.
-    "loomflow[litellm,web,mcp]>=0.10.25",
+    "loomflow[litellm,web,mcp]>=0.10.23",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user
