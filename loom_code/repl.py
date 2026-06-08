@@ -406,6 +406,7 @@ class Repl:
             return await self._run_inner()
         finally:
             await self._aclose_mcp()
+            await self._aclose_browsers()
 
     async def _aclose_mcp(self) -> None:
         """Best-effort teardown of the MCP registry's sessions. Never
@@ -415,6 +416,16 @@ class Repl:
             return
         try:
             await registry.aclose()
+        except Exception:  # noqa: BLE001 — teardown must not fail exit
+            pass
+
+    async def _aclose_browsers(self) -> None:
+        """Close any /computer browser windows on exit so a headed
+        Chromium doesn't linger after loom-code quits. Best-effort."""
+        try:
+            from .browse import close_all_browsers
+
+            await close_all_browsers()
         except Exception:  # noqa: BLE001 — teardown must not fail exit
             pass
 

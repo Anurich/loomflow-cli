@@ -25,7 +25,22 @@ from loomflow.tools.registry import Tool
 from .act import act, fill_combobox, press_key, scroll, set_date
 from .observe import observe, read_text
 from .session import BrowserSession
-from .verify import verify
+from .verify import look, verify
+
+# Live browser sessions created this process. The REPL closes them all on
+# exit so the headed Chromium window doesn't linger after loom-code quits.
+_LIVE_SESSIONS: list[BrowserSession] = []
+
+
+async def close_all_browsers() -> None:
+    """Close every browser session opened by /computer. Best-effort;
+    called from the REPL's exit teardown. Never raises."""
+    for s in _LIVE_SESSIONS:
+        try:
+            await s.close()
+        except Exception:  # noqa: BLE001 — teardown must not fail exit
+            pass
+    _LIVE_SESSIONS.clear()
 
 
 def browse_tools(model: str | None = None) -> list[Tool]:
@@ -33,6 +48,7 @@ def browse_tools(model: str | None = None) -> list[Tool]:
     session launches lazily on the first page_open and persists across
     calls so observe → act → observe walks the same evolving page."""
     session = BrowserSession()
+    _LIVE_SESSIONS.append(session)  # so the REPL can close it on exit
 
     async def page_open(url: str) -> str:
         """Open a URL in the visible browser, then list what's on it."""
@@ -119,6 +135,19 @@ def browse_tools(model: str | None = None) -> list[Tool]:
             return "no page open yet — call page_open(url) first."
         return await read_text(page)
 
+    async def page_look(question: str) -> str:
+        """SEE the page — take a screenshot (with numbered [id] boxes on
+        elements) and have the vision model answer about it. Use when DOM
+        text isn't enough: reading prices/results, understanding layout,
+        confirming what a complex widget shows. Costs more than page_read
+        (sends an image), so use when you need to actually SEE. Arg:
+        question (what to look for)."""
+        try:
+            page = session.page
+        except RuntimeError:
+            return "no page open yet — call page_open(url) first."
+        return await look(page, question, model=model)
+
     async def page_check(question: str) -> str:
         """Visually verify the page: screenshot + ask a yes/no question
         (e.g. 'is Delhi the origin?'). Use after typing to confirm it
@@ -202,6 +231,17 @@ def browse_tools(model: str | None = None) -> list[Tool]:
                 "amount (default 1)."
             ),
         )(page_scroll),
+        tool(
+            name="page_look",
+            description=(
+                "SEE the page with vision — screenshots it (numbered [id] "
+                "boxes on elements) and a vision model answers your "
+                "question. Use when DOM text isn't enough: reading "
+                "prices/results, understanding layout, or when page_read/"
+                "page_observe seem to miss content. Costs more (sends an "
+                "image) — use when you must actually SEE. Arg: question."
+            ),
+        )(page_look),
         tool(
             name="page_read",
             description=(

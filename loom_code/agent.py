@@ -301,7 +301,7 @@ def build_agent(
         from loomflow.tools import bash_tool, edit_tool, write_tool
 
         from .browse import browse_tools
-        from .operator import OPERATOR_PROMPT, media_app_tools
+        from .operator import build_operator_prompt, media_app_tools
 
         coordinator_tools.extend(
             [
@@ -312,7 +312,9 @@ def build_agent(
                 *browse_tools(model=model),
             ]
         )
-        coordinator_instructions = OPERATOR_PROMPT
+        # build_operator_prompt() injects today's date so relative dates
+        # ("tomorrow") resolve correctly.
+        coordinator_instructions = build_operator_prompt()
     # Compose the coordinator's tools with the MCP registry so the
     # coordinator itself can call browser_* (and any other MCP) tools.
     # In operator mode this is what makes browser control reachable by
