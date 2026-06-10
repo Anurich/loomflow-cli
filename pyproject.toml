@@ -41,7 +41,11 @@ dependencies = [
     # plugin to use MCP. Discovery degrades gracefully if it's ever absent.
     # >=0.10.25 carries the tool-call arg coercion + PEP 563 schema-typing
     # fix that loom-code's typed tools (edit replace_all=bool, etc.) rely on.
-    "loomflow[litellm,web,mcp]>=0.10.23",
+    # <0.11 ceiling: loomflow is pre-1.0, so a minor bump may break the
+    # composed surfaces (Team kwargs, stop hooks, working blocks). Raise
+    # the ceiling deliberately after testing, not by accident on a
+    # user's machine mid-`pipx upgrade`.
+    "loomflow[litellm,web,mcp]>=0.10.23,<0.11",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user
@@ -58,8 +62,10 @@ dependencies = [
     # "install with: pip install 'loom-code[graphify]' then re-run"
     # friction. The install adds ~30s + a few hundred MB
     # (tree-sitter grammars, NetworkX, Leiden); acceptable price
-    # for zero-config knowledge-graph integration.
-    "graphifyy",
+    # for zero-config knowledge-graph integration. Floor + ceiling pin
+    # the query-tier contract (DIRECT/NEIGHBOR/COMMUNITY) the graphify
+    # skill's tools depend on.
+    "graphifyy>=0.8.11,<0.9",
     # jedi powers the LSP navigation tools (go_to_definition /
     # find_references / hover) — pure-Python static analysis, the
     # engine behind most editors' Python intelligence. No
