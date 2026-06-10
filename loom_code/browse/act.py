@@ -61,7 +61,10 @@ async def act(
         except Exception:  # noqa: BLE001 — overlay / unstable; JS fallback
             try:
                 await el.evaluate("e => e.click()")
-                return f"clicked [{loom_id}] (via JS — an overlay was in the way)"
+                return (
+                    f"clicked [{loom_id}] "
+                    "(via JS — an overlay was in the way)"
+                )
             except Exception as exc:  # noqa: BLE001
                 return (
                     f"could not click [{loom_id}]: {exc}. An overlay may be "
@@ -84,9 +87,10 @@ async def act(
         try:
             await el.fill(text)
             return (
-                f'typed "{text}" into [{loom_id}]. If it is an autocomplete, '
-                "re-observe and CLICK the matching suggestion; then page_check "
-                "the field value stuck."
+                f'typed "{text}" into [{loom_id}]. If it is an '
+                "autocomplete, "
+                "re-observe and CLICK the matching suggestion; "
+                "then page_check the field value stuck."
             )
         except Exception:  # noqa: BLE001 — fall back to keyboard typing
             try:
@@ -222,11 +226,15 @@ async def set_date(page: Any, loom_id: int | str, date_text: str) -> str:
 
     # Try to find the day; if not visible, click a "next month" control and
     # retry a few times (the target month may be ahead).
-    for attempt in range(8):
+    for _attempt in range(8):
         try:
             res = await page.evaluate(
                 _CLICK_DAY_JS,
-                {"iso": iso_target, "longA": long_frag, "longB": long_frag_alt},
+                {
+                    "iso": iso_target,
+                    "longA": long_frag,
+                    "longB": long_frag_alt,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             return f"date-pick failed: {exc}"

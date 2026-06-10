@@ -76,7 +76,9 @@ class BrowserSession:
         await self.start()
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        await self._page.goto(
+            url, wait_until="domcontentloaded", timeout=45000
+        )
 
     async def close(self) -> None:
         """Tear everything down. Safe to call multiple times."""

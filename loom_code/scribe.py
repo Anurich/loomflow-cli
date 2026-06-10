@@ -24,15 +24,18 @@ from loomflow import Agent
 _DEFAULT_MODEL = "claude-haiku-4-5"
 
 
-_COMMIT_SYSTEM_PROMPT = """You write conventional-commit messages from git diffs.
+_COMMIT_SYSTEM_PROMPT = """\
+You write conventional-commit messages from git diffs.
 
 Format:
 - First line: under 50 chars, imperative mood, ``type(scope): subject``
 - Types: feat, fix, refactor, docs, test, chore, perf, style, ci, build
 - Subject in imperative mood: "add" not "added" or "adds"
 - Lowercase subject, no trailing period
-- Optional body separated by a blank line, wrapped at 72 chars, explains WHY (not what)
-- No marketing fluff, no AI-disclosure trailers, no markdown fences in the output
+- Optional body separated by a blank line, wrapped at 72 chars,
+  explains WHY (not what)
+- No marketing fluff, no AI-disclosure trailers, no markdown fences
+  in the output
 
 Examples:
   feat(auth): add JWT validator with RS256 support

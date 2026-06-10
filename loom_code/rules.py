@@ -34,7 +34,9 @@ _DEFAULT_RULES_FILE = "AGENTS.md"
 
 # Markers delimiting the agent-curated block. The human's content lives
 # OUTSIDE these; the agent only edits BETWEEN them.
-BLOCK_START = "<!-- loom:rules (auto-added from chat — edit or delete freely) -->"
+BLOCK_START = (
+    "<!-- loom:rules (auto-added from chat — edit or delete freely) -->"
+)
 BLOCK_END = "<!-- /loom:rules -->"
 
 # Soft cap on managed rules: past this we nudge (never auto-drop).
@@ -185,9 +187,12 @@ def add_rule(
 
     fp = target_rules_file(root)
     try:
-        text = fp.read_text(encoding="utf-8") if fp.is_file() else (
-            _STARTER_TEMPLATE.format(block_start=BLOCK_START, block_end=BLOCK_END)
-        )
+        if fp.is_file():
+            text = fp.read_text(encoding="utf-8")
+        else:
+            text = _STARTER_TEMPLATE.format(
+                block_start=BLOCK_START, block_end=BLOCK_END
+            )
         text = _ensure_block(text)
         rules = _read_managed_rules(text)
 
@@ -225,7 +230,7 @@ def add_rule(
     msg = (
         f"Saved to {fp.name}: {rule!r}"
         + (f" (replaced {superseded!r})" if superseded else "")
-        + f". It applies from the next session; I'll keep following it now too."
+        + ". It applies from the next session; I'll keep following it now too."
     )
     if len(rules) > SOFT_CAP:
         msg += (

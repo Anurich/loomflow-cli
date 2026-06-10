@@ -177,7 +177,11 @@ async def look(page: Any, question: str, model: str | None = None) -> str:
         probe = Agent(prompt, model=model)
         result = await probe.run(
             "(see attached screenshot)",
-            metadata={"_loom_images": [{"data": b64, "media_type": "image/png"}]},
+            metadata={
+                "_loom_images": [
+                    {"data": b64, "media_type": "image/png"}
+                ]
+            },
         )
         out = getattr(result, "output", None) or str(result)
         return str(out).strip() or "(model returned nothing)"
@@ -185,5 +189,6 @@ async def look(page: Any, question: str, model: str | None = None) -> str:
         # Vision failed (model not multimodal / API issue) → DOM fallback.
         return (
             f"page_look vision unavailable ({type(exc).__name__}); "
-            "using DOM values instead:\n\n" + await verify(page, question, model)
+            "using DOM values instead:\n\n"
+            + await verify(page, question, model)
         )

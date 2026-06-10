@@ -17,8 +17,6 @@ Tools:
 
 from __future__ import annotations
 
-from typing import Any
-
 from loomflow import tool
 from loomflow.tools.registry import Tool
 
@@ -286,7 +284,7 @@ def browse_tools(model: str | None = None) -> list[Tool]:
     ]
     # Stash the session so the REPL can close it on exit / mode-off.
     for t in tools:
-        setattr(t, "_loom_browser_session", session)
+        t._loom_browser_session = session
     return tools
 
 

@@ -36,13 +36,9 @@ from __future__ import annotations
 import asyncio
 import platform
 import shutil
-import shlex
-from pathlib import Path
-from typing import Any, Awaitable, Callable
 
 from loomflow import tool
 from loomflow.tools.registry import Tool
-
 
 # ---------------------------------------------------------------------------
 # Tier 2 — native media + app control tools.
@@ -55,7 +51,10 @@ from loomflow.tools.registry import Tool
 _OS = platform.system()  # "Darwin" | "Windows" | "Linux"
 
 
-async def _run(cmd: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
+async def _run(
+    cmd: list[str],
+    timeout: float = 20.0,  # noqa: ASYNC109 — applied via wait_for below
+) -> tuple[int, str, str]:
     """Run a command, return (rc, stdout, stderr). Never raises."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -69,7 +68,7 @@ async def _run(cmd: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
             out.decode("utf-8", "replace").strip(),
             err.decode("utf-8", "replace").strip(),
         )
-    except (OSError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, OSError) as exc:
         return 1, "", str(exc)
 
 
@@ -85,10 +84,14 @@ def _open_app_tool() -> Tool:
             return "error: no app name given"
         if _OS == "Darwin":
             rc, _out, err = await _run(["open", "-a", name])
-            return f"opened {name}" if rc == 0 else f"could not open {name}: {err}"
+            if rc == 0:
+                return f"opened {name}"
+            return f"could not open {name}: {err}"
         if _OS == "Windows":
             rc, _out, err = await _run(["cmd", "/c", "start", "", name])
-            return f"opened {name}" if rc == 0 else f"could not open {name}: {err}"
+            if rc == 0:
+                return f"opened {name}"
+            return f"could not open {name}: {err}"
         # Linux: try the binary name directly, then xdg-open.
         if shutil.which(name):
             rc, _o, err = await _run([name])
@@ -228,7 +231,7 @@ def _reveal_tool() -> Tool:
         """Open the file manager with the given file/folder highlighted."""
         from pathlib import Path as _P
 
-        p = _P(path).expanduser()
+        p = _P(path).expanduser()  # noqa: ASYNC240 — pure string math, no disk I/O
         # Resolve ~-relative + bare names against home so "Downloads/x"
         # works like a human means it.
         if not p.is_absolute():
