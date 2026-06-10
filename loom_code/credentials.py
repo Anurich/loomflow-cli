@@ -143,6 +143,40 @@ def required_env_for_model(model: str) -> str | None:
     return "OPENAI_API_KEY"
 
 
+def cheap_model_for(model: str) -> str | None:
+    """The CHEAP, fast sibling of ``model`` in the SAME provider —
+    for low-stakes utility calls (compaction summaries, tool-result
+    compression, /goal's DONE/NOT_DONE checker).
+
+    Staying in-provider avoids switching to an account that may be
+    unfunded (a set key doesn't prove credits). Returns ``None``
+    when no cheap sibling is usable (local / litellm / echo models,
+    or the cheap model's key isn't set) — callers fall back to the
+    main model.
+    """
+    lower = model.lower()
+    # Escape BEFORE the substring checks: ``litellm/anthropic/claude-*``
+    # contains "claude" but is routed through a proxy/Bedrock the user
+    # chose — silently sending compaction summaries or tool output
+    # direct to api.anthropic.com would bypass that routing. Local and
+    # fake models have no cheap sibling either.
+    if lower == "echo" or lower.startswith(("ollama/", "litellm/")):
+        return None
+    if "claude" in lower:
+        target = "claude-haiku-4-5"
+    elif lower.startswith(("gpt", "o1", "o3", "o4")):
+        target = "gpt-4.1-mini"
+    else:
+        # Unknown provider — don't guess.
+        return None
+    if lower == target:
+        return target
+    env = required_env_for_model(target)
+    if env is None or os.environ.get(env):
+        return target
+    return None
+
+
 def ensure_key_for_model(model: str, console: Console) -> bool:
     """If ``model`` needs a key that isn't set, prompt the user
     for one (hidden input), save it, and load it into env. Returns

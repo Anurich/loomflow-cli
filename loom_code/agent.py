@@ -42,6 +42,8 @@ from .trust import discover_trusted
 from .web_fetch import web_fetch_tool
 from .workers import (
     BUILTIN_WORKER_NAMES,
+    SUMMARY_THRESHOLD_CHARS,
+    _build_coder,
     build_custom_worker,
     build_workers,
 )
@@ -107,6 +109,7 @@ def build_agent(
     sandbox: bool = False,
     sandbox_allow_network: bool = False,
     operator: bool = False,
+    run_until: str | dict[str, Any] | None = None,
 ) -> tuple[Agent, LocalDiskWorkspace]:
     """Wire the loom-code agent for a given project.
 
@@ -193,6 +196,33 @@ def build_agent(
         window = context_window_for(model)
         auto_compact_at_tokens = int(window * 0.8)
 
+    # Cheap same-provider sibling for low-stakes utility LLM calls —
+    # auto-compact summaries and per-result tool-output compression.
+    # Running those on the main coding model (Opus / GPT-4-class)
+    # wastes real money on summarisation; Haiku / gpt-4.1-mini do
+    # the job. ``None`` (no usable cheap sibling) falls back to the
+    # main model inside the framework.
+    from .credentials import cheap_model_for
+    cheap_model = cheap_model_for(model)
+    # Per-result tool-output compression for the read-only WORKERS
+    # only. The framework replaces the result IN-TURN (the agent sees
+    # the digest, never the verbatim output), so this is a last-resort
+    # bound against a single huge dump 400-ing a worker's run — snip
+    # is turn-count-based and auto-compact never fires inside a
+    # worker's single run. Excluded on purpose:
+    # * the CODER — needs verbatim ``read`` output to build
+    #   exact-match ``edit`` old_strings;
+    # * the COORDINATOR — its ``delegate`` results ARE the worker
+    #   briefings (digesting them loses the findings), and in
+    #   operator mode it holds writer tools, hitting the same
+    #   exact-match problem as the coder.
+    worker_summarizer = (
+        tool_result_summarizer
+        if tool_result_summarizer is not None
+        else cheap_model
+    )
+    summary_threshold = SUMMARY_THRESHOLD_CHARS
+
     # MCP servers (trust-gated above, so only servers from a trusted
     # repo or the user's own config survive). Built into one registry
     # and handed to the coder — the sole writer/executor — so its tools
@@ -222,6 +252,7 @@ def build_agent(
         skills=all_skills,
         auto_compact_at_tokens=auto_compact_at_tokens,
         snip_window=snip_window,
+        tool_result_summarizer=worker_summarizer,
         effort=effort,
         mcp_registry=mcp_registry,
         sandbox=sandbox,
@@ -362,6 +393,13 @@ def build_agent(
 
         _coord_extra["permissions"] = StandardPermissions()
         _coord_extra["approval_handler"] = approval_handler
+    # /goal run-until-done loop. Passed ONLY when armed: ``run_until=``
+    # needs a loomflow newer than any released 0.10.x, and passing the
+    # kwarg unconditionally (even as None) would TypeError at startup
+    # on a PyPI install — /goal degrades to an error on old framework
+    # versions instead of bricking the whole CLI.
+    if run_until is not None:
+        _coord_extra["run_until"] = run_until
     coordinator = Team.supervisor(
         workers=workers,
         instructions=coordinator_instructions,
@@ -375,8 +413,13 @@ def build_agent(
         max_stop_hook_iterations=max_stop_hook_iterations,
         prompt_caching=True,
         tool_result_summarizer=tool_result_summarizer,
+        tool_result_summary_threshold=summary_threshold,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        # Auto-compact summaries are low-stakes — run them on the
+        # cheap same-provider sibling instead of the coding model.
+        # ``None`` falls back to the main model inside the framework.
+        auto_compact_summariser=cheap_model,
         effort=effort,
         persist_tool_transcripts=True,
         **_coord_extra,
@@ -398,6 +441,84 @@ def build_agent(
     coordinator._mcp_registry = mcp_registry  # type: ignore[attr-defined]
 
     return coordinator, workspace
+
+
+def build_solo_agent(
+    project: Project,
+    *,
+    model: str = DEFAULT_MODEL,
+    approval_handler: Callable[..., Awaitable[bool]] | None = None,
+    web_backend: str | None = None,
+    snip_window: int = 8,
+    auto_compact: bool = True,
+    effort: str | None = None,
+    sandbox: bool = False,
+    sandbox_allow_network: bool = False,
+    extensions: Extensions | None = None,
+) -> Agent:
+    """The trivial-task FAST PATH: one coder-kernel agent, no team.
+
+    The supervisor topology earns its keep on multi-file features and
+    verification-worthy work — but it taxes a one-line fix with a full
+    delegation round-trip (coordinator reads → delegates → coder
+    re-reads → coordinator integrates): 2-3x the turns and model calls
+    of just doing it. The REPL routes obviously-small tasks here
+    instead (see ``Repl._route_turn``); everything real still goes
+    through the team.
+
+    Context is CONTINUOUS across routes: the solo agent shares the
+    team's memory (same ``.loom/memory.db``, same embedder pivot) and
+    notebook workspace, and the REPL runs it under the same
+    ``session_id`` — so a solo fix shows up in the team's history next
+    turn and vice versa. Approval gate + tool hooks apply exactly as
+    they do for the team's coder; permissions are identical. MCP
+    servers are NOT attached (an external-integration task isn't a
+    trivial fix — the router sends those to the team).
+    """
+    loom_dir = project.root / LOOM_DIR
+    loom_dir.mkdir(exist_ok=True)
+    workspace = LocalDiskWorkspace(str(loom_dir / "notebook"))
+    embedder = "openai" if _is_openai_model(model) else "hash"
+    memory_cfg: dict[str, str] = {
+        "backend": "sqlite",
+        "path": str(loom_dir / "memory.db"),
+        "embedder": embedder,
+    }
+    if extensions is None:
+        extensions = discover_trusted(project.root)
+    all_skills = _bundled_skill_paths() + extensions.skill_paths
+
+    auto_compact_at_tokens: int | None = None
+    if auto_compact:
+        from loomflow.agent.auto_compact import context_window_for
+        auto_compact_at_tokens = int(context_window_for(model) * 0.8)
+
+    agent = _build_coder(
+        project,
+        model=model,
+        approval_handler=approval_handler,
+        has_web=web_backend is not None,
+        skills=all_skills,
+        auto_compact_at_tokens=auto_compact_at_tokens,
+        snip_window=snip_window,
+        effort=effort,
+        sandbox=sandbox,
+        sandbox_allow_network=sandbox_allow_network,
+        embedder=embedder,
+        workspace=workspace,
+        # Standalone — no parent to inherit memory/workspace from.
+        memory=memory_cfg,
+        attach_workspace=True,
+        # Shares the REPL session_id with the read-only coordinator —
+        # persisting writer transcripts would make the coordinator
+        # rehydrate history of "itself" editing (the grind failure).
+        persist_tool_transcripts=False,
+    )
+    if web_backend is not None:
+        from loomflow.tools import web_tool
+        agent.add_tool(web_tool(backend=web_backend))  # type: ignore[arg-type]
+    attach_tool_hooks(agent, extensions.hook_specs, cwd=project.root)
+    return agent
 
 
 def loom_dir_for(root: Path) -> Path:

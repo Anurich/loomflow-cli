@@ -64,10 +64,11 @@ from rich.text import Text
 
 from . import checkpoint as _checkpoint
 from . import file_history, worktree
-from .agent import LOOM_DIR, build_agent
+from .agent import LOOM_DIR, build_agent, build_solo_agent
 from .approval import ApprovalGate
 from .compact import Compactor, default_compact_threshold
 from .credentials import (
+    cheap_model_for,
     ensure_key_for_model,
     save_credential,
 )
@@ -182,11 +183,80 @@ def _flatten_exception_group(
 # The single source of truth for slash commands the REPL accepts.
 # The autocomplete menu (popped the moment the user types '/')
 # reads off this list, so adding a new command here is enough —
+# Question-shaped prompts route to the TEAM coordinator (it answers
+# read-only questions directly — no delegation tax — and holds the
+# repo map). The heuristic only ever short-circuits TOWARD the team,
+# so a false positive ("how about you rename X" → team) costs the
+# status-quo overhead, never a capability.
+_QUESTION_STARTERS = (
+    "what", "when", "where", "which", "who", "why", "how",
+    "is ", "are ", "does ", "do ", "did ", "can ", "could ",
+    "should ", "would ", "will ", "explain", "show me", "tell me",
+    "describe", "summarize", "summarise", "walk me through",
+)
+
+
+def _looks_like_question(prompt: str) -> bool:
+    """True when the prompt reads as a question / explanation request
+    rather than a change request."""
+    p = prompt.strip().lower()
+    return p.endswith("?") or p.startswith(_QUESTION_STARTERS)
+
+
+# Pronouns/markers that point at conversation the SOLO/TEAM classifier
+# cannot see. "fix it" after ten turns of discussion LOOKS trivial in
+# isolation but may be a multi-file task — the team coordinator (which
+# holds the session history) must take those.
+_ANAPHORA_WORDS = frozenset(
+    {"it", "that", "this", "them", "those", "these", "above", "again"}
+)
+
+
+def _references_prior_context(prompt: str) -> bool:
+    """True when a SHORT prompt leans on prior conversation the
+    stateless classifier can't see ("fix it", "continue", "do that
+    again"). Long prompts may use "it" self-referentially and still
+    classify fine, so only short ones short-circuit."""
+    words = prompt.strip().lower().split()
+    if len(words) <= 2:
+        return True
+    if len(words) <= 6 and any(
+        w.strip(".,!:;") in _ANAPHORA_WORDS for w in words
+    ):
+        return True
+    return False
+
+
+# The SOLO/TEAM classifier's whole system prompt. One word out; the
+# cheap model handles this reliably. Biased toward TEAM — solo only
+# for tasks where skipping the team round-trip is a pure win.
+_ROUTER_PROMPT = """\
+You route tasks for a terminal coding agent. Reply with EXACTLY one
+word: SOLO or TEAM.
+
+SOLO — one small, focused change a single capable agent should just
+do: a one-file edit or bugfix, a rename confined to one place, adding
+one test, tweaking a config value, running or adjusting one command,
+a small mechanical change with an obvious definition of done.
+
+TEAM — everything else: multi-file features or refactors, anything
+needing investigation first ("find out why...", "figure out..."),
+work that warrants independent review or running a test suite to
+verify, vague or large scope, external integrations, anything
+destructive or wide-reaching. Also TEAM: any task that leans on
+prior conversation you cannot see ("fix it", "do that again",
+"continue", "the bug we discussed") — you see only this one message.
+
+When in doubt: TEAM.
+"""
+
+
 # no need to also update the autocomplete separately.
 _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/help", "show all commands"),
     ("/init-loom", "create a starter AGENTS.md rules file"),
     ("/plan", "show the current plan, or start one"),
+    ("/goal", "work until a condition is met (/goal make all tests pass)"),
     ("/cost", "session cost + token totals"),
     ("/good", "mark the last turn useful (credit notes)"),
     ("/bad", "mark the last turn unhelpful"),
@@ -201,7 +271,9 @@ _COMMAND_DEFS: list[tuple[str, str]] = [
     ("/set_model", "pick OpenAI or Anthropic + save API key"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
     ("/mcp", "list connected MCP servers + their tools"),
-    ("/computer", "browser control — agent drives a real browser (Playwright)"),
+    # /computer (computer-operator mode) is HIDDEN for now — kept in code
+    # + dispatched if typed, but not advertised in help/autocomplete
+    # until it's ready to ship. Re-add this entry to surface it again.
     ("/resume", "resume the last session (rehydrate prior turns)"),
     ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
     ("/clear", "fresh conversation (new session)"),
@@ -295,6 +367,18 @@ class Repl:
         # Model the session was on before /computer bumped to a stronger
         # one — restored if operator mode is turned off.
         self._pre_operator_model: str | None = None
+        # /goal run-until-done loop spec (None = off). When /goal arms a
+        # condition, this holds the run_until dict (condition + cheap
+        # checker + guardrails) that build_agent forwards to the
+        # framework GoalStopHook. Cleared after the goal turn completes.
+        self._run_until: dict[str, Any] | None = None
+        # Adaptive routing (solo fast path). Both built lazily on
+        # first use and invalidated by ``_rebuild_agent`` (model /
+        # web changes): the solo agent is a standalone coder kernel
+        # sharing the team's memory + notebook; the router agent is
+        # the cheap one-word SOLO/TEAM classifier.
+        self._solo_agent: Any | None = None
+        self._router_agent: Any | None = None
         # Graphify and other bundled skills are auto-registered
         # by build_agent (see _bundled_skill_paths). No per-session
         # toggle needed — the agent decides when to load skills.
@@ -308,6 +392,7 @@ class Repl:
             sandbox=self._sandbox,
             sandbox_allow_network=self._sandbox_allow_network,
             operator=self._browser_mode,
+            run_until=self._run_until,
         )
         # One session_id for the whole REPL → loomflow rehydrates
         # prior turns so the agent has real conversation memory.
@@ -344,6 +429,7 @@ class Repl:
         self.total_snips = 0
         self.turns = 0
         self.last_plan: str | None = None
+        self.last_result: dict[str, Any] | None = None
         # Self-improvement: cited slugs from the last turn, awaiting
         # a success/failure judgement (the moved-on heuristic).
         self._pending_slugs: list[str] = []
@@ -362,7 +448,12 @@ class Repl:
         # any positive int is an explicit user override. The
         # exchange list is what the compactor sees on trigger; the
         # cumulative-tokens counter is what fires the trigger.
-        self._compactor = Compactor(model=model)
+        # Compaction is summarisation — low-stakes, so it runs on the
+        # cheap same-provider sibling (Haiku / gpt-4.1-mini) instead
+        # of burning the coding model's rates on it.
+        self._compactor = Compactor(
+            model=cheap_model_for(model) or model
+        )
         self._compact_threshold = -1  # auto
         self._compact_tokens = 0
         self._compact_exchanges: list[tuple[str, str]] = []
@@ -549,13 +640,25 @@ class Repl:
             # system prompt.
             await self._inject_loom_context(line)
             await self._inject_file_history(line)
+            await self._inject_learned_notes(line)
             # Auto-checkpoint before the turn runs: snapshot the working
             # tree so the user can /undo this turn's edits even if the
             # agent goes off the rails. Silent on success (a checkpoint
             # per turn would be noise); only /undo + /checkpoints surface
             # them. Best-effort — a non-git repo / git failure no-ops.
             self._checkpoint_before_turn(line)
-            await self._turn(line)
+            route = await self._route_turn(line)
+            if route == "solo":
+                # Surface the routing decision — silent topology
+                # switches make cost/behaviour differences look
+                # random to the user.
+                console.print(
+                    "  [dim]→ solo fast path (small task — skipping "
+                    "team delegation)[/dim]"
+                )
+                await self._turn(line, agent=self._get_solo_agent())
+            else:
+                await self._turn(line)
 
     # ---- input ----------------------------------------------------------
 
@@ -612,6 +715,56 @@ class Repl:
                 "project_rules",
                 project_rules_block(self.project.root),
                 user_id=_USER_ID,
+            )
+        except Exception:  # noqa: BLE001 — injection is best-effort
+            pass
+
+    async def _inject_learned_notes(self, prompt: str) -> None:
+        """ACTIVE recall: push the top success-credited notes relevant
+        to this prompt into the ``learned_notes`` working block, so past
+        learnings shape the next action directly.
+
+        Before this, credited notes only ranked higher in
+        ``search_notes`` — a search the agent might never run. Now the
+        proven ones (cited in a turn the user accepted) arrive in the
+        system prompt unprompted, CLAUDE.md-style, while the full
+        notebook stays behind search. Slugs are shown so the agent can
+        ``read_note(slug)`` for full detail — which also keeps the
+        citation-credit chain alive for the /good /bad loop.
+
+        Bounded: top 3 notes, snippet-length excerpts (~140 chars each)
+        — a few hundred tokens, not a notebook dump. Block is cleared
+        when nothing relevant is proven, so stale advice never lingers.
+        Failures are swallowed (never let memory I/O kill a turn).
+        """
+        try:
+            matches = await self.workspace.search_notes(
+                prompt,
+                user_id=_USER_ID,
+                boost_relevance=True,
+                limit=8,
+            )
+            proven = [
+                m for m in matches if m.summary.success_count > 0
+            ][:3]
+            if proven:
+                lines = [
+                    "# Learned notes (proven on past turns)",
+                    "Notes from earlier work on THIS project that were "
+                    "used in turns the user accepted. Trust but verify "
+                    "— `read_note(slug)` for the full note.",
+                    "",
+                ]
+                lines.extend(
+                    f"- [{m.summary.slug}] (worked "
+                    f"{m.summary.success_count}x) {m.snippet}"
+                    for m in proven
+                )
+                body = "\n".join(lines)
+            else:
+                body = ""
+            await self.agent.memory.update_block(
+                "learned_notes", body, user_id=_USER_ID
             )
         except Exception:  # noqa: BLE001 — injection is best-effort
             pass
@@ -846,9 +999,15 @@ class Repl:
         if cb is not None:
             cb()
 
-    async def _turn(self, prompt: str) -> None:
+    async def _turn(self, prompt: str, *, agent: Any | None = None) -> None:
         """Stream one agent run for ``prompt``, reusing the
         session so conversation history carries forward.
+
+        ``agent`` overrides the team coordinator for this turn —
+        the solo fast path passes the coder-kernel agent here (see
+        ``_route_turn``). Default ``None`` keeps the team. Both run
+        under the same ``session_id`` + memory db, so history is
+        continuous whichever route a turn takes.
 
         Spinner UX: Rich's ``console.status`` runs continuously for
         the whole turn. The renderer drives its label via two
@@ -902,7 +1061,10 @@ class Repl:
         # consume the agent's stream; the framework handles
         # continuation, bounded by ``max_stop_hook_iterations``.
         ok = await self._consume_agent_stream(
-            self.agent, prompt, renderer, pause_status
+            agent if agent is not None else self.agent,
+            prompt,
+            renderer,
+            pause_status,
         )
         if not ok:
             return
@@ -910,6 +1072,9 @@ class Repl:
         if renderer.last_plan:
             self.last_plan = renderer.last_plan
         result = renderer.last_result
+        # Stash for post-turn inspection (e.g. /goal reads
+        # interruption_reason to report goal-met vs guardrail-stop).
+        self.last_result = result
         agent_output = ""
         if result:
             self.total_cost += float(result.get("cost_usd", 0.0))
@@ -981,8 +1146,11 @@ class Repl:
         if n_tool_calls == 0 and _looks_like_completion_claim(
             agent_output
         ):
+            # Under /isolate the live session writes to the WORKTREE's
+            # .loom/memory.db — target that one, not the main project's.
+            active_root = (self._isolated_project or self.project).root
             deleted = _delete_last_episode(
-                self.project.root / LOOM_DIR / "memory.db",
+                active_root / LOOM_DIR / "memory.db",
                 session_id=self.session_id,
                 user_id=_USER_ID,
             )
@@ -1240,6 +1408,8 @@ class Repl:
             await self._handle_mcp()
         elif cmd == "/computer":
             await self._handle_computer(arg)
+        elif cmd == "/goal":
+            await self._handle_goal(arg)
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "
@@ -1480,6 +1650,129 @@ class Repl:
         if arg.strip():
             await self._turn(arg.strip())
 
+    async def _handle_goal(self, arg: str) -> None:
+        """``/goal <task>`` — run until the goal is met.
+
+        The agent works on ``<task>`` and, after each pass, a cheap
+        same-provider checker model judges whether the goal is
+        satisfied; if not, the agent is re-prompted and works again —
+        the run-until-done loop (framework ``run_until=`` / GoalStopHook).
+        Bounded by three guardrails so it can't spin forever: a max
+        re-prompt count, no-progress detection, and a cost cap.
+
+        The task text IS the stop condition. For an explicit split, use
+        ``/goal <task> :: <condition>`` — everything before ``::`` is
+        what to do, everything after is what the checker tests."""
+        arg = arg.strip()
+        if not arg:
+            console.print(
+                "  [yellow]usage: /goal <task> — e.g. "
+                "/goal make all tests pass[/yellow]\n"
+                "  [dim]optional explicit condition: "
+                "/goal <task> :: <condition>[/dim]"
+            )
+            return
+
+        # Split the optional "task :: condition" form. Default: the task
+        # is also the condition (the framework's str happy-path).
+        if "::" in arg:
+            task, _, condition = arg.partition("::")
+            task, condition = task.strip(), condition.strip()
+            if not task or not condition:
+                console.print(
+                    "  [yellow]both sides of :: must be non-empty — "
+                    "/goal <task> :: <condition>[/yellow]"
+                )
+                return
+        else:
+            task = condition = arg
+
+        # Cheap same-provider checker (Haiku / gpt-4.1-mini); falls back
+        # to the main model inside the framework when no cheap key.
+        checker = self._pick_checker_model()
+        # Guardrails — the research is unanimous these prevent runaway
+        # cost. max_iterations doubles as the loop's hard cap; the
+        # framework caps each re-prompt and bails on no-progress / cost.
+        self._run_until = {
+            "condition": condition,
+            "max_iterations": 20,
+            "max_no_progress": 3,
+            "max_cost_usd": 2.0,
+        }
+        if checker is not None:
+            self._run_until["checker"] = checker
+
+        # The goal loop needs room to re-prompt — loom-code's default
+        # auto-continue cap (2) is far too low for run-until-done. Lift
+        # it for this goal turn; restore after. The GoalStopHook's own
+        # max_iterations is the real bound.
+        saved_cap = self._auto_continue_limit
+        self._auto_continue_limit = max(saved_cap, 20)
+        # keep_session: the goal must run WITH the conversation so far
+        # ("/goal fix the bug we discussed") — rebuilding is only about
+        # arming the run_until hook, not starting over.
+        try:
+            self._rebuild_agent(keep_session=True)
+        except TypeError:
+            # Installed loomflow predates ``run_until=``. Disarm and
+            # rebuild clean so the REPL keeps working — /goal is the
+            # only casualty, not the session.
+            self._run_until = None
+            self._auto_continue_limit = saved_cap
+            self._rebuild_agent(keep_session=True)
+            console.print(
+                "  [yellow]/goal needs a newer loomflow than is "
+                "installed (Agent(run_until=) is missing). "
+                "Upgrade loomflow and retry.[/yellow]"
+            )
+            return
+
+        checker_label = checker or f"{self.model} (no cheap checker key)"
+        console.print(
+            f"  [green]🎯 goal:[/green] {condition}\n"
+            f"  [dim]checker {checker_label} · max 20 passes · "
+            "no-progress 3 · cap $2.00 · Esc to stop[/dim]"
+        )
+
+        try:
+            await self._inject_loom_context(task)
+            await self._turn(task)
+        finally:
+            # Disarm the goal: clear the spec, restore the cap, rebuild
+            # back to a normal coding agent for the next message —
+            # keeping the session so the goal turn stays part of the
+            # conversation history.
+            self._run_until = None
+            self._auto_continue_limit = saved_cap
+            self._rebuild_agent(keep_session=True)
+
+        # Report whether the goal was met or a guardrail stopped it. The
+        # framework sets interruption_reason="run_until:<reason>" on a
+        # guardrail stop; a clean condition_met leaves interrupted False.
+        result = self.last_result
+        reason = (result or {}).get("interruption_reason") or ""
+        if reason.startswith("run_until:"):
+            why = reason.split(":", 1)[1]
+            pretty = {
+                "max_iterations": "hit the 20-pass cap",
+                "no_progress": "stopped making progress",
+                "cost_cap": "hit the $2.00 cost cap",
+            }.get(why, why)
+            console.print(
+                f"  [yellow]⚠ goal not confirmed — {pretty}.[/yellow] "
+                "[dim]Review the work above; re-run /goal to continue.[/dim]"
+            )
+        elif reason == "stop_hook_iterations_exhausted":
+            console.print(
+                "  [yellow]⚠ goal not confirmed — auto-continue cap "
+                "reached.[/yellow]"
+            )
+        else:
+            console.print(
+                "  [green]✓ goal met[/green] — the checker confirmed the "
+                "condition."
+            )
+
     def _pick_operator_model(self) -> str | None:
         """Choose a strong reasoning model for operator mode — the first
         candidate whose API key is already configured (so we never prompt
@@ -1510,13 +1803,117 @@ class Repl:
             return target
         return None
 
-    def _rebuild_agent(self) -> None:
+    def _pick_checker_model(self) -> str | None:
+        """Choose a CHEAP, fast checker for /goal's run-until loop — the
+        small model in the SAME provider as the current model. The
+        checker runs once per loop pass to judge DONE/NOT_DONE, so it
+        should be cheap; staying in-provider avoids switching to an
+        account that may be unfunded (the funding lesson from operator
+        mode — a set key doesn't prove credits). Returns None to let the
+        framework fall back to the main model when no cheap key is set.
+
+        Delegates to :func:`credentials.cheap_model_for` — the same
+        picker the compactor and tool-result summariser use. One
+        deliberate difference from the original inline logic: local /
+        litellm models now return None (fall back to the main model)
+        instead of silently routing judgements to OpenAI — an
+        Ollama user shouldn't leak session content to a cloud
+        provider just because OPENAI_API_KEY happens to be set."""
+        return cheap_model_for(self.model)
+
+    # ---- adaptive routing (solo fast path) ------------------------------
+
+    async def _route_turn(self, prompt: str) -> str:
+        """Pick ``"solo"`` or ``"team"`` for this turn.
+
+        The supervisor team taxes a one-line fix with a full
+        delegation round-trip (coordinator reads → delegates → coder
+        re-reads), so obviously-small write tasks run on a standalone
+        coder kernel instead. The decision is conservative — every
+        branch that isn't a confident SOLO falls back to the team:
+
+        * /goal armed or operator mode → team (their hooks live on
+          the coordinator).
+        * Question-shaped prompts → team (the read-only coordinator
+          answers those directly — no delegation tax to dodge — and
+          it holds the repo map + notebook tools).
+        * Otherwise the cheap classifier votes; no usable cheap
+          model, classifier error, or anything but a clear SOLO →
+          team. A misroute therefore costs at most the status-quo
+          overhead, never a lost capability.
+        """
+        if self._run_until is not None or self._browser_mode:
+            return "team"
+        if _looks_like_question(prompt):
+            return "team"
+        if _references_prior_context(prompt):
+            # "fix it" / "continue" lean on history the stateless
+            # classifier can't see — the coordinator has it.
+            return "team"
+        return (
+            "solo"
+            if await self._classify_task(prompt) == "SOLO"
+            else "team"
+        )
+
+    async def _classify_task(self, prompt: str) -> str:
+        """One-word SOLO/TEAM vote from the cheap same-provider
+        model (~a hundred tokens, fractions of a cent — repaid many
+        times over when it saves one delegation round-trip)."""
+        cheap = cheap_model_for(self.model)
+        if cheap is None:
+            return "TEAM"
+        try:
+            if self._router_agent is None:
+                from loomflow import Agent as _Agent
+
+                self._router_agent = _Agent(
+                    _ROUTER_PROMPT, model=cheap, prompt_caching=True
+                )
+            result = await self._router_agent.run(
+                prompt[:2000], user_id=_USER_ID
+            )
+            return (
+                "SOLO" if "SOLO" in result.output.upper() else "TEAM"
+            )
+        except Exception:  # noqa: BLE001 — routing must never kill a turn
+            return "TEAM"
+
+    def _get_solo_agent(self) -> Any:
+        """Lazily build the standalone coder for the fast path —
+        shares the team's memory db + notebook so context stays
+        continuous across routes. Invalidated on /model, /set_web,
+        and isolation changes via ``_rebuild_agent``."""
+        if self._solo_agent is None:
+            build_project = self._isolated_project or self.project
+            self._solo_agent = build_solo_agent(
+                build_project,
+                model=self.model,
+                approval_handler=self._gate.handler,
+                web_backend=self._web_backend,
+                effort=self._effort,
+                sandbox=self._sandbox,
+                sandbox_allow_network=self._sandbox_allow_network,
+                extensions=self._extensions,
+            )
+        return self._solo_agent
+
+    def _rebuild_agent(self, *, keep_session: bool = False) -> None:
         """Reconstruct the supervisor + workers using the current
         ``self.model`` and ``self._web_backend``. Used by
         ``/model`` (model change) and ``/set_web`` (backend change).
         Bundled skills (graphify et al.) are auto-registered
         inside ``build_agent`` so we don't pass them explicitly
-        here."""
+        here.
+
+        ``keep_session=True`` preserves ``session_id`` (and the
+        compaction accumulators that mirror it) across the rebuild —
+        used by ``/goal``, which rebuilds only to arm/disarm the
+        ``run_until`` hook on the SAME conversation: "/goal fix the
+        bug we discussed" must see the discussion, and the goal
+        turn must stay part of the session history afterwards. The
+        default (fresh session) is right for ``/model`` and
+        ``/set_web``, where history is model-specific."""
         # When isolated, build rooted at the worktree (its own working
         # copy + .loom). Extensions stay ``self._extensions`` — they're
         # the MAIN project's .loom config, which the worktree (being
@@ -1534,11 +1931,19 @@ class Repl:
             sandbox=self._sandbox,
             sandbox_allow_network=self._sandbox_allow_network,
             operator=self._browser_mode,
+            run_until=self._run_until,
         )
-        self._compactor = Compactor(model=self.model)
-        self._compact_tokens = 0
-        self._compact_exchanges.clear()
-        self.session_id = new_id()
+        # Routing agents are model-derived — drop them so the next
+        # solo route / classification rebuilds on the new config.
+        self._solo_agent = None
+        self._router_agent = None
+        self._compactor = Compactor(
+            model=cheap_model_for(self.model) or self.model
+        )
+        if not keep_session:
+            self._compact_tokens = 0
+            self._compact_exchanges.clear()
+            self.session_id = new_id()
 
     # ---- persistent status line ----------------------------------------
 

@@ -46,7 +46,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from loomflow import Agent, StandardPermissions
+from loomflow import Agent, StandardPermissions, Tuning
 from loomflow.architecture import ReAct
 from loomflow.tools import (
     bash_tool,
@@ -75,47 +75,49 @@ _CODER_MAX_TURNS = 60
 _SPECIALIST_MAX_TURNS = 20  # explorer + auditor — one scoped question
 _REVIEWER_MAX_TURNS = 30  # tests can iterate
 
+# Per-result summarisation threshold (chars) for the read-only
+# workers' ``tool_result_summarizer``. IMPORTANT semantics: loomflow
+# replaces the result IN-TURN — the worker never sees the verbatim
+# output, only a ≤512-token digest. So this is strictly a last-resort
+# bound: 20k chars (~5k tokens) leaves normal reads/greps/test runs
+# verbatim and compresses only the genuine dumps that would otherwise
+# 400 the run with context_length_exceeded — where a digest beats a
+# dead turn. Do NOT lower this to "save tokens": below it, fidelity
+# loss (explorer briefings and reviewer verdicts built from digests)
+# costs more than the tokens save.
+SUMMARY_THRESHOLD_CHARS = 20_000
+
 _EXPLORER_PROMPT = """\
 You are the EXPLORER on a loom-code team — a read-only
 investigator. A tech lead delegates ONE question about the
-codebase to you. You answer it thoroughly and hand the answer
-back.
+codebase; answer it thoroughly and hand the answer back.
 
-You have read-only tools: `read`, `grep`, `find`, `ls` (all
-scoped to the project root) and `web_fetch` (for HTTPS URLs and
-raw GitHub files). You have NO write/edit/bash — you cannot
-change anything, and must not try.
+You have read-only tools: `read`, `grep`, `find`, `ls` (scoped to
+the project root) and `web_fetch` (HTTPS URLs; GitHub blob URLs
+auto-rewrite to raw). NO write/edit/bash — you cannot change
+anything, and must not try.
 
 How you work:
-- Start broad (`find` / `ls` / `grep` for the relevant symbols),
-  then `read` the files that matter.
-- Follow the actual wiring — imports, call sites, config — don't
-  guess.
-- For URLs the lead names (a GitHub link, README, doc page,
-  spec), use `web_fetch(url=...)` — never substitute a local
-  file for a remote source you were asked to inspect. GitHub
-  blob URLs auto-rewrite to raw, so you can paste the human URL.
-  If you need a full repo (not a single file), say so in your
-  report — full clones need `bash git clone`, which only `coder`
-  has; the lead can re-route.
-- Answer concretely. Cite `path:line` for every claim. Quote the
-  key code, don't paraphrase it away.
-- If the question has sub-parts, answer each.
-- End with a short, direct summary the lead can act on.
+- Start broad (`find`/`ls`/`grep`), then `read` the files that
+  matter. Follow the actual wiring — imports, call sites, config
+  — don't guess.
+- For URLs the lead names, use `web_fetch(url=...)` — never
+  substitute a local file for a remote source. A full repo needs
+  `bash git clone`, which only `coder` has — say so in your
+  report and the lead can re-route.
+- Answer concretely: cite `path:line` for every claim, quote the
+  key code, answer every sub-part, and end with a short summary
+  the lead can act on.
 
-**When your finding is non-trivial, write ONE finding note.** If
-you uncovered something a teammate would otherwise have to re-
-investigate (where a subsystem lives, how a flow wires together, a
-gotcha), call `note(kind="finding", title="<short, searchable>",
-content=<your findings, including path:line citations>)` so the
-next fresh-session worker reuses it. Make the title keyword-rich.
-But for a quick lookup or a one-line answer, SKIP the note — your
-report to the lead is enough; a note that just restates a simple
-answer is noise that costs everyone tokens.
+**When your finding is non-trivial, write ONE finding note** —
+`note(kind="finding", title="<short, keyword-rich>",
+content=<findings with path:line citations>)` — so the next
+fresh-session worker reuses it instead of re-investigating. SKIP
+the note for a quick lookup or one-line answer; restating a
+simple answer is noise.
 
-Be exhaustive on facts, terse on prose — wasted words cost the
-lead context. No summary documents or banners; your report is the
-only thing read.
+Be exhaustive on facts, terse on prose. No summary documents or
+banners; your report is the only thing read.
 """
 
 # Appended onto _EXPLORER_PROMPT only when the explorer was built
@@ -123,13 +125,12 @@ only thing read.
 # turns on failed tool calls.
 _EXPLORER_WEB_HINT = """\
 
-You also have `web_search(query=...)` for investigation that goes
-*outside* the codebase — an upstream library's documented
-behaviour, an external API's contract, a CVE / errata page, the
-known cause of a third-party error message. Use it AFTER you've
-read the relevant project code, not instead. Keyword queries beat
-sentences. Cite the source URL in your finding note so the lead
-can verify it.
+You also have `web_search(query=...)` for investigation *outside*
+the codebase — an upstream library's documented behaviour, an
+external API's contract, a CVE, a third-party error's known
+cause. Use it AFTER you've read the relevant project code, not
+instead. Keyword queries beat sentences. Cite the source URL in
+your finding note.
 """
 
 
@@ -145,13 +146,12 @@ You are the AUDITOR on a loom-code team — a read-only inspector.
 A tech lead delegates a focus area and a lens (security,
 performance, or correctness). Your job: hunt for PROBLEMS.
 
-You have read-only tools: `read`, `grep`, `find`, `ls`. You have
-NO write/edit/bash — you find problems, you do not fix them.
+You have read-only tools: `read`, `grep`, `find`, `ls`. NO
+write/edit/bash — you find problems, you do not fix them.
 
 How you work:
-- Read the code in the focus area carefully. Trace inputs to
-  where they're used.
-- Through your lens, look hard for concrete defects:
+- Read the focus area carefully; trace inputs to where they're
+  used. Through your lens, hunt concrete defects:
   - security: injection, unsanitised input, secrets in code,
     path traversal, unsafe deserialization, missing authz.
   - performance: N+1 patterns, work in hot loops, unbounded
@@ -162,17 +162,15 @@ How you work:
   `[blocker]` — a real bug / vulnerability, must fix.
   `[risk]`    — likely wrong or fragile, worth a closer look.
   `[nit]`     — minor, optional.
-- Cite `path:line` for every finding. Quote the offending code.
+  Cite `path:line` for every finding and quote the offending code.
 - If you find nothing real, say so — do NOT invent problems to
   look thorough.
 
-**When you found real issues, write ONE finding note.** If the
-audit turned up blockers/risks worth preserving, call
+**When you found real issues, write ONE finding note** —
 `note(kind="finding", title="<area>: <severity gist>",
-content=<your tagged findings with path:line citations>)` so the
-lead and next worker pick it up via `search_notes()` instead of
-re-auditing. If you found nothing notable, SKIP the note and just
-say so in your report — don't write a note to record "no issues".
+content=<tagged findings with path:line citations>)` — so the
+lead and next worker reuse it instead of re-auditing. Nothing
+notable → SKIP the note; don't write one to record "no issues".
 
 End with a one-line summary: how many blockers / risks / nits. No
 summary documents or banners — the report is the only thing read.
@@ -180,14 +178,12 @@ summary documents or banners — the report is the only thing read.
 
 _REVIEWER_PROMPT = """\
 You are the REVIEWER on a loom-code team — a verification
-specialist. A tech lead delegates a description of a change that
-was just made. Your job: independently confirm it is correct,
-complete, and safe.
+specialist. A tech lead delegates a description of a change just
+made. Independently confirm it is correct, complete, and safe.
 
 You have `read`, `grep`, `find`, `ls`, and `bash`. Use `bash` to
 run the project's OWN tests / linters / build — not improvised
-checks. You have NO write/edit — you do not fix things, you
-REPORT.
+checks. NO write/edit — you do not fix things, you REPORT.
 
 How you work:
 - Re-read the changed files yourself. Don't trust the description.
@@ -198,9 +194,8 @@ How you work:
   `[blocker]` — must fix before this is done.
   `[risk]`    — probably wrong / fragile, worth a second look.
   `[nit]`     — minor, optional.
-- If everything checks out, say so plainly: `VERDICT: pass` plus
-  the evidence (which tests ran, what passed). Otherwise
-  `VERDICT: fail` and the blockers.
+- All good → `VERDICT: pass` plus the evidence (which tests ran,
+  what passed). Otherwise `VERDICT: fail` and the blockers.
 
 You are the last line before the user sees the work. Be skeptical.
 """
@@ -266,10 +261,22 @@ def _build_coder(
     sandbox_allow_network: bool = False,
     embedder: str | None = None,
     workspace: Any | None = None,
+    memory: Any | None = None,
+    attach_workspace: bool = False,
+    persist_tool_transcripts: bool = True,
 ) -> Agent:
     """The doer. Full file-and-shell kernel, scoped to the project
     root. `StandardPermissions` gates the destructive tools
     (write / edit / bash) through the shared approval handler.
+
+    ``persist_tool_transcripts=False`` is used by the SOLO fast path:
+    it shares the REPL ``session_id`` with the read-only coordinator,
+    and persisting its write/bash transcripts would make the
+    coordinator rehydrate history of "itself" editing files — the
+    exact grind-it-myself failure the read-only design exists to
+    prevent. Solo turns are small; losing their transcript reuse
+    costs little. (As a delegate worker the coder keeps ``True`` —
+    its sessions are worker-private.)
 
     ``embedder`` adds the read-only ``codebase_search`` tool — the
     coder uses it to locate the right code to change before editing,
@@ -290,7 +297,15 @@ def _build_coder(
     — the ONLY worker that gets them, since it's the sole writer/executor.
     When set, the coder's static tools are wrapped in an
     ``McpAugmentedHost`` so MCP tools resolve lazily (connect-on-first-
-    use) and static builtins win any name collision."""
+    use) and static builtins win any name collision.
+
+    ``memory`` / ``attach_workspace``: as a delegate worker the coder
+    inherits the coordinator's memory + workspace ambiently, so both
+    stay off (``None`` / ``False``). The SOLO fast path
+    (:func:`loom_code.agent.build_solo_agent`) runs this same agent
+    standalone — no parent to inherit from — so it passes the shared
+    memory cfg explicitly and attaches the notebook workspace so
+    ``note`` / ``search_notes`` exist."""
     root = project.root
     # bash is the one tool that runs arbitrary code, so it's the one we
     # kernel-sandbox when asked. edit/write only touch where the model
@@ -340,6 +355,8 @@ def _build_coder(
         model=model,
         architecture=ReAct(),
         tools=tools,
+        memory=memory,
+        workspace=workspace if attach_workspace else None,
         # Bundled skills (graphify, etc.) — registered on workers
         # too, not just the coordinator. Without this, when the
         # coordinator delegates "build the graph" to coder, the
@@ -371,8 +388,9 @@ def _build_coder(
         # the single biggest token leak in long sessions; flipping
         # this on makes session_messages() rehydrate the prior
         # tool transcript so the coder QUOTES what it read instead
-        # of re-running `read`.
-        persist_tool_transcripts=True,
+        # of re-running `read`. (False on the solo fast path — see
+        # the docstring.)
+        persist_tool_transcripts=persist_tool_transcripts,
     )
 
 
@@ -384,6 +402,7 @@ def _build_explorer(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    tool_result_summarizer: str | None = None,
     effort: str | None = None,
     embedder: str | None = None,
     workspace: Any | None = None,
@@ -403,6 +422,16 @@ def _build_explorer(
         max_turns=_SPECIALIST_MAX_TURNS,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        # Per-result output compression (cheap model). Safe here —
+        # the explorer returns a BRIEFING, not exact-match edits, so
+        # a faithfully-summarised read/grep dump loses nothing it
+        # needs. This is the per-result bound snip (turn-count) and
+        # auto-compact (never fires inside a worker run — stop hooks
+        # are off on workers) cannot provide.
+        tool_result_summarizer=tool_result_summarizer,
+        tuning=Tuning(
+            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS
+        ),
         effort=effort,
         # See ``_build_coder`` for the rationale. Explorer benefits
         # too: a question like "how does X work, then check Y" no
@@ -419,6 +448,7 @@ def _build_auditor(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    tool_result_summarizer: str | None = None,
     effort: str | None = None,
     embedder: str | None = None,
     workspace: Any | None = None,
@@ -435,6 +465,11 @@ def _build_auditor(
         max_turns=_SPECIALIST_MAX_TURNS,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        # Same rationale as the explorer: briefings, not exact edits.
+        tool_result_summarizer=tool_result_summarizer,
+        tuning=Tuning(
+            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS
+        ),
         effort=effort,
         # Same rationale as explorer — auditor accumulates context
         # about the focus area across rounds when its findings get
@@ -451,6 +486,7 @@ def _build_reviewer(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    tool_result_summarizer: str | None = None,
     effort: str | None = None,
     embedder: str | None = None,
     workspace: Any | None = None,
@@ -475,6 +511,12 @@ def _build_reviewer(
         max_turns=_REVIEWER_MAX_TURNS,
         snip_window=snip_window,
         auto_compact_at_tokens=auto_compact_at_tokens,
+        # Briefings + test verdicts, not exact edits — a summarised
+        # pytest dump keeps the failures, drops the dots.
+        tool_result_summarizer=tool_result_summarizer,
+        tuning=Tuning(
+            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS
+        ),
         effort=effort,
         # Reviewer benefits too: re-review cycles ("you flagged X,
         # the coder fixed it, recheck") no longer re-read every
@@ -492,6 +534,7 @@ def build_workers(
     skills: list[Any] | None = None,
     auto_compact_at_tokens: int | None = None,
     snip_window: int = 0,
+    tool_result_summarizer: str | None = None,
     effort: str | None = None,
     mcp_registry: Any | None = None,
     sandbox: bool = False,
@@ -518,6 +561,14 @@ def build_workers(
     Auditor + reviewer stay read-only-and-local (no web access)
     — keeps their cost predictable and their scope honest.
     ``None`` (default) leaves web search off entirely.
+
+    ``tool_result_summarizer`` (a cheap model name) compresses
+    oversized tool results on the READ-ONLY workers (explorer /
+    auditor / reviewer) — they return briefings, so a faithful
+    summary loses nothing. The CODER is deliberately excluded:
+    it needs verbatim ``read`` output to construct exact-match
+    ``edit`` old_strings; a summarised read would make every
+    subsequent edit miss.
     """
     has_web = web_backend is not None
     workers: dict[str, Agent] = {
@@ -543,6 +594,7 @@ def build_workers(
             skills=skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            tool_result_summarizer=tool_result_summarizer,
             effort=effort,
             embedder=embedder,
             workspace=workspace,
@@ -553,6 +605,7 @@ def build_workers(
             skills=skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            tool_result_summarizer=tool_result_summarizer,
             effort=effort,
             embedder=embedder,
             workspace=workspace,
@@ -564,6 +617,7 @@ def build_workers(
             skills=skills,
             auto_compact_at_tokens=auto_compact_at_tokens,
             snip_window=snip_window,
+            tool_result_summarizer=tool_result_summarizer,
             effort=effort,
             embedder=embedder,
             workspace=workspace,

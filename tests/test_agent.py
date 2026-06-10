@@ -9,8 +9,10 @@ auditor / reviewer).
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
+import pytest
 from loomflow import Agent
 from loomflow.architecture import Supervisor
 from loomflow.workspace import LocalDiskWorkspace
@@ -149,3 +151,65 @@ def test_graphify_skill_registered_on_coordinator(
         f"(found: {skill_names}). Check pyproject.toml's "
         "package-data section + loom_code/skills/graphify/SKILL.md."
     )
+
+
+# ---- /goal run-until-done wiring (run_until=) ------------------------
+
+# ``run_until=`` needs a loomflow newer than any released 0.10.x.
+# ``build_agent`` passes it only when armed (so the CLI starts fine on
+# a PyPI install), and the armed tests SKIP rather than fail there —
+# they activate automatically once the framework release lands and the
+# pyproject floor is bumped.
+requires_run_until = pytest.mark.skipif(
+    "run_until" not in inspect.signature(Agent.__init__).parameters,
+    reason="installed loomflow predates Agent(run_until=)",
+)
+
+
+def _hook_names(agent: Agent) -> list[str]:
+    """Names of the coordinator's registered stop hooks."""
+    return [
+        getattr(h, "name", type(h).__name__) for h in agent._stop_hooks
+    ]
+
+
+@requires_run_until
+def test_run_until_registers_goal_hook(project: Project) -> None:
+    # /goal passes a run_until dict to build_agent → the framework
+    # GoalStopHook is registered on the coordinator (alongside the
+    # always-on living_plan hook). Ordering: living_plan first so the
+    # plan finishes before the goal is checked.
+    coordinator, _ = build_agent(
+        project,
+        model="echo",
+        run_until={
+            "condition": "all tests pass",
+            "max_iterations": 20,
+            "max_no_progress": 3,
+            "max_cost_usd": 2.0,
+        },
+    )
+    names = _hook_names(coordinator)
+    assert "run_until" in names
+    assert "living_plan" in names
+    assert names.index("living_plan") < names.index("run_until")
+
+
+def test_no_run_until_leaves_default_unchanged(project: Project) -> None:
+    # Default build (no /goal) registers NO run_until hook — behaviour
+    # is identical to before the feature.
+    coordinator, _ = build_agent(project, model="echo")
+    assert "run_until" not in _hook_names(coordinator)
+
+
+@requires_run_until
+def test_run_until_checker_in_dict(project: Project) -> None:
+    # The cheap checker travels inside the run_until dict (resolved to
+    # Dependencies.goal_checker by the framework). A str condition works
+    # too — build_agent forwards whatever shape it's given.
+    coordinator, _ = build_agent(
+        project,
+        model="echo",
+        run_until={"condition": "x", "checker": "echo"},
+    )
+    assert "run_until" in _hook_names(coordinator)
