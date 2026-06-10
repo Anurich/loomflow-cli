@@ -52,11 +52,25 @@ def test_no_git_hint_when_not_git(tmp_path: Path) -> None:
     )
 
 
-def test_context_file_inlined_in_both_prompts(tmp_path: Path) -> None:
+def test_context_file_reaches_both_agents(tmp_path: Path) -> None:
+    """The coder inlines the context file statically; the coordinator
+    deliberately does NOT (``include_context_file=False``) — it gets
+    the rules FRESH each turn via the ``project_rules`` working block
+    instead, so mid-session edits apply without a restart. Pin both
+    halves of that contract."""
+    from loom_code.rules import project_rules_block
+
     marker = "BINDING-HOUSE-RULE-MARKER"
     proj = _proj(tmp_path, context=marker)
-    assert marker in build_unified_coordinator_instructions(proj)
+    # Coder: static bake.
     assert marker in build_coder_prompt(proj)
+    # Coordinator: no static bake...
+    assert marker not in build_unified_coordinator_instructions(proj)
+    # ...because the per-turn working block carries it. AGENTS.md is
+    # loom-code's native convention (what /init-loom creates); CLAUDE.md
+    # is only read for compatibility with repos that already have one.
+    (tmp_path / "AGENTS.md").write_text(marker, encoding="utf-8")
+    assert marker in project_rules_block(tmp_path)
 
 
 def test_coordinator_instructs_use_of_repo_map(
