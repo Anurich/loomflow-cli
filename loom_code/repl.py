@@ -736,38 +736,15 @@ class Repl:
         — a few hundred tokens, not a notebook dump. Block is cleared
         when nothing relevant is proven, so stale advice never lingers.
         Failures are swallowed (never let memory I/O kill a turn).
+
+        Delegates to :mod:`loom_code.turn` — the SHARED per-turn
+        pipeline, so the desktop sidecar runs the identical logic.
         """
-        try:
-            matches = await self.workspace.search_notes(
-                prompt,
-                user_id=_USER_ID,
-                boost_relevance=True,
-                limit=8,
-            )
-            proven = [
-                m for m in matches if m.summary.success_count > 0
-            ][:3]
-            if proven:
-                lines = [
-                    "# Learned notes (proven on past turns)",
-                    "Notes from earlier work on THIS project that were "
-                    "used in turns the user accepted. Trust but verify "
-                    "— `read_note(slug)` for the full note.",
-                    "",
-                ]
-                lines.extend(
-                    f"- [{m.summary.slug}] (worked "
-                    f"{m.summary.success_count}x) {m.snippet}"
-                    for m in proven
-                )
-                body = "\n".join(lines)
-            else:
-                body = ""
-            await self.agent.memory.update_block(
-                "learned_notes", body, user_id=_USER_ID
-            )
-        except Exception:  # noqa: BLE001 — injection is best-effort
-            pass
+        from .turn import inject_learned_notes
+
+        await inject_learned_notes(
+            self.workspace, self.agent.memory, prompt, user_id=_USER_ID
+        )
 
     async def _inject_file_history(self, prompt: str) -> None:
         """Proactive anticipation: before the agent runs, surface what
@@ -1189,26 +1166,22 @@ class Repl:
         ``quiet`` suppresses the confirmation line — used for the
         implicit 'moved-on = success' path so the REPL doesn't
         chatter on every turn."""
-        # Revise the last turn's file touches from "unknown" to the
-        # now-known outcome. Independent of the slug path (a turn can
-        # edit files without citing notes), so do it first + always.
-        if self._pending_files:
-            file_history.update_last_outcome(
-                self.project.root,
-                self._pending_files,
-                "success" if success else "fail",
-            )
-            self._pending_files = []
-        if not self._pending_slugs:
-            return
+        # Shared pipeline (loom_code.turn) owns what crediting means;
+        # the REPL only owns the pending state + console feedback.
+        from .turn import attribute_turn
+
+        files = self._pending_files
         slugs = self._pending_slugs
+        self._pending_files = []
         self._pending_slugs = []
-        try:
-            n = await self.workspace.attribute_outcome(
-                success=success, slugs=slugs, user_id=_USER_ID
-            )
-        except Exception:  # noqa: BLE001 — best-effort, never fatal
-            return
+        n = await attribute_turn(
+            self.workspace,
+            self.project.root,
+            success=success,
+            slugs=slugs,
+            files=files,
+            user_id=_USER_ID,
+        )
         if n and not quiet:
             verb = "credited" if success else "debited"
             console.print(
