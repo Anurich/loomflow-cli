@@ -132,14 +132,101 @@ def test_ollama_needs_no_key() -> None:
     )
 
 
-def test_litellm_returns_none_to_skip_prompt() -> None:
-    # litellm/<provider>/... — too many shapes to map reliably;
-    # don't surprise advanced users with a wrong-key prompt.
+def test_litellm_known_provider_maps_to_its_key() -> None:
+    # A KNOWN LiteLLM provider (in the registry) prompts for the
+    # right env var + signup link.
     assert (
-        required_env_for_model("litellm/groq/llama-3.1") is None
+        required_env_for_model("litellm/nvidia_nim/nvidia/nemotron")
+        == "NVIDIA_NIM_API_KEY"
     )
+    assert (
+        required_env_for_model("litellm/groq/llama-3.1")
+        == "GROQ_API_KEY"
+    )
+    assert (
+        required_env_for_model("litellm/together_ai/some-model")
+        == "TOGETHERAI_API_KEY"
+    )
+
+
+def test_litellm_unknown_provider_returns_none() -> None:
+    # An UNKNOWN litellm/<x>/... still returns None — we don't guess
+    # and risk prompting for a key we can't reliably name.
+    assert (
+        required_env_for_model("litellm/some_exotic_proxy/m") is None
+    )
+
+
+def test_nvidia_alias_normalizes_to_litellm_form() -> None:
+    from loom_code.credentials import normalize_model
+
+    assert (
+        normalize_model("nvidia/nemotron-nano-9b-v2")
+        == "litellm/nvidia_nim/nvidia/nemotron-nano-9b-v2"
+    )
+    # Idempotent + passthrough for native/prefixed strings.
+    assert (
+        normalize_model("litellm/nvidia_nim/nvidia/x")
+        == "litellm/nvidia_nim/nvidia/x"
+    )
+    assert normalize_model("gpt-4.1-mini") == "gpt-4.1-mini"
+    assert normalize_model("claude-sonnet-4-6") == "claude-sonnet-4-6"
+    assert normalize_model("ollama/llama3") == "ollama/llama3"
 
 
 def test_echo_model_needs_no_key() -> None:
     # The test fake.
     assert required_env_for_model("echo") is None
+
+
+# ---- user-declared providers (settings.toml [[provider]]) -----------------
+
+
+def test_user_provider_registers_via_settings_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A user can integrate ANY provider without editing source: a
+    # [[provider]] block in ~/.loom-code/settings.toml adds it to the
+    # registry, so its key is prompted for and its alias normalizes.
+    from loom_code.credentials import (
+        litellm_providers,
+        normalize_model,
+        signup_url_for,
+    )
+
+    monkeypatch.setattr(creds_mod, "_CREDENTIALS_DIR", tmp_path)
+    (tmp_path / "settings.toml").write_text(
+        '[[provider]]\n'
+        'slug = "myproxy"\n'
+        'env = "MYPROXY_API_KEY"\n'
+        'signup = "https://example.com/keys"\n'
+        'alias = "myai"\n'
+    )
+    # Registry now includes the custom provider alongside built-ins.
+    reg = litellm_providers()
+    assert reg["myproxy"] == ("MYPROXY_API_KEY", "https://example.com/keys")
+    assert "nvidia_nim" in reg  # built-ins still present
+    # required_env_for_model + signup link route to it.
+    assert (
+        required_env_for_model("litellm/myproxy/some-model")
+        == "MYPROXY_API_KEY"
+    )
+    assert signup_url_for("MYPROXY_API_KEY") == "https://example.com/keys"
+    # The declared alias normalizes.
+    assert (
+        normalize_model("myai/some-model")
+        == "litellm/myproxy/some-model"
+    )
+
+
+def test_malformed_settings_toml_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bad TOML must not crash startup — falls back to built-ins only.
+    from loom_code.credentials import litellm_providers
+
+    monkeypatch.setattr(creds_mod, "_CREDENTIALS_DIR", tmp_path)
+    (tmp_path / "settings.toml").write_text("this is not valid = = toml [[")
+    reg = litellm_providers()
+    assert "nvidia_nim" in reg  # built-ins survive
+    assert "myproxy" not in reg

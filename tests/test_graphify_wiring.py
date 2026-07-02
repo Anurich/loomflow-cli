@@ -73,6 +73,6 @@ def test_setup_commands_are_gone() -> None:
     assert not hasattr(repl_mod.Repl, "_handle_loominit"), (
         "_handle_loominit still defined on Repl"
     )
-    cmds = {cmd for cmd, _desc in repl_mod._COMMAND_DEFS}
+    cmds = {entry[0] for entry in repl_mod._COMMAND_DEFS}
     assert "/graphify" not in cmds, "/graphify still in _COMMAND_DEFS"
     assert "/loominit" not in cmds, "/loominit still in _COMMAND_DEFS"

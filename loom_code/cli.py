@@ -197,6 +197,16 @@ def _print_run_summary(
                 (f"${cost:.4f}", "dim green"),
             )
         )
+        # Stable, machine-parseable usage marker on its own line. The
+        # pretty line above is for humans (Rich markup, commas); this one
+        # is for tooling — a benchmark harness / script greps LOOM_USAGE
+        # and reads plain ints, no formatting to unpick. Kept minimal and
+        # append-only so parsers don't break when fields are added.
+        console.print(
+            f"LOOM_USAGE turns={turns} "
+            f"tokens_in={tin} cached_in={cached} "
+            f"tokens_out={tout} cost_usd={cost:.6f}"
+        )
 
     if project.is_git:
         changes = _git_changes(project)
@@ -297,6 +307,18 @@ def main() -> None:
         from .credentials import load_preferred_model
 
         args.model = load_preferred_model() or DEFAULT_MODEL
+    # Expand friendly provider aliases (e.g. ``nvidia/nemotron-...`` →
+    # ``litellm/nvidia_nim/nvidia/nemotron-...``) so the rest of the
+    # pipeline — key prompt, resolver, persistence — sees the canonical
+    # form loomflow understands.
+    from .credentials import normalize_model, quiet_litellm_model_warnings
+
+    args.model = normalize_model(args.model)
+    # litellm-routed models trigger loomflow "unknown model" warnings
+    # (context window + pricing) that loom-code already handles; hush
+    # them so the startup output stays clean. Native models are
+    # untouched, so a real misconfig there still surfaces.
+    quiet_litellm_model_warnings(args.model)
     if not ensure_key_for_model(args.model, console):
         sys.exit(1)
     # Remember it so the next launch starts here too.

@@ -193,7 +193,13 @@ def build_agent(
     auto_compact_at_tokens: int | None = None
     if auto_compact:
         from loomflow.agent.auto_compact import context_window_for
-        window = context_window_for(model)
+
+        from .credentials import context_window_override
+        # Prefer a known window for litellm-routed models (NVIDIA
+        # Nemotron, Groq Llama, ...) that context_window_for doesn't
+        # recognise — otherwise it returns a conservative 8192 and
+        # compaction fires far too early.
+        window = context_window_override(model) or context_window_for(model)
         auto_compact_at_tokens = int(window * 0.8)
 
     # Cheap same-provider sibling for low-stakes utility LLM calls —
@@ -491,7 +497,10 @@ def build_solo_agent(
     auto_compact_at_tokens: int | None = None
     if auto_compact:
         from loomflow.agent.auto_compact import context_window_for
-        auto_compact_at_tokens = int(context_window_for(model) * 0.8)
+
+        from .credentials import context_window_override
+        window = context_window_override(model) or context_window_for(model)
+        auto_compact_at_tokens = int(window * 0.8)
 
     agent = _build_coder(
         project,

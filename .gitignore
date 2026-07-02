@@ -36,3 +36,7 @@ graphify-out/
 
 # OS
 .DS_Store
+benchmarks/terminal_bench/dist/
+
+# Terminal-Bench run artifacts (local only)
+runs/

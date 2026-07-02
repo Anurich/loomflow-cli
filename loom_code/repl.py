@@ -33,15 +33,10 @@ How "success" is judged — the **moved-on heuristic**:
 That matches how a developer actually signals: silence + moving
 on means "worked", an explicit "no" means "didn't".
 
-Slash commands (handled here, never sent to the agent):
-  /help            this list
-  /plan            show the current living plan
-  /cost            cumulative cost + token totals
-  /good            mark the last turn useful (credit cited notes)
-  /bad             mark the last turn unhelpful
-  /model <name>    switch model (rebuilds the agent, keeps the repo)
-  /clear           start a fresh conversation (new session_id)
-  /exit, /quit     leave (Ctrl-D works too)
+Slash commands are handled here, never sent to the agent. The full
+list is defined once in :data:`_COMMAND_DEFS` (grouped) and rendered
+by :func:`_render_help` for ``/help`` and the autocomplete menu — see
+there rather than duplicating the catalogue in this docstring.
 """
 
 from __future__ import annotations
@@ -88,39 +83,6 @@ from .trust import filter_trusted_hooks
 # to that provider's commonly-used model.
 _OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
 _ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-4-6"
-
-_SLASH_HELP = """\
-[bold]loom-code commands[/bold]
-  [cyan]/help[/cyan]            this list
-  [cyan]/plan[/cyan] [<task>]   show the current plan — or start one
-  [cyan]/cost[/cyan]            session cost + token totals
-  [cyan]/good[/cyan]            mark the last turn useful (credits notes)
-  [cyan]/bad[/cyan]             mark the last turn unhelpful
-  [cyan]/undo[/cyan]            restore the working tree to the last checkpoint
-  [cyan]/checkpoints[/cyan]     list auto-checkpoints (taken before each edit)
-  [cyan]/model[/cyan] <name>    switch to a specific model by name
-  [cyan]/set_model[/cyan]       pick OpenAI / Anthropic + save API key
-  [cyan]/set_web[/cyan]         enable web search (Serper / DDG / off)
-  [cyan]/resume[/cyan]          resume the last session — rehydrates prior
-                   turns from loomflow memory so you pick up where
-                   you left off
-  [cyan]/set_continue_cap[/cyan] [N]
-                   show / set the auto-continue cap. When the plan
-                   has non-done steps after the agent emits a final
-                   answer, the REPL auto-runs up to N more
-                   iterations. Default 15. ``/set_continue_cap 0``
-                   disables auto-continue.
-  [cyan]/clear[/cyan]           fresh conversation (new session)
-  [cyan]/compress_token_length[/cyan] [N|auto|off]
-                   show / set / disable the auto-compact threshold
-                   (default: 80% of the model's context window)
-  [cyan]/exit[/cyan]            leave (Ctrl-D also works)
-
-Anything else is a task — loom-code plans, codes, and verifies it.
-Long sessions auto-compact: when cumulative tokens cross the
-threshold, a compactor agent writes a dense summary to memory and
-the conversation continues with that summary as its only history.
-"""
 
 _USER_ID = "loom-code"
 
@@ -252,37 +214,96 @@ When in doubt: TEAM.
 
 
 # no need to also update the autocomplete separately.
-_COMMAND_DEFS: list[tuple[str, str]] = [
-    ("/help", "show all commands"),
-    ("/init-loom", "create a starter AGENTS.md rules file"),
-    ("/plan", "show the current plan, or start one"),
-    ("/goal", "work until a condition is met (/goal make all tests pass)"),
-    ("/cost", "session cost + token totals"),
-    ("/good", "mark the last turn useful (credit notes)"),
-    ("/bad", "mark the last turn unhelpful"),
-    ("/undo", "restore the working tree to the last checkpoint"),
-    ("/checkpoints", "list auto-checkpoints (taken before each edit)"),
-    ("/model", "switch to a specific model by name"),
-    ("/effort", "reasoning effort: low | medium | high | off"),
-    ("/isolate", "run this session in its own git worktree"),
-    ("/review", "show the isolated session's diff vs base"),
-    ("/merge", "merge the isolated session's edits into base"),
-    ("/discard", "discard the isolated session's edits"),
-    ("/set_model", "pick OpenAI or Anthropic + save API key"),
-    ("/set_web", "enable web search (Serper / DuckDuckGo / off)"),
-    ("/mcp", "list connected MCP servers + their tools"),
-    # /computer (computer-operator mode) is HIDDEN for now — kept in code
-    # + dispatched if typed, but not advertised in help/autocomplete
-    # until it's ready to ship. Re-add this entry to surface it again.
-    ("/resume", "resume the last session (rehydrate prior turns)"),
-    ("/set_continue_cap", "set auto-continue cap (current=default 15)"),
-    ("/clear", "fresh conversation (new session)"),
+#
+# Each entry is (command, description, group). The GROUP tag lets
+# /help print the commands clustered by purpose instead of as one
+# flat 20-item wall — and both /help AND the autocomplete menu read
+# off this one list, so there's a single source of truth. Add a
+# command here and it shows up in both, correctly grouped, for free.
+# Group order below is the order groups appear in /help.
+_COMMAND_DEFS: list[tuple[str, str, str]] = [
+    # Coding — the day-to-day task loop.
+    ("/plan", "show the current plan, or start one", "Coding"),
+    (
+        "/goal",
+        "work until a condition is met (/goal make all tests pass)",
+        "Coding",
+    ),
+    ("/undo", "restore the working tree to the last checkpoint", "Coding"),
+    (
+        "/checkpoints",
+        "list auto-checkpoints (taken before each edit)",
+        "Coding",
+    ),
+    ("/good", "mark the last turn useful (credit notes)", "Coding"),
+    ("/bad", "mark the last turn unhelpful", "Coding"),
+    ("/init-loom", "create a starter AGENTS.md rules file", "Coding"),
+    # Isolation — sandbox this session in its own git worktree.
+    ("/isolate", "run this session in its own git worktree", "Isolate"),
+    ("/review", "show the isolated session's diff vs base", "Isolate"),
+    ("/merge", "merge the isolated session's edits into base", "Isolate"),
+    ("/discard", "discard the isolated session's edits", "Isolate"),
+    # Model & tools — how the agent thinks and what it can reach.
+    ("/model", "switch to a specific model by name", "Model"),
+    ("/effort", "reasoning effort: low | medium | high | off", "Model"),
+    ("/set_model", "pick OpenAI or Anthropic + save API key", "Model"),
+    ("/set_web", "enable web search (Serper / DuckDuckGo / off)", "Model"),
+    ("/mcp", "list connected MCP servers + their tools", "Model"),
+    # Session — state, cost, and history for the whole run.
+    ("/cost", "session cost + token totals", "Session"),
+    ("/resume", "resume the last session (rehydrate prior turns)", "Session"),
+    (
+        "/set_continue_cap",
+        "set auto-continue cap (current=default 15)",
+        "Session",
+    ),
     (
         "/compress_token_length",
         "auto-compact threshold: <N> | auto | off",
+        "Session",
     ),
-    ("/exit", "leave (Ctrl-D also works)"),
+    ("/clear", "fresh conversation (new session)", "Session"),
+    ("/help", "show all commands", "Session"),
+    ("/exit", "leave (Ctrl-D also works)", "Session"),
+    # /computer (computer-operator mode) is HIDDEN for now — kept in code
+    # + dispatched if typed, but not advertised in help/autocomplete
+    # until it's ready to ship. Add an entry here to surface it again.
 ]
+
+# Group order for /help — groups render in this sequence; any group
+# not listed falls to the end in first-seen order.
+_HELP_GROUP_ORDER = ("Coding", "Isolate", "Model", "Session")
+
+
+def _render_help() -> str:
+    """Build the /help text from :data:`_COMMAND_DEFS` so it can never
+    drift from the commands the REPL actually accepts (the old
+    hand-maintained blob had silently lost a third of them). Commands
+    cluster under their group header, aligned on the description."""
+    from collections import defaultdict
+
+    by_group: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for cmd, desc, group in _COMMAND_DEFS:
+        by_group[group].append((cmd, desc))
+    order = [g for g in _HELP_GROUP_ORDER if g in by_group]
+    order += [g for g in by_group if g not in _HELP_GROUP_ORDER]
+
+    # Align descriptions on the widest command across ALL groups so the
+    # columns line up down the whole list, not just within a group.
+    width = max(len(cmd) for cmd, _, _ in _COMMAND_DEFS)
+    lines = ["[bold]loom-code commands[/bold]"]
+    for group in order:
+        lines.append(f"\n  [dim]{group}[/dim]")
+        for cmd, desc in by_group[group]:
+            pad = " " * (width - len(cmd))
+            lines.append(f"    [cyan]{cmd}[/cyan]{pad}  {desc}")
+    lines.append(
+        "\nAnything else is a task — loom-code plans, codes, and "
+        "verifies it.\nLong sessions auto-compact: when tokens cross "
+        "the threshold, a\ncompactor writes a dense summary to memory "
+        "and the run continues."
+    )
+    return "\n".join(lines)
 
 
 class _SlashCompleter(Completer):
@@ -300,7 +321,7 @@ class _SlashCompleter(Completer):
         text = document.text_before_cursor
         if not text.startswith("/"):
             return
-        for cmd, desc in _COMMAND_DEFS:
+        for cmd, desc, _group in _COMMAND_DEFS:
             if cmd.startswith(text):
                 yield Completion(
                     cmd,
@@ -1200,7 +1221,7 @@ class Repl:
         if cmd in ("/exit", "/quit"):
             return False
         if cmd == "/help":
-            console.print(_SLASH_HELP)
+            console.print(_render_help())
         elif cmd == "/init-loom":
             from .rules import init_agents_md
 
@@ -1433,6 +1454,17 @@ class Repl:
         the new model too; ``_compact_threshold`` stays as-is so a
         user override survives a model switch (auto = -1 just
         recomputes against the new model on the next check)."""
+        # Expand friendly provider aliases first (``nvidia/nemotron-…``
+        # → ``litellm/nvidia_nim/nvidia/nemotron-…``) so ``/model`` in
+        # the REPL accepts the same short forms as the ``--model`` flag,
+        # and the key prompt / resolver see the canonical string.
+        from .credentials import (
+            normalize_model,
+            quiet_litellm_model_warnings,
+        )
+
+        model = normalize_model(model)
+        quiet_litellm_model_warnings(model)
         # Ensure we have a key for the NEW model before
         # constructing — otherwise build_agent crashes inside the
         # provider SDK on a missing key. ensure_key_for_model
@@ -2178,7 +2210,15 @@ class Repl:
             "    [cyan]2[/cyan]. Anthropic  "
             "(claude-sonnet-4-6, claude-opus-4-7, ...)"
         )
-        choice = await self._prompt_line("  Enter 1 or 2: ")
+        console.print(
+            "    [cyan]3[/cyan]. NVIDIA     "
+            "(Nemotron — [green]free[/green] API at build.nvidia.com)"
+        )
+        console.print(
+            "    [cyan]4[/cyan]. Other      "
+            "(Groq / Together / any litellm provider)"
+        )
+        choice = await self._prompt_line("  Enter 1-4: ")
         if choice is None:
             console.print("  [dim]cancelled[/dim]")
             return
@@ -2190,10 +2230,24 @@ class Repl:
             env_name = "ANTHROPIC_API_KEY"
             target_model = _ANTHROPIC_DEFAULT_MODEL
             label = "Anthropic"
+        elif choice == "3":
+            # NVIDIA NIM — free tier. Let the user pick WHICH model
+            # (the catalog has many; the small 9B is a poor default for
+            # tool-heavy work). Returns None if cancelled.
+            picked = await self._pick_nvidia_model()
+            if picked is None:
+                console.print("  [dim]cancelled[/dim]")
+                return
+            env_name = "NVIDIA_NIM_API_KEY"
+            target_model = picked
+            label = "NVIDIA"
+        elif choice == "4":
+            await self._set_model_other()
+            return
         else:
             console.print(
                 f"  [yellow]invalid choice {choice!r} — "
-                "enter 1 or 2[/yellow]"
+                "enter 1-4[/yellow]"
             )
             return
 
@@ -2221,10 +2275,118 @@ class Repl:
                 f"  [dim]{env_name} already set — using it[/dim]"
             )
         console.print(
-            f"  [dim]switching to {label}'s default model "
+            f"  [dim]switching to {label} model "
             f"({target_model})[/dim]"
         )
         self._switch_model(target_model)
+
+    # Curated NVIDIA NIM models, ordered small→large. loom-code is
+    # tool-heavy (delegate/write/edit/bash), so models with solid
+    # OpenAI-format function calling do far better — those are marked.
+    # (label, full litellm model string, note). Kept short + editable;
+    # the free-type option covers anything not listed.
+    # Model IDs verified against NVIDIA's live /v1/models catalog.
+    _NVIDIA_MODELS: list[tuple[str, str, str]] = [
+        (
+            "nemotron-nano-9b-v2",
+            "litellm/nvidia_nim/nvidia/nvidia-nemotron-nano-9b-v2",
+            "small/fast — weak at multi-step tool use",
+        ),
+        (
+            "nemotron-super-49b-v1.5",
+            "litellm/nvidia_nim/nvidia/"
+            "llama-3.3-nemotron-super-49b-v1.5",
+            "stronger, function-calling — better for real tasks",
+        ),
+        (
+            "llama-3.3-70b",
+            "litellm/nvidia_nim/meta/llama-3.3-70b-instruct",
+            "general 70B, function-calling",
+        ),
+        (
+            "deepseek-v4-pro",
+            "litellm/nvidia_nim/deepseek-ai/deepseek-v4-pro",
+            "strong code/reasoning (MoE)",
+        ),
+    ]
+
+    async def _pick_nvidia_model(self) -> str | None:
+        """Menu of common NVIDIA NIM models + free-type. Returns the
+        chosen litellm model string, or None if cancelled.
+
+        The user may enter a list number, or type any model id (a bare
+        ``nvidia/…`` / ``meta/…`` id is normalised to the litellm form,
+        or a full ``litellm/nvidia_nim/…`` string is taken as-is)."""
+        from .credentials import normalize_model
+
+        console.print()
+        console.print(
+            "  [bold]NVIDIA models[/bold] "
+            "[dim](free at build.nvidia.com)[/dim]"
+        )
+        for i, (name, _model, note) in enumerate(self._NVIDIA_MODELS, 1):
+            console.print(
+                f"    [cyan]{i}[/cyan]. {name:22} [dim]{note}[/dim]"
+            )
+        console.print(
+            "  [dim]enter a number, or type any model id "
+            "(e.g. nvidia/nemotron-…)[/dim]"
+        )
+        ans = await self._prompt_line("  Model: ")
+        if not ans:
+            return None
+        if ans.isdigit():
+            idx = int(ans) - 1
+            if 0 <= idx < len(self._NVIDIA_MODELS):
+                return self._NVIDIA_MODELS[idx][1]
+            console.print(f"  [yellow]no option {ans}[/yellow]")
+            return None
+        # Free-typed id. If it's already a litellm string, keep it; if
+        # it's a bare vendor id (nvidia/…, meta/…), route it via NIM.
+        if ans.lower().startswith("litellm/"):
+            return ans
+        if "/" in ans:
+            return f"litellm/nvidia_nim/{ans}"
+        # A lone token like "nemotron-nano-9b-v2" — assume nvidia vendor.
+        return normalize_model(f"nvidia/{ans}")
+
+    async def _set_model_other(self) -> None:
+        """``/set_model`` → Other — the fully generic path for ANY
+        provider loomflow can route through LiteLLM (Groq, Together,
+        DeepSeek, a custom OpenAI-compatible proxy, ...).
+
+        The user types a model string; :func:`normalize_model` in
+        ``_switch_model`` expands a known alias, and
+        ``ensure_key_for_model`` prompts for the right key (with a
+        signup link) when the provider is in the registry. Providers
+        added via ``~/.loom-code/settings.toml`` ``[[provider]]`` blocks
+        work here too, with no code change."""
+        from .credentials import litellm_providers
+
+        console.print()
+        known = ", ".join(sorted(litellm_providers()))
+        console.print(
+            "  [dim]Enter any model string loom-code can route, e.g.:[/dim]"
+        )
+        console.print(
+            "    [cyan]groq/llama-3.3-70b-versatile[/cyan]   "
+            "[dim](short alias)[/dim]"
+        )
+        console.print(
+            "    [cyan]litellm/deepseek/deepseek-chat[/cyan]   "
+            "[dim](explicit litellm form)[/dim]"
+        )
+        console.print(f"  [dim]known providers: {known}[/dim]")
+        console.print(
+            "  [dim]add more in ~/.loom-code/settings.toml "
+            "([[provider]] blocks)[/dim]"
+        )
+        model = await self._prompt_line("  Model: ")
+        if not model:
+            console.print("  [dim]cancelled[/dim]")
+            return
+        # _switch_model normalizes the alias + prompts for the key.
+        self._switch_model(model)
 
     async def _handle_set_web(self) -> None:
         """``/set_web`` — pick a web-search backend (or disable).
