@@ -134,23 +134,61 @@ _SKIP_DIRS = frozenset(
 
 # Cache: root -> (signature, rendered map). The signature is cheap to
 # recompute; the expensive AST walk only re-runs when it changes.
-_REPO_MAP_CACHE: dict[str, tuple[tuple[float, int], str | None]] = {}
+# ``_UNMAPPABLE`` in the signature slot marks a root we refuse to map
+# (drive root / home dir / walk blew the budget) — cached so later
+# turns skip instantly instead of re-attempting the walk.
+_UNMAPPABLE = object()
+_REPO_MAP_CACHE: dict[str, tuple[object, str | None]] = {}
+
+# Walk guards. The signature walk runs at EVERY turn start, on the
+# REPL's event loop — it must never be able to stall a turn. A user
+# launched loom-code at ``D:\`` (drive root, no git → cwd becomes the
+# project root) and the first turn hung walking the whole drive.
+_SIG_MAX_FILES = 50_000  # .py files — far beyond any sane repo
+_SIG_TIME_BUDGET_S = 3.0  # wall-clock cap for the whole walk
 
 
-def _tree_signature(root: Path) -> tuple[float, int]:
+def _unmappable_root(root: Path) -> bool:
+    """Roots where a repo map makes no sense and the walk is dangerous:
+    a filesystem/drive root (``/``, ``C:\\``, ``D:\\``) or the user's
+    home directory. These aren't projects — they're the world."""
+    try:
+        return root == Path(root.anchor) or root == Path.home()
+    except OSError:
+        return True  # can't even resolve — don't walk it
+
+
+def _tree_signature(root: Path) -> tuple[float, int] | None:
     """A cheap freshness key: (newest .py mtime, file count). Either
     moving means the tree changed → rebuild. Count catches add/delete
-    that don't bump the newest mtime."""
+    that don't bump the newest mtime.
+
+    ``os.walk`` with pruning (NOT ``rglob``, which descends into
+    node_modules/.venv and filters after the fact) plus a file-count
+    and wall-clock budget. Returns ``None`` when the budget is
+    breached — the tree is too big to map; the caller caches the
+    refusal."""
+    import os
+    import time as _time
+
+    deadline = _time.monotonic() + _SIG_TIME_BUDGET_S
     newest = 0.0
     count = 0
-    for p in root.rglob("*.py"):
-        if any(part in _SKIP_DIRS for part in p.parts):
-            continue
-        try:
-            newest = max(newest, p.stat().st_mtime)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if _time.monotonic() > deadline:
+            return None
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            try:
+                st = os.stat(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            newest = max(newest, st.st_mtime)
             count += 1
-        except OSError:
-            continue
+            if count > _SIG_MAX_FILES:
+                return None
     return (newest, count)
 
 
@@ -161,11 +199,23 @@ def _repo_map_cached(
     True when the source tree changed and we re-walked, False on a
     cache hit. Freshness-keyed (newest .py mtime + file count), so it
     only re-parses when something actually moved. Mirrors the map to
-    ``<root>/.loom/repomap.md`` on every rebuild for inspection."""
+    ``<root>/.loom/repomap.md`` on every rebuild for inspection.
+
+    Unmappable roots (drive root / home / budget-breaching trees)
+    return ``(None, False)`` and are cached as such — the agent simply
+    runs without a repo map there, and no later turn pays the walk."""
     root_p = Path(root).resolve()
     key = str(root_p)
-    sig = _tree_signature(root_p)
     cached = _REPO_MAP_CACHE.get(key)
+    if cached is not None and cached[0] is _UNMAPPABLE:
+        return None, False
+    if _unmappable_root(root_p):
+        _REPO_MAP_CACHE[key] = (_UNMAPPABLE, None)
+        return None, False
+    sig = _tree_signature(root_p)
+    if sig is None:  # walk breached the budget — tree too big
+        _REPO_MAP_CACHE[key] = (_UNMAPPABLE, None)
+        return None, False
     if cached is not None and cached[0] == sig:
         return cached[1], False
     rendered = repo_map_for_root(root_p, max_tokens=max_tokens)
