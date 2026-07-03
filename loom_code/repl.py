@@ -401,7 +401,7 @@ _COMMAND_DEFS: list[tuple[str, str, str]] = [
         "approval mode: default | accept-edits | plan | yolo",
         "Model",
     ),
-    ("/set_model", "pick OpenAI or Anthropic + save API key", "Model"),
+    ("/set_model", "pick a provider + model (saves API key)", "Model"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)", "Model"),
     ("/mcp", "list connected MCP servers + their tools", "Model"),
     # Session — state, cost, and history for the whole run.

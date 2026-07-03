@@ -1,132 +1,170 @@
 # loom-code
 
-A terminal coding agent built on [loomflow](https://github.com/Anurich/LoomFlow).
+**A terminal coding agent built on [loomflow](https://github.com/Anurich/LoomFlow).**
+Plans before it codes, asks before it breaks things, works with any model —
+including free ones.
 
-loom-code is a thin terminal shell — the brain is loomflow. The CLI
-detects your project, builds a loomflow `Agent`, streams the run to
-the terminal, and gates destructive tool calls behind an approval
-prompt. Everything load-bearing — the agent loop, tools, planning,
-memory, the self-improvement notebook — is loomflow.
+```
+›  add a retry decorator to the http client
 
-## What it does
+● loom
+Added `retry(max_attempts=3, backoff=2.0)` to http/client.py and wired it
+onto get() and post(). Tests pass (14/14).
+───────────────────────────────────────────── 12,431 in · 217 out · $0.0043
+```
+
+loom-code is a thin terminal shell — the brain is loomflow. The CLI detects
+your project, builds a loomflow `Agent`, streams the run to your terminal,
+and gates destructive tool calls behind an approval prompt. Everything
+load-bearing — the agent loop, tools, planning, memory — is loomflow.
+
+## Highlights
 
 - **Plans before it codes.** Every task gets a living plan
-  (`plan_write` / `plan_read`) — TodoWrite-style, visible, hard to
-  drift from.
-- **A 7-tool kernel.** `read` / `write` / `edit` / `grep` / `find` /
-  `ls` / `bash`, all scoped to the project root.
-- **Specialist sub-agents on demand.** The main ReAct loop can call
+  (TodoWrite-style), visible as it progresses, hard to drift from.
+- **Any model, including free ones.** OpenAI, Anthropic, NVIDIA's free
+  NIM tier, local Ollama, or anything LiteLLM routes (Groq, Together,
+  Azure, Bedrock, Vertex…). `/set_model` walks you through provider →
+  API key → model with arrow-key menus.
+- **Claude-Code-style permissions.** Reads are lenient, writes are
+  strict. Every write/edit/shell command routes through an approval
+  gate with a unified-diff preview. Allow/ask/deny rules, approval
+  modes (`default` / `accept-edits` / `plan` / `yolo`), and an
+  optional OS-level bash sandbox (`--sandbox`).
+- **Specialist sub-agents on demand.** The main loop can call
   `explore` (read-only investigation) and `review` (independent
-  verification) as tools — one coherent main thread, specialists
-  when they earn their keep.
-- **Asks before destructive changes.** Writes, edits, and shell
-  commands route through an approval gate with a unified-diff
-  preview and an allow-all-session option.
-- **Gets sharper at your repo.** A per-project notebook
-  (`.loom/notebook`) plus episode memory (`.loom/memory.db`) —
-  notes the agent reads get credited when a turn goes well, so
-  future runs surface what worked.
+  verification) as tools — one coherent thread, specialists when they
+  earn their keep.
+- **Session isolation.** `/isolate` runs the session in its own git
+  worktree; `/review` shows the diff, `/merge` or `/discard` ends it.
+  Auto-checkpoints before every edit; `/undo` restores.
+- **Gets sharper at your repo.** A per-project notebook plus episode
+  memory (`.loom/`) — notes the agent used get credited when a turn
+  goes well, so future runs surface what worked. `/good` and `/bad`
+  train it.
+- **Cost you can see.** Every response closes with that turn's tokens
+  and dollar cost (`free` on free tiers). `/cost` has session totals.
+- **MCP out of the box.** Connect Linear, Sentry, Postgres,
+  Playwright, or any MCP server; `/mcp` lists what's live.
+- **Goal mode.** `/goal make all tests pass` keeps working until the
+  condition is verifiably met.
 
 ## Install
-
-One command, no clone needed:
 
 ```bash
 pipx install git+https://github.com/Anurich/loomflow-cli
 ```
 
-`pipx` is the standard installer for Python CLIs (`aider`,
-`ruff`, `httpie` all ship this way). It clones the repo into its
-own isolated cache, creates a private venv, and puts `loom-code`
-on your PATH — globally. No `cd` into our repo, no venv to
-manage. If you don't have pipx: `brew install pipx` (macOS) or
-`python -m pip install --user pipx`.
+(`pip install` works too; `pipx` keeps CLI tools in their own venvs.
+No pipx? `brew install pipx` or `python -m pip install --user pipx`.)
 
-Then set one model key in your environment (or a local `.env`):
+Requires Python 3.11+. To update: `pipx upgrade loom-code`.
 
-```bash
-export OPENAI_API_KEY=sk-...        # OpenAI / gpt-4.1-mini default
-# or
-export ANTHROPIC_API_KEY=sk-ant-... # Anthropic / Claude
-```
-
-Ollama needs no key (it's local) — see [Models](#models) below.
-
-To update later: `pipx upgrade loom-code`. To remove:
-`pipx uninstall loom-code`.
-
-## Use it
-
-`loom-code` always operates on the **current working directory**
-— walks up to find `.git` and roots itself there. So:
+## Quickstart
 
 ```bash
 cd ~/your-project
-
-# one-shot — agent does the task, prints a summary, exits
-loom-code "add a retry decorator to the http client"
-
-# interactive REPL — chat, code, approve, repeat
 loom-code
 ```
 
-Works on **existing code** (fix a bug, add a feature, refactor)
-and on **brand-new projects from an empty directory**:
+First run: type `/set_model`, pick a provider with the arrow keys,
+paste your API key once (it's saved for future sessions), pick a
+model. **No paid key?** Pick NVIDIA — free at
+[build.nvidia.com](https://build.nvidia.com).
 
-```bash
-mkdir ~/my-new-app && cd ~/my-new-app
-loom-code "scaffold a FastAPI backend with a /users endpoint and SQLite"
-# or
-loom-code "create a Vite + React + Tailwind app with a login screen"
-# or
-loom-code "create a loomflow Agent that summarises markdown files"
+Then just type what you want:
+
+```
+›  fix the failing test in tests/test_auth.py
+›  add a /users endpoint with pagination
+›  why is startup slow? profile it
 ```
 
-Scaffolding involves a lot of `write` and `bash` calls. The
-approval gate asks once per call by default — pick `a` on the
-first prompt to allow the whole session through. For unattended
-runs on a disposable tree, `loom-code --yes "task"` skips the
-gate entirely.
+One-shot mode (does the task, prints a summary, exits):
 
-The REPL ships with slash commands — type `/` and the menu pops
-with everything available (`/help`, `/plan`, `/cost`, `/good`,
-`/bad`, `/model`, `/clear`, `/compress_token_length`, `/exit`).
+```bash
+loom-code "add a retry decorator to the http client"
+loom-code --yes "scaffold a FastAPI backend"   # skip approval prompts
+```
 
-## Install (for development)
+Works on existing code and empty directories alike — scaffolding new
+projects is a first-class path.
 
-If you want to work *on* loom-code's own source:
+## Models
+
+| model string | provider | env key |
+|---|---|---|
+| `claude-opus-4-8`, `claude-sonnet-4-6`, … | Anthropic | `ANTHROPIC_API_KEY` |
+| `gpt-4.1`, `gpt-4.1-mini`, `o4-mini`, … | OpenAI | `OPENAI_API_KEY` |
+| `nvidia/…` (Nemotron, Llama, DeepSeek) | NVIDIA NIM — **free tier** | `NVIDIA_NIM_API_KEY` |
+| `ollama/llama3`, `ollama/qwen2.5-coder`, … | local [Ollama](https://ollama.com) — free, offline | — |
+| `litellm/<provider>/<model>` | anything LiteLLM routes | provider's own |
+
+Switch anytime with `/model <name>` or the guided `/set_model`.
+Reasoning models support `/effort low|medium|high`.
+
+> Tip: tool-heavy agent work needs a model with solid function
+> calling. On the free NVIDIA tier, `deepseek-v4-pro` and
+> `nemotron-super-49b` hold up well; tiny models fumble tool calls.
+
+## Safety & permissions
+
+The permission layer is the boundary, not the working directory:
+
+- **Reads** anywhere are allowed; **writes outside the project** are
+  only possible for files *you* referenced, and always show a diff
+  prompt — in every mode, even `--yes`.
+- **Approval modes** (`/mode`): `default` asks for writes and shell;
+  `accept-edits` auto-approves in-project edits; `plan` is read-only;
+  `yolo` approves everything except your deny rules.
+- **Rules** live in `.loom/settings.toml` — glob-based
+  `allow` / `ask` / `deny` per tool (e.g. `deny = ["edit(*.env)"]`).
+  Deny always wins, even in yolo.
+- **Sandbox**: `--sandbox` runs bash under OS-level isolation
+  (writes limited to the repo, network off unless
+  `--sandbox-allow-network`).
+- Irreversible commands (`git push --force`, `rm -rf`, …) always
+  get an explicit prompt.
+
+## Commands
+
+Type `/` in the REPL — the menu autocompletes. Highlights:
+
+| | |
+|---|---|
+| `/plan` | show or start the living plan |
+| `/goal <condition>` | work until the condition is met |
+| `/undo` · `/checkpoints` | restore / list auto-checkpoints |
+| `/isolate` · `/review` · `/merge` · `/discard` | worktree-isolated sessions |
+| `/model` · `/set_model` · `/effort` · `/mode` | model + approval setup |
+| `/set_web` | web search (Serper / DuckDuckGo) |
+| `/mcp` | list connected MCP servers |
+| `/cost` · `/compact` · `/export` | session accounting + history |
+| `/resume` | pick up the last session for this project |
+| `/good` · `/bad` | credit / debit the agent's notes |
+
+## Project context
+
+loom-code reads `LOOM.md` / `CLAUDE.md` / `AGENTS.md` /
+`.loom/context.md` at the project root and treats it as binding house
+rules. `/init-loom` creates a starter file.
+
+## Development
 
 ```bash
 git clone https://github.com/Anurich/loomflow-cli
 cd loomflow-cli
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest -q
+pytest -q          # 465 tests
+ruff check .
 ```
 
-## Models
+Architecture in one line: **loom-code is deliberately thin** — if a
+capability belongs in the agent loop, it goes in
+[loomflow](https://github.com/Anurich/LoomFlow), not here. See
+`DESIGN.md` for the boundary.
 
-`--model "<name>"` accepts any string loomflow's resolver routes.
-The common patterns:
+## License
 
-| flag value | provider | env you need |
-|---|---|---|
-| `claude-sonnet-4-6`, `claude-opus-4-7`, ... | Anthropic | `ANTHROPIC_API_KEY` |
-| `gpt-4.1-mini`, `gpt-4.1`, `o4-mini`, ... | OpenAI | `OPENAI_API_KEY` |
-| `ollama/llama3`, `ollama/qwen2.5-coder`, ... | local [Ollama](https://ollama.com) (free, private, offline) | (optional) `OLLAMA_API_BASE` — defaults to `http://localhost:11434` |
-| `litellm/<anything>` | force LiteLLM for any provider (`groq/`, `together_ai/`, `azure/`, `bedrock/`, `vertex_ai/`, ...) | provider's own env |
-
-The default is `gpt-4.1-mini` — override with `--model "<name>"` on
-the CLI, or `/model <name>` inside the REPL. Switching mid-REPL
-starts a fresh conversation (the previous model's history doesn't
-carry over).
-
-Ollama support comes from the `[litellm]` extra on the loomflow
-dependency, which is included by default — no extra install
-needed.
-
-## Project context
-
-loom-code reads a `LOOM.md` / `CLAUDE.md` / `AGENTS.md` /
-`.loom/context.md` file at the project root, if present, and
-treats it as binding house rules.
+MIT — see [LICENSE](LICENSE).
