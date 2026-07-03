@@ -86,12 +86,33 @@ async def _run(
     opinion."""
     stdin = json.dumps(payload).encode("utf-8")
     result: Any = None
+    # Pipe-race errors to swallow: a hook that exits without reading
+    # stdin (``touch marker``, ``true``, …) closes the pipe while
+    # run_process is still writing the payload — the write raises
+    # BrokenResourceError (anyio's wrap of BrokenPipeError /
+    # ConnectionResetError). The hook RAN; only payload delivery
+    # failed, so it degrades to "no opinion". anyio's internal task
+    # group may deliver it bare OR wrapped in an ExceptionGroup —
+    # handle both, and re-raise groups holding anything else.
+    _pipe_errors = (OSError, ValueError, anyio.BrokenResourceError)
     with anyio.move_on_after(spec.timeout):
         try:
             result = await anyio.run_process(
                 spec.command, input=stdin, cwd=str(cwd), check=False
             )
-        except (OSError, ValueError):
+        except _pipe_errors:
+            return HookOutcome()
+        except BaseExceptionGroup as eg:
+            # subgroup() tests GROUP nodes too — exclude them so only
+            # leaf exceptions decide (a group is never itself a pipe
+            # error, and matching it would re-raise everything).
+            real = eg.subgroup(
+                lambda e: not isinstance(
+                    e, (BaseExceptionGroup, *_pipe_errors)
+                )
+            )
+            if real is not None:
+                raise  # a real error is in there — don't mask it
             return HookOutcome()
     if result is None:
         # Timed out (cancelled) or failed to launch.

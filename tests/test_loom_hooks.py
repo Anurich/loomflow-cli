@@ -218,6 +218,22 @@ async def test_repl_hook_only_fires_matching_event(
     assert marker.exists()
 
 
+async def test_hook_ignoring_stdin_never_raises(tmp_path: Path) -> None:
+    """A hook that exits without reading stdin must not blow up the
+    turn (regression: BrokenResourceError escaped _run when the child
+    closed the pipe mid-payload-write — flaky on CI, deterministic
+    with a payload larger than the pipe buffer)."""
+    from loom_code.hooks import _run
+
+    spec = HookSpec(event="UserPromptSubmit", command="true")
+    # >64KB payload guarantees the stdin write outlives the child.
+    outcome = await _run(
+        spec, {"prompt": "x" * 1_000_000}, cwd=tmp_path
+    )
+    # The hook ran and had no opinion — and, critically, didn't raise.
+    assert not outcome.block
+
+
 # ---- trust gate -----------------------------------------------------
 
 
