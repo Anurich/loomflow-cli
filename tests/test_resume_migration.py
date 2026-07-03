@@ -16,7 +16,10 @@ from pathlib import Path
 
 import pytest
 
-from loom_code.repl import _migrate_legacy_per_route_episodes
+from loom_code.repl import (
+    _migrate_legacy_per_route_episodes,
+    _scrub_prose_from_tool_transcripts,
+)
 
 
 def _seed_episode(
@@ -159,3 +162,103 @@ def test_migrate_swallows_db_errors(bad_path: Path) -> None:
     # will refuse to create the file there.
     result = _migrate_legacy_per_route_episodes(bad_path, "x")
     assert result == 0
+
+
+# ---- transcript prose scrub (loomflow < 0.10.30 leak) ----------------
+
+
+def _seed_transcript_row(
+    db_path: Path,
+    *,
+    episode_id: str,
+    sequence: int,
+    message_json: str,
+) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS episode_tool_transcripts (
+                episode_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                message_json TEXT NOT NULL,
+                PRIMARY KEY (episode_id, sequence)
+            )
+        """)
+        cur.execute(
+            "INSERT INTO episode_tool_transcripts VALUES (?, ?, ?)",
+            (episode_id, sequence, message_json),
+        )
+        conn.commit()
+
+
+def _transcript_count(db_path: Path) -> int:
+    with sqlite3.connect(str(db_path)) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM episode_tool_transcripts"
+        ).fetchone()[0]
+
+
+def test_scrub_removes_leaked_prose_keeps_tool_work(
+    tmp_path: Path,
+) -> None:
+    """The loomflow <0.10.30 capture leak: a resumed session's
+    transcript contains a prior turn's assistant answer and the
+    run's own user prompt. The scrub deletes exactly those and
+    keeps legitimate tool work (tool results + assistant messages
+    carrying tool_calls)."""
+    db = tmp_path / "memory.db"
+    _seed_episode(db, session_id="S", input_text="what today")
+    ep_id = "ep-S-what tod"
+    # leaked prose (must go)
+    _seed_transcript_row(
+        db, episode_id=ep_id, sequence=0,
+        message_json='{"role":"assistant","content":"prior answer",'
+        '"tool_calls":[]}',
+    )
+    _seed_transcript_row(
+        db, episode_id=ep_id, sequence=1,
+        message_json='{"role":"user","content":"what today"}',
+    )
+    # legitimate tool work (must stay)
+    _seed_transcript_row(
+        db, episode_id=ep_id, sequence=2,
+        message_json='{"role":"assistant","content":"",'
+        '"tool_calls":[{"id":"t1","tool":"grep","args":{}}]}',
+    )
+    _seed_transcript_row(
+        db, episode_id=ep_id, sequence=3,
+        message_json='{"role":"tool","content":"match",'
+        '"tool_call_id":"t1"}',
+    )
+    assert _scrub_prose_from_tool_transcripts(db, "S") == 2
+    assert _transcript_count(db) == 2
+    # idempotent
+    assert _scrub_prose_from_tool_transcripts(db, "S") == 0
+
+
+def test_scrub_scoped_to_session(tmp_path: Path) -> None:
+    """Rows belonging to OTHER sessions are untouched."""
+    db = tmp_path / "memory.db"
+    _seed_episode(db, session_id="A", input_text="a")
+    _seed_episode(db, session_id="B", input_text="b")
+    _seed_transcript_row(
+        db, episode_id="ep-A-a", sequence=0,
+        message_json='{"role":"user","content":"leak"}',
+    )
+    _seed_transcript_row(
+        db, episode_id="ep-B-b", sequence=0,
+        message_json='{"role":"user","content":"leak"}',
+    )
+    assert _scrub_prose_from_tool_transcripts(db, "A") == 1
+    assert _transcript_count(db) == 1  # B's row survives
+
+
+def test_scrub_swallows_db_errors(tmp_path: Path) -> None:
+    """Missing db / missing table must not block /resume."""
+    assert _scrub_prose_from_tool_transcripts(
+        Path("/dev/null/cant-open"), "x"
+    ) == 0
+    # db exists but has no transcript table at all
+    db = tmp_path / "memory.db"
+    _seed_episode(db, session_id="S", input_text="x")
+    assert _scrub_prose_from_tool_transcripts(db, "S") == 0

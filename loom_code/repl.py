@@ -3676,6 +3676,20 @@ class Repl:
                 "episode(s) into the shared session for "
                 "rehydration[/dim]"
             )
+        # Repair transcripts written by loomflow < 0.10.30, whose
+        # capture window leaked rehydrated prose (a prior answer +
+        # the run's own prompt) into the tool transcript — that
+        # prose gets spliced back by session_messages and shows up
+        # as duplicated/misaligned turns in rehydration AND the
+        # preview below. Idempotent; silent when nothing to fix.
+        scrubbed = _scrub_prose_from_tool_transcripts(
+            self.project.root / LOOM_DIR / "memory.db", prior
+        )
+        if scrubbed:
+            console.print(
+                f"  [dim]scrubbed {scrubbed} leaked prose message(s) "
+                "from stored tool transcripts[/dim]"
+            )
 
         console.print(
             f"  [green]✓[/green] resumed session [cyan]{prior[:8]}…"
@@ -3980,6 +3994,64 @@ def _migrate_legacy_per_route_episodes(
             migrated = cur.rowcount or 0
             conn.commit()
             return int(migrated)
+    except (sqlite3.Error, OSError):
+        return 0
+
+
+def _scrub_prose_from_tool_transcripts(
+    db_path: Path, session_id: str
+) -> int:
+    """Delete NON-tool messages from a session's persisted tool
+    transcripts.
+
+    loomflow < 0.10.30 built the transcript by EXCLUDING {system,
+    first USER, last ASSISTANT-text} and keeping the rest — on a
+    resumed session the "first USER" was a prior turn's rehydrated
+    prompt, so a prior answer + the run's own input leaked into the
+    transcript. ``session_messages`` splices the transcript between
+    input/output, so consumers (rehydration AND the /resume preview)
+    saw duplicated, misaligned turns.
+
+    A transcript row is legitimate iff it is tool work:
+    ``role == "tool"`` or ``role == "assistant"`` with a non-empty
+    ``tool_calls``. Everything else is leaked prose — delete it.
+    Idempotent; returns rows deleted. Same direct-sqlite rationale
+    as :func:`_migrate_legacy_per_route_episodes`, and failure here
+    must NEVER block /resume.
+    """
+    if not db_path.is_file():
+        return 0
+    try:
+        import sqlite3
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.cursor()
+            rows = cur.execute(
+                "SELECT t.episode_id, t.sequence, t.message_json "
+                "FROM episode_tool_transcripts t "
+                "JOIN episodes e ON e.id = t.episode_id "
+                "WHERE e.session_id = ?",
+                (session_id,),
+            ).fetchall()
+            doomed: list[tuple[str, int]] = []
+            for episode_id, sequence, message_json in rows:
+                try:
+                    msg = json.loads(message_json)
+                except (json.JSONDecodeError, ValueError):
+                    continue  # unparseable — leave it alone
+                role = str(msg.get("role", "")).lower()
+                is_tool_work = role == "tool" or (
+                    role == "assistant" and msg.get("tool_calls")
+                )
+                if not is_tool_work:
+                    doomed.append((episode_id, sequence))
+            for episode_id, sequence in doomed:
+                cur.execute(
+                    "DELETE FROM episode_tool_transcripts "
+                    "WHERE episode_id = ? AND sequence = ?",
+                    (episode_id, sequence),
+                )
+            conn.commit()
+            return len(doomed)
     except (sqlite3.Error, OSError):
         return 0
 
