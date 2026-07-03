@@ -155,3 +155,38 @@ def test_no_checkpoints_to_restore(tmp_path: Path) -> None:
     restored, err = cp.restore(root)
     assert restored is None
     assert "no checkpoint" in err.lower()
+
+
+def test_checkpoint_sees_same_second_same_size_edit(
+    tmp_path: Path,
+) -> None:
+    """Regression: the racy-git stat trap. The temp snapshot index was
+    seeded by COPYING the real index — inheriting its stat cache. An
+    edit that keeps the same SIZE and lands in the same mtime SECOND
+    as the last index write (agents write fast; CI is faster) made
+    ``git add`` trust the cached hash and skip the file, so the
+    snapshot captured the OLD content and /undo restored stale data.
+    Forge the collision deterministically with os.utime."""
+    import os
+    import time
+
+    root = tmp_path
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@t.co")
+    _git(root, "config", "user.name", "t")
+    (root / ".loom").mkdir()
+    a = root / "a.py"
+    past = time.time() - 10  # older than the temp index's mtime →
+    a.write_text("v1\n")     # the entry is NOT "racy", so git's
+    os.utime(a, (past, past))  # racy-protection can't save us
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "init")
+    a.write_text("v2\n")  # same 3-byte size as "v1\n"
+    os.utime(a, (past, past))  # identical stat → cache trusted
+
+    snap, err = cp.checkpoint(root, summary="racy edit")
+    assert snap is not None, err
+    in_snapshot = _git(root, "show", f"{snap.sha}:a.py")
+    assert in_snapshot == "v2\n", (
+        f"snapshot captured stale content: {in_snapshot!r}"
+    )

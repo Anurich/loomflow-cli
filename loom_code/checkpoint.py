@@ -134,18 +134,25 @@ def _snapshot_commit(root: Path) -> tuple[str | None, str]:
 
     # Temp index OUTSIDE the worktree so it never appears in the
     # snapshot (an in-tree temp index leaked itself into the tree —
-    # verified). Seed it from the real index so unchanged staged state
-    # is preserved; if there's no index yet, git creates one.
+    # verified).
+    #
+    # Seed it from HEAD's TREE via read-tree — NOT by copying the real
+    # index file. A copied index carries the real index's STAT CACHE,
+    # and a same-size edit whose mtime matches the cached stat makes
+    # ``git add`` trust the cache and skip re-hashing — the snapshot
+    # silently captures the OLD content and /undo restores stale data
+    # (agents write fast; hit for real on CI). read-tree writes
+    # entries with no stat information, so the add below re-stats and
+    # re-hashes every path — the trap can't fire.
     tmp_fd, tmp_index = tempfile.mkstemp(prefix="loom-ckpt-index-")
     os.close(tmp_fd)
     try:
-        real_index = root / ".git" / "index"
-        if real_index.is_file():
-            try:
-                Path(tmp_index).write_bytes(real_index.read_bytes())
-            except OSError:
-                pass  # start from empty temp index
         env = {"GIT_INDEX_FILE": tmp_index}
+        if parent:
+            rc, _o, err = _git(root, ["read-tree", parent], env=env)
+            if rc != 0:
+                return None, f"read-tree failed: {err.strip()}"
+        # No HEAD yet → empty temp index; add stages everything fresh.
         # Stage tracked changes + untracked files. .loom is excluded so
         # the snapshot doesn't churn on our own state files (it's also
         # usually gitignored, but be explicit).
