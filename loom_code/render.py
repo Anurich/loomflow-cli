@@ -108,6 +108,7 @@ class StreamRenderer:
         set_status: Callable[[str], None] | None = None,
         pause_status: Callable[[], None] | None = None,
         sandbox: bool = False,
+        gate_active: Callable[[], bool] | None = None,
     ) -> None:
         """``set_status(label)`` / ``pause_status()`` are optional
         callbacks the REPL wires to a Rich ``console.status``
@@ -121,7 +122,13 @@ class StreamRenderer:
         user can see — per command, not just at launch — that the
         coder's shell is kernel-isolated. Off by default."""
         self._sandbox = sandbox
+        # While this returns True (approval prompt on screen), events
+        # queue in _deferred instead of printing — see handle().
+        self._gate_active = gate_active
+        self._deferred: list[Any] = []
         self._in_text = False
+        # Mid-thinking-burst flag (reasoning chunks stream dim).
+        self._in_thinking = False
         # Whether ANY assistant prose has been shown this run — drives
         # the _on_completed fallback (print result["output"] only if
         # nothing streamed, so we never double-print).
@@ -170,7 +177,24 @@ class StreamRenderer:
 
     def handle(self, event: Any) -> None:
         """Render a single ``Event``. ``kind`` is a string enum;
-        compare against the lowercase values loomflow uses."""
+        compare against the lowercase values loomflow uses.
+
+        While the approval gate is prompting (``gate_active``), events
+        are DEFERRED instead of rendered: the selector redraws itself
+        in place with cursor-up escapes, so any concurrent print
+        displaces its geometry and the menu visibly duplicates
+        (observed live). Deferred events flush in order the moment the
+        gate closes."""
+        if self._gate_active is not None and self._gate_active():
+            self._deferred.append(event)
+            return
+        if self._deferred:
+            pending, self._deferred = self._deferred, []
+            for ev in pending:
+                self._dispatch(ev)
+        self._dispatch(event)
+
+    def _dispatch(self, event: Any) -> None:
         kind = str(event.kind)
         payload = event.payload or {}
         method = getattr(self, f"_on_{kind}", None)
@@ -178,6 +202,13 @@ class StreamRenderer:
             method(payload)
         # Unknown event kinds are silently ignored — forward-compat
         # with new loomflow event types.
+
+    def flush_deferred(self) -> None:
+        """Render anything still queued from a gate window — called by
+        the REPL after the stream ends so no event is ever lost."""
+        pending, self._deferred = self._deferred, []
+        for ev in pending:
+            self._dispatch(ev)
 
     # ---- text streaming -------------------------------------------------
 
@@ -203,67 +234,172 @@ class StreamRenderer:
         # that blocks the agent mid-write is infinitely worse than
         # un-prettified streaming.
         chunk = payload.get("chunk") or {}
-        if chunk.get("kind") != "text":
+        kind = chunk.get("kind")
+        if kind == "thinking":
+            # Reasoning stream (Claude extended thinking / o-series
+            # summaries when /effort is set). Shown dim so the user
+            # sees the model IS working — previously these chunks
+            # were silently dropped and high-effort turns looked
+            # stalled. Not buffered: thinking is not the answer.
+            text = chunk.get("text") or ""
+            if not text:
+                return
+            if not self._in_thinking:
+                self._pause_status()
+                console.print()
+                console.print(
+                    "  ✻ thinking… ", end="", style="dim italic"
+                )
+                self._in_thinking = True
+            console.print(
+                text,
+                end="",
+                markup=False,
+                highlight=False,
+                style="dim",
+            )
+            return
+        if kind != "text":
             return
         text = chunk.get("text") or ""
         if not text:
             return
+        self._end_thinking()
         if not self._in_text:
-            # First chunk of a prose burst — pause the spinner (it
-            # owns the cursor line) + drop a blank line so the
-            # streamed text starts clean.
-            self._pause_status()
-            console.print()
+            # First chunk of the message — keep the spinner up
+            # ("responding…") and BUFFER instead of printing raw. We
+            # render the whole thing as clean Markdown on completion
+            # (Claude-Code style), which is why we don't stream the raw
+            # tokens: showing raw ``###``/``**`` then replacing them
+            # would need fragile cursor-erase math. The spinner gives
+            # the "working" feedback in the meantime.
+            self._set_status("responding…")
             self._in_text = True
         self._any_text = True
         self._text_buffer.append(text)
-        # Stream the raw chunk inline. ``markup=False`` /
-        # ``highlight=False`` so a stray ``[`` in the model's text
-        # isn't parsed as a Rich style tag mid-stream.
-        console.print(text, end="", markup=False, highlight=False)
+
+    def _end_thinking(self) -> None:
+        """Close an open thinking burst (newline + spinner back)."""
+        if not self._in_thinking:
+            return
+        self._in_thinking = False
+        console.print()
+        self._set_status("thinking...")
 
     def _end_text(self) -> None:
+        self._end_thinking()
         if not self._in_text:
             return
-        # Close the streamed line. The streamed plain text IS the
-        # final output — no re-render (re-rendering as Markdown
-        # would print the whole response a SECOND time).
+        # Message complete. It was BUFFERED (not streamed raw), so now
+        # print it ONCE — as rendered Markdown when it looks markdown-y
+        # (headings, bold, code fences → Claude-Code look), else as
+        # plain text. The spinner was paused by the caller/_end path.
+        full = "".join(self._text_buffer)
         self._text_buffer.clear()
         self._in_text = False
-        console.print()  # newline to end the inline stream
-        # Prose burst over — bring the spinner back; the next
-        # tool_call will overwrite this label with something
-        # more specific.
-        self._set_status("thinking...")
+        self._pause_status()
+        console.print()  # blank line before the answer
+        if full.strip():
+            # A labelled marker before the response, so the model's
+            # output is visually attributed + separated from the tool
+            # activity above it (Claude-Code ``● Assistant`` style).
+            console.print(Text("● loom", style="bold cyan"))
+        rendered = self._render_markdown(full)
+        if rendered is not None:
+            console.print(rendered)
+        elif full.strip():
+            # Plain text (no markdown to gain) — markup/highlight OFF so
+            # a stray ``[`` in the model's text isn't parsed as a tag.
+            console.print(full, markup=False, highlight=False)
+        # Deliberately DON'T restart the spinner here. A real next event
+        # (tool_call / architecture line) sets its own status; the turn
+        # end pauses it. Restarting to "thinking..." on every prose
+        # burst rendered a spinner line that Rich then cleared, leaving
+        # the dead gap between the answer and the turn-summary rule.
+
+    @staticmethod
+    def _render_markdown(text: str) -> Any:
+        """Render ``text`` as Rich Markdown, or None to print it plain.
+        Skips empty output and text with no markdown to gain, and never
+        raises — a parse failure falls back to the plain print."""
+        if not text.strip():
+            return None
+        if not any(
+            m in text for m in ("#", "```", "**", "- ", "* ", "|", "`")
+        ):
+            return None
+        try:
+            from rich.markdown import Markdown
+
+            return Markdown(text, code_theme="ansi_dark")
+        except Exception:  # noqa: BLE001 — render must never crash
+            return None
 
     # ---- architecture events --------------------------------------------
 
     def _on_architecture_event(self, payload: dict[str, Any]) -> None:
         """Surface the bits the user actually cares about. Most
         architecture events are framework-internal progress signals
-        the renderer correctly hides — but ``router.dispatched``
-        tells the user WHICH route the classifier picked
-        ('simple' vs 'complex' for loom-code), which fixes the
-        observability asymmetry where COMPLEX turns showed
-        delegate+worker activity but SIMPLE turns showed nothing
-        but a spinner. Unrelated event names are ignored."""
-        name = payload.get("name")
-        if name != "router.dispatched":
-            return
-        route = payload.get("route")
-        if not route:
-            return
-        # End any in-flight prose burst first so the route line
-        # doesn't land mid-Live-render. Then print a single line.
-        self._end_text()
-        self._pause_status()
-        console.print(
-            f"  [dim]→ routed to[/dim] [cyan]{route}[/cyan]"
-        )
-        # Re-set the status spinner so the user has feedback while
-        # the specialist starts up. Specific tool labels will
-        # overwrite it as the route's agent does its work.
-        self._set_status(f"{route} working...")
+        the renderer correctly hides — the exceptions:
+
+        * ``router.dispatched`` — WHICH route the classifier picked
+          ('simple' vs 'complex'), fixing the observability asymmetry
+          where COMPLEX turns showed delegate+worker activity but
+          SIMPLE turns showed nothing but a spinner.
+        * ``auto_compacted`` — the conversation was just compacted;
+          the user should know why the model "forgot" verbatim detail.
+        * ``stop_hook.fired`` — an auto-continue iteration started
+          (the plan still has open steps), so a long turn visibly
+          progresses instead of looking stuck.
+
+        NOTE: keep this the ONLY definition of this method — a
+        previous refactor left two copies and the second silently
+        shadowed the first, hiding every one of these lines.
+        """
+        name = payload.get("name") or ""
+        if name == "router.dispatched":
+            route = payload.get("route")
+            if not route:
+                return
+            # End any in-flight prose burst first so the route line
+            # doesn't land mid-Live-render. Then print a single line.
+            self._end_text()
+            self._pause_status()
+            console.print(
+                f"  [dim]→ routed to[/dim] [cyan]{route}[/cyan]"
+            )
+            # Re-set the status spinner so the user has feedback while
+            # the specialist starts up. Specific tool labels will
+            # overwrite it as the route's agent does its work.
+            self._set_status(f"{route} working...")
+        elif name == "auto_compacted":
+            self._end_text()
+            dropped = payload.get("messages_dropped")
+            extra = f" ({dropped} messages summarised)" if dropped else ""
+            console.print(
+                Text(f"  ✦ context compacted{extra}", style="dim magenta")
+            )
+        elif name == "stop_hook.fired":
+            self._end_text()
+            iteration = payload.get("iteration")
+            tag = f" ({iteration})" if iteration else ""
+            console.print(
+                Text(
+                    f"  ▸ auto-continue{tag} — plan has open steps",
+                    style="dim",
+                )
+            )
+        else:
+            # Generic living-plan / architecture progress
+            # (``plan.updated``, ``self_refine.critique``, …). The
+            # previous handler surfaced any 'plan'-ish event as a dim
+            # ▸ line; keep that so a long multi-step turn shows
+            # movement instead of a silent spinner. Some architectures
+            # key the label under ``event`` rather than ``name``.
+            label = str(name or payload.get("event") or "")
+            if "plan" in label.lower():
+                self._end_text()
+                console.print(Text(f"  ▸ {label}", style="dim magenta"))
 
     # ---- tools ----------------------------------------------------------
 
@@ -384,18 +520,6 @@ class StreamRenderer:
         )
         console.print(Text(indented, style="dim"))
 
-    # ---- plan -----------------------------------------------------------
-
-    def _on_architecture_event(self, payload: dict[str, Any]) -> None:
-        # ReAct / living-plan emit free-form architecture events.
-        # Surface only the ones worth seeing.
-        name = payload.get("event") or payload.get("name") or ""
-        if "plan" in str(name).lower():
-            self._end_text()
-            console.print(
-                Text(f"  ▸ {name}", style="dim magenta")
-            )
-
     # ---- permission gate ------------------------------------------------
 
     def _on_permission_ask(self, payload: dict[str, Any]) -> None:
@@ -419,11 +543,39 @@ class StreamRenderer:
 
     def _on_error(self, payload: dict[str, Any]) -> None:
         self._end_text()
-        msg = payload.get("error") or payload.get("message") or "?"
+        msg = str(payload.get("error") or payload.get("message") or "?")
+        # loomflow BOTH emits the error event AND re-raises the same
+        # exception, so when it re-raises the consumer (repl/cli)
+        # prints the flattened, classified form right after this
+        # handler — printing the opaque anyio wrapper here too would be
+        # a duplicate. Suppress ONLY the BARE wrapper ("unhandled
+        # errors in a TaskGroup (N sub-exception)") with nothing else
+        # of substance: if the message ALSO carries a real cause (a
+        # worker error the run RECOVERS from and does not re-raise —
+        # the consumer never sees it), we must still show it, or the
+        # user gets a silently degraded answer.
+        low = msg.lower()
+        # The bare wrapper is exactly "unhandled errors in a TaskGroup
+        # (N sub-exception[s])" — it ends at the paren note with no
+        # real cause appended. A message that carries a cause has more
+        # after the "sub-exception)" — keep those.
+        tail = low.split("sub-exception", 1)[-1]
+        bare_wrapper = (
+            "unhandled errors in a taskgroup" in low
+            and tail.strip(" s)") == ""
+        )
+        if bare_wrapper:
+            return
         console.print(Text(f"\n✗ error: {msg}", style="bold red"))
 
     def _on_completed(self, payload: dict[str, Any]) -> None:
         self._end_text()
+        # _end_text restarts the spinner ("thinking...") to bridge to
+        # the NEXT event — but this is the LAST event, so kill it now.
+        # Left running, it renders a dangling spinner line that Rich
+        # then clears, leaving the dead gap between the answer and the
+        # turn-summary rule the user saw.
+        self._pause_status()
         result = payload.get("result") or payload
         self.last_result = result
         # Fallback: if the run produced a final answer but nothing
@@ -435,13 +587,15 @@ class StreamRenderer:
         output = str(result.get("output") or "").strip()
         if output and not self._any_text:
             console.print()
-            console.print(output, markup=False, highlight=False)
-        # Visual separator between turns. The cost / token numbers
-        # used to print here too — they're now owned by the REPL's
-        # pre-prompt status line (cumulative) and the CLI's one-
-        # shot run summary, so we don't duplicate them here.
-        console.print()
-        console.rule(style="dim")
+            console.print(Text("● loom", style="bold cyan"))
+            rendered = self._render_markdown(output)
+            if rendered is not None:
+                console.print(rendered)
+            else:
+                console.print(output, markup=False, highlight=False)
+        # No trailing blank here — the REPL's end-of-turn summary rule
+        # (_print_turn_summary) closes the turn. A blank here just added
+        # dead space between the answer and that rule.
 
 
 # Status → (glyph, Rich style) for the compact plan view. ■ done /

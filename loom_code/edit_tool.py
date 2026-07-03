@@ -34,6 +34,7 @@ from loomflow.tools import edit_tool as _loomflow_edit_tool
 from loomflow.tools.registry import Tool
 
 from .grep_tool import _as_bool
+from .paths import is_within, resolve_path
 
 # How many lines of context to show around the edited region in
 # the EDIT PREVIEW. Chosen so the model can usually see the whole
@@ -140,7 +141,26 @@ def verifying_edit_tool(workdir: Path | str) -> Tool:
           underlying error verbatim. No preview, no extra noise.
     """
     root = Path(workdir).resolve()
+    anchor = root.anchor or "/"
+    # Two delegates: the project-rooted one keeps in-project results
+    # clean (``edited sample.py``, not the absolute path); the
+    # anchor-rooted one handles genuinely-outside files the user
+    # referenced (an absolute path never escapes the "/" root, so its
+    # own workdir check passes — the outside decision is made HERE via
+    # consent). Which one + which path to pass is chosen per call.
     inner = _loomflow_edit_tool(workdir=root)
+    inner_fs = _loomflow_edit_tool(workdir=Path(anchor))
+
+    def _delegate_for(target: Path) -> tuple[Any, str]:
+        """Pick (inner_tool, path_to_pass) for a resolved target: the
+        short project-relative form when inside, else the anchor-
+        stripped absolute form via the "/"-rooted delegate."""
+        if is_within(target, root):
+            return inner, str(target.relative_to(root))
+        rel = str(target)
+        return inner_fs, (
+            rel[len(anchor):] if rel.startswith(anchor) else rel
+        )
 
     async def edit(
         path: str,
@@ -157,18 +177,27 @@ def verifying_edit_tool(workdir: Path | str) -> Tool:
         # "false" string is truthy, which would silently replace
         # ALL occurrences when the model meant just one.
         replace_all = _as_bool(replace_all, default=False)
-        # Snapshot the file's pre-edit content for the diff bounds.
-        target = (root / path).resolve()
-        try:
-            target.relative_to(root)
-        except ValueError:
-            return (
-                f"edit: refusing to edit outside workdir: {target}"
-            )
+        # Resolve ~ / relative / absolute the same way read does.
+        target = resolve_path(path, root)
+        if not is_within(target, root):
+            # Outside the project — allowed ONLY when the user
+            # explicitly referenced this file in the session ("the
+            # user naming a path IS the permission"); the approval
+            # gate still previews the diff either way.
+            from .consent import is_granted
+
+            if not is_granted(target):
+                return (
+                    f"edit: refusing to edit {path} — it is outside "
+                    "the project and the user has not referenced it. "
+                    "Only files the user pasted or @-mentioned may be "
+                    "edited outside the project."
+                )
+        delegate, inner_path = _delegate_for(target)
         if not target.is_file():
             # Defer to loomflow's error message for consistency.
-            return await inner.fn(
-                path=path,
+            return await delegate.fn(
+                path=inner_path,
                 old_string=old_string,
                 new_string=new_string,
                 replace_all=replace_all,
@@ -178,8 +207,8 @@ def verifying_edit_tool(workdir: Path | str) -> Tool:
         )
 
         # Delegate the actual replace + write.
-        result = await inner.fn(
-            path=path,
+        result = await delegate.fn(
+            path=inner_path,
             old_string=old_string,
             new_string=new_string,
             replace_all=replace_all,
@@ -499,14 +528,18 @@ def multi_edit_tool(workdir: Path | str) -> Tool:
         if isinstance(coerced, str):
             return coerced  # error message, verbatim
 
-        target = (root / path).resolve()
-        try:
-            target.relative_to(root)
-        except ValueError:
-            return (
-                f"multi_edit: refusing to edit outside workdir: "
-                f"{target}"
-            )
+        target = resolve_path(path, root)
+        if not is_within(target, root):
+            # Same consent rule as ``edit`` — user-named files only.
+            from .consent import is_granted
+
+            if not is_granted(target):
+                return (
+                    f"multi_edit: refusing to edit {path} — it is "
+                    "outside the project and the user has not "
+                    "referenced it. Only files the user pasted or "
+                    "@-mentioned may be edited outside the project."
+                )
         if not target.is_file():
             return f"multi_edit: file not found: {path}"
 

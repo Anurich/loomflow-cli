@@ -41,12 +41,15 @@ there rather than duplicating the catalogue in this docstring.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+import anyio
 from loomflow import new_id
 from prompt_toolkit import HTML, PromptSession
 from prompt_toolkit.completion import (
@@ -99,6 +102,43 @@ _USER_ID = "loom-code"
 # ``/set_continue_cap N`` for power users who want more or less.
 _AUTO_CONTINUE_LIMIT_DEFAULT = 15
 
+# Consecutive IDENTICAL tool calls (same tool, same args) before the
+# stall detector aborts the turn. loomflow's own no-progress hook only
+# arms under /goal; this guards the everyday interactive path. 4 is
+# high enough that legitimate retry-once patterns never trip it.
+_STALL_REPEATS = 4
+
+# @-completion caches the project file list this long (seconds) and
+# filters it in-memory per keystroke, instead of re-walking the tree
+# on every character — a cold walk per keypress froze the prompt on a
+# large repo. Bounded so a huge monorepo can't build an enormous list.
+_FILE_CACHE_TTL = 4.0
+_FILE_CACHE_MAX = 20_000
+
+# Pure greetings answered locally, zero tokens. Short prompts route to
+# the heavy TEAM path (the anaphora rule), so before this a bare "hi"
+# cost the full coordinator context (~6.6k tokens, observed live) and
+# sometimes a hallucinated delegation on weak models. EXACT matches
+# only — "ok"/"thanks" are moved-on feedback signals, and anything
+# with more content deserves the model.
+_GREETINGS = frozenset({
+    "hi", "hello", "hey", "yo", "hiya", "hola", "sup",
+    "good morning", "good afternoon", "good evening",
+    "hi there", "hello there", "hey there",
+})
+
+
+def _greeting_reply(prompt: str) -> str | None:
+    """A canned local reply when ``prompt`` is a bare greeting, else
+    None (run the model normally)."""
+    p = re.sub(r"[!.,\s]+$", "", prompt.strip().lower())
+    if p in _GREETINGS:
+        return (
+            "hi! give me a coding task — or [cyan]/help[/cyan] "
+            "for the command list."
+        )
+    return None
+
 
 def _context_high_water(
     prev: int, *, tokens_in: int, cached_in: int
@@ -121,6 +161,116 @@ def _context_high_water(
     resume), where occupancy genuinely starts over.
     """
     return max(prev, tokens_in + cached_in)
+
+
+# Tool names the agents actually expose — used to recognise a tool
+# call that a weak model emitted as PLAIN TEXT instead of through the
+# structured tool-calling interface. (Observed live with
+# phi-4-mini: final answer was literally
+# ``{ "name": "read", "parameters": {"path": "FileA.py"} }``.)
+_KNOWN_TOOL_NAMES = frozenset({
+    "read", "write", "edit", "multi_edit", "grep", "find", "ls",
+    "bash", "web_fetch", "web_search", "delegate", "codebase_search",
+    "plan_write", "plan_read", "note", "search_notes", "read_note",
+    "list_notes", "remember_rule", "go_to_definition",
+    "find_references", "hover",
+})
+
+
+def _looks_like_leaked_tool_call(text: str) -> bool:
+    """True when a final answer is clearly a tool CALL written as
+    prose — a bare JSON object naming a known tool with an args-like
+    key. The ReAct loop treats "no structured tool calls" as "model
+    is done", so without this guard the user sees raw JSON as the
+    answer and the tool never runs."""
+    t = text.strip()
+    # Unwrap a single fenced code block (```json ... ```).
+    if t.startswith("```") and t.endswith("```"):
+        t = t.strip("`").strip()
+        first, _, rest = t.partition("\n")
+        if rest and len(first) <= 10:  # language tag line
+            t = rest.strip()
+    if not (t.startswith("{") and t.endswith("}")):
+        return False
+    import json
+
+    try:
+        obj = json.loads(t)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+    name = obj.get("name") or obj.get("tool") or obj.get("function")
+    if isinstance(name, dict):  # OpenAI shape: {"function": {"name": ..}}
+        name = name.get("name")
+    if not isinstance(name, str):
+        return False
+    has_args = any(
+        k in obj
+        for k in ("parameters", "arguments", "args", "input")
+    )
+    return has_args and name.rsplit(".", 1)[-1] in _KNOWN_TOOL_NAMES
+
+
+# The bounded corrective prompt sent when a leaked tool call is
+# detected. One nudge per turn — if the model leaks again, we show
+# the raw output rather than loop.
+_TOOL_LEAK_NUDGE = (
+    "Your previous reply was a tool invocation written as plain "
+    "text, which cannot be executed. Either call the tool through "
+    "the proper tool-calling interface, or answer the user's "
+    "request directly in prose. Do not print JSON."
+)
+
+
+def friendly_error_hint(exc: BaseException) -> str | None:
+    """An actionable one-liner for a model/provider error, or None
+    when we have nothing better than the raw message.
+
+    The classified exception (loomflow's PermanentModelError /
+    RateLimitError / etc., or the provider SDK error inside it) is
+    matched on type name + message text rather than imported types —
+    keeps this working across loomflow versions and provider SDKs
+    without hard dependencies. Checked most-specific first.
+    """
+    blob = f"{type(exc).__name__}: {exc}".lower()
+    if "notfounderror" in blob or "404" in blob or "not found" in blob:
+        return (
+            "the model id wasn't found at the provider — check the "
+            "spelling, or /set_model to pick another"
+        )
+    if (
+        "authentication" in blob
+        or "401" in blob
+        or "invalid api key" in blob
+        or "unauthorized" in blob
+    ):
+        return (
+            "the API key was rejected — /set_model to re-enter it "
+            "(or fix the env var / ~/.loom-code/credentials)"
+        )
+    if "ratelimit" in blob or "429" in blob or "rate limit" in blob:
+        return (
+            "the provider rate-limited us and retries ran out — "
+            "wait a moment and try again, or /model to switch"
+        )
+    if "timeout" in blob or "timed out" in blob:
+        return (
+            "the turn timed out — try again, or narrow the ask; "
+            "/undo restores the tree if it half-finished"
+        )
+    if "connection" in blob or "connect" in blob or "network" in blob:
+        return (
+            "couldn't reach the provider — check your network / "
+            "VPN, then try again"
+        )
+    if "context" in blob and ("length" in blob or "window" in blob):
+        return (
+            "the conversation outgrew the model's context window — "
+            "/compress_token_length to lower the auto-compact "
+            "threshold, or /clear for a fresh session"
+        )
+    return None
 
 
 def _flatten_exception_group(
@@ -246,15 +396,30 @@ _COMMAND_DEFS: list[tuple[str, str, str]] = [
     # Model & tools — how the agent thinks and what it can reach.
     ("/model", "switch to a specific model by name", "Model"),
     ("/effort", "reasoning effort: low | medium | high | off", "Model"),
+    (
+        "/mode",
+        "approval mode: default | accept-edits | plan | yolo",
+        "Model",
+    ),
     ("/set_model", "pick OpenAI or Anthropic + save API key", "Model"),
     ("/set_web", "enable web search (Serper / DuckDuckGo / off)", "Model"),
     ("/mcp", "list connected MCP servers + their tools", "Model"),
     # Session — state, cost, and history for the whole run.
     ("/cost", "session cost + token totals", "Session"),
-    ("/resume", "resume the last session (rehydrate prior turns)", "Session"),
+    (
+        "/resume",
+        "resume the last session — or `/resume pick` to choose one",
+        "Session",
+    ),
+    ("/export", "save this conversation to a markdown file", "Session"),
     (
         "/set_continue_cap",
         "set auto-continue cap (current=default 15)",
+        "Session",
+    ),
+    (
+        "/compact",
+        "compact the conversation NOW (fold history into a summary)",
         "Session",
     ),
     (
@@ -307,27 +472,98 @@ def _render_help() -> str:
 
 
 class _SlashCompleter(Completer):
-    """Pop the slash-command menu the moment the user types '/'.
+    """Two completions in one:
 
-    Only fires when the line starts with '/' — typing a normal
-    task message stays clean, no popup. Filters as the user types
-    more characters, so '/co' narrows to /cost +
-    /compress_token_length.
+    * ``/`` at line start → the slash-command menu (filters as you
+      type, so ``/co`` narrows to /cost + /compress_token_length).
+    * ``@`` anywhere → a fuzzy file-path menu rooted at the project,
+      so ``@src/ma`` completes to ``@src/main.py`` — the agent then
+      reads the referenced file (see ``_expand_at_mentions``).
+
+    A normal task message with neither trigger stays clean, no popup.
     """
+
+    def __init__(self, root: Path | None = None) -> None:
+        self._root = root
+        # Cached (rel-path list, monotonic timestamp). complete_while_
+        # typing fires this on EVERY keystroke, so we walk the tree at
+        # most once per _FILE_CACHE_TTL and filter the cached list per
+        # keystroke instead of re-walking (a re-walk per char froze the
+        # prompt on a large repo).
+        self._file_cache: list[str] | None = None
+        self._file_cache_at = 0.0
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
     ):
         text = document.text_before_cursor
-        if not text.startswith("/"):
+        if text.startswith("/"):
+            for cmd, desc, _group in _COMMAND_DEFS:
+                if cmd.startswith(text):
+                    yield Completion(
+                        cmd,
+                        start_position=-len(text),
+                        display_meta=desc,
+                    )
             return
-        for cmd, desc, _group in _COMMAND_DEFS:
-            if cmd.startswith(text):
-                yield Completion(
-                    cmd,
-                    start_position=-len(text),
-                    display_meta=desc,
+        # @-file mention: complete the token after the last '@'.
+        at = text.rfind("@")
+        if at != -1 and self._root is not None:
+            frag = text[at + 1:]
+            if " " not in frag:  # still typing one path token
+                yield from self._file_completions(frag)
+
+    def _all_files(self) -> list[str]:
+        """Project file list (rel paths), walked at most once per TTL
+        and cached — the completer filters this in memory per keystroke
+        rather than re-walking the tree each time."""
+        now = time.monotonic()
+        if (
+            self._file_cache is not None
+            and now - self._file_cache_at < _FILE_CACHE_TTL
+        ):
+            return self._file_cache
+        import os
+
+        from .loominit.repomap import _SKIP_DIRS
+
+        root = self._root
+        assert root is not None
+        out: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _SKIP_DIRS and not d.endswith(".egg-info")
+            ]
+            for fn in filenames:
+                out.append(
+                    os.path.relpath(os.path.join(dirpath, fn), root)
                 )
+                if len(out) >= _FILE_CACHE_MAX:
+                    break
+            if len(out) >= _FILE_CACHE_MAX:
+                break
+        self._file_cache = out
+        self._file_cache_at = now
+        return out
+
+    def _file_completions(self, frag: str):
+        """Up to 20 project files matching ``frag`` (prefix on the
+        path, or substring on the basename), filtered from the cached
+        file list."""
+        frag_l = frag.lower()
+        count = 0
+        for rel in self._all_files():
+            base = rel.rsplit("/", 1)[-1].lower()
+            if rel.lower().startswith(frag_l) or frag_l in base:
+                yield Completion(
+                    rel,
+                    start_position=-len(frag),
+                    display_meta="file",
+                )
+                count += 1
+                if count >= 20:
+                    return
 
 
 class Repl:
@@ -340,9 +576,13 @@ class Repl:
         *,
         sandbox: bool = False,
         sandbox_allow_network: bool = False,
+        startup_resume: str | None = None,
     ) -> None:
         self.project = project
         self.model = model
+        # "last" / "pick" / None — consumed once at the top of the
+        # loop (the --continue / --resume CLI flags).
+        self._startup_resume = startup_resume
         # Kernel-sandbox the coder's bash (Claude-Code-style). Stored so
         # every (re)build of the agent — initial + /model switch + worktree
         # isolate — passes them through ``_rebuild_agent``.
@@ -354,11 +594,54 @@ class Repl:
         # the gate calls them through the stable wrapper methods.
         self._active_pause_spinner: Any = None
         self._active_resume_spinner: Any = None
+        # True while the ApprovalGate is waiting on the user — the
+        # idle-watchdog must not count that as a hung stream.
+        self._gate_active = False
+        # Monotonic time of the last Ctrl-C at the idle prompt — a
+        # second press within the window exits (see _run_inner).
+        self._last_ctrl_c = 0.0
+        # Output of the most recent ``!cmd`` inline shell run, folded
+        # into the NEXT task turn's prompt then cleared (see _run_inner).
+        self._last_bash_output: str | None = None
+        # Which session_id already has a sessions.jsonl record — one
+        # line per session, written on its first pointer save.
+        self._recorded_session_id: str | None = None
+        # content-hash per working block — skip the sqlite write when a
+        # block's content hasn't changed. loomflow's update_block is an
+        # UPSERT that bumps ``updated_at`` on every call and its block
+        # ``format()`` has no timestamp, so an identical rewrite doesn't
+        # itself bust the provider prompt-cache; the win here is
+        # avoiding a redundant DB write (and the churn of re-reading
+        # AGENTS.md from disk) every turn. Reset on agent rebuild.
+        self._block_hashes: dict[str, str] = {}
+        # Idle watchdog: abort a turn when the agent stream produces
+        # NO events for this many seconds (a hung provider/model would
+        # otherwise burn until max_turns). 0 disables. Generous default
+        # — a slow non-streaming completion can legitimately be quiet
+        # for a couple of minutes.
+        try:
+            self._idle_timeout = float(
+                os.environ.get("LOOM_IDLE_TIMEOUT", "300")
+            )
+        except ValueError:
+            self._idle_timeout = 300.0
+        # Permission rules from settings.toml (user + project) + the
+        # session mode. Rules load once; /mode swaps the mode live.
+        from .permissions import Mode, load_rules
+
+        rule_dirs = [
+            Path.home() / ".loom-code",
+            project.root / ".loom",
+        ]
+        perm_rules = load_rules(rule_dirs)
         # ApprovalGate persists across turns so 'allow all' sticks
         # for the whole session.
         self._gate = ApprovalGate(
             pause_spinner=self._pause_active_spinner,
             resume_spinner=self._resume_active_spinner,
+            rules=perm_rules,
+            mode=Mode.DEFAULT,
+            project_root=project.root,
         )
         self._auto_continue_limit = _AUTO_CONTINUE_LIMIT_DEFAULT
         # Reasoning effort (None | "low" | "medium" | "high"). None =
@@ -434,6 +717,12 @@ class Repl:
         # cache writes).
         self.total_cache_write = 0
         self.total_out = 0
+        # Per-turn deltas (reset each turn in _account_result) — drive
+        # the end-of-turn summary line so each response is separated by
+        # a rule showing THAT turn's tokens + cost.
+        self._turn_in = 0
+        self._turn_out = 0
+        self._turn_cost = 0.0
         # Framework-event counters (loomflow 0.10.13+):
         # ``total_summaries`` ticks each time
         # ``tool_result_summarized`` fires (per-tool-result LLM
@@ -496,7 +785,7 @@ class Repl:
         # the visible prompt stays readable; expand_pastes() restores
         # the full content before the line goes to the agent.
         self._prompt_session: PromptSession[str] = PromptSession(
-            completer=_SlashCompleter(),
+            completer=_SlashCompleter(root=project.root),
             complete_while_typing=True,
             key_bindings=build_paste_keybindings(),
         )
@@ -561,20 +850,23 @@ class Repl:
         # provider/web setup AND the bare /model command so users who
         # already have an API key but want a different model name
         # don't go hunting through /help. Ordering: most-common first.
+        # ``•`` bullets, NOT ``▸``/``›`` — the input prompt uses a
+        # ``›`` glyph, and arrow-ish banner bullets read as prompts at
+        # a glance in most terminal fonts.
         console.print(
-            "  [dim]▸ type a task, or [cyan]/help[/cyan] "
+            "  [dim]• type a task, or [cyan]/help[/cyan] "
             "for the command menu[/dim]"
         )
         console.print(
-            "  [dim]▸ [cyan]/model <name>[/cyan]  switch to a "
-            "specific model by name (e.g. gpt-4.1, claude-opus-4-7)[/dim]"
+            "  [dim]• [cyan]/model <name>[/cyan]  switch to a "
+            "specific model by name (e.g. gpt-4.1, claude-opus-4-8)[/dim]"
         )
         console.print(
-            "  [dim]▸ [cyan]/set_model[/cyan]     pick "
-            "OpenAI or Anthropic and save your API key[/dim]"
+            "  [dim]• [cyan]/set_model[/cyan]     pick a provider + "
+            "model (saves your API key)[/dim]"
         )
         console.print(
-            "  [dim]▸ [cyan]/set_web[/cyan]       enable web "
+            "  [dim]• [cyan]/set_web[/cyan]       enable web "
             "search (Serper / DuckDuckGo)[/dim]"
         )
         # Show the resume hint ONLY when a prior session pointer
@@ -582,7 +874,7 @@ class Repl:
         # feature they can't use yet.
         if self._load_session_pointer() is not None:
             console.print(
-                "  [dim]▸ [cyan]/resume[/cyan]        pick up "
+                "  [dim]• [cyan]/resume[/cyan]        pick up "
                 "the last session for this project (rehydrates "
                 "prior turns)[/dim]"
             )
@@ -599,20 +891,46 @@ class Repl:
                 f"  [dim]{start_result.added_context}[/dim]"
             )
 
+        # --continue / --resume: rejoin a prior session before the
+        # first prompt, via the same machinery as /resume.
+        if self._startup_resume == "last":
+            await self._handle_resume("")
+        elif self._startup_resume == "pick":
+            await self._handle_resume("pick")
+
         while True:
-            # Persistent session status — printed before every prompt
-            # so the user always sees where they stand on cost/tokens,
-            # not just when they ask via /cost. Same split format as
-            # the end-of-turn summary for visual consistency.
-            self._print_status_line()
+            # _read_line opens each turn with a full-width rule + a dim
+            # cost line, so the cost/token status is attached to the
+            # prompt (no separate status print above it) and the rule
+            # separates this turn from the previous output.
             try:
                 line = await self._read_line()
-            except (EOFError, KeyboardInterrupt):
-                # Leaving satisfied — credit any pending turn.
+            except EOFError:
+                # Ctrl-D: leaving satisfied — credit any pending turn.
                 await self._attribute_pending(success=True, quiet=True)
                 await self._fire_repl_hooks("SessionEnd")
                 console.print("\n[dim]bye[/dim]")
                 return 0
+            except KeyboardInterrupt:
+                # Ctrl-C at the idle prompt: the reflex from every
+                # other REPL is "clear the line", not "quit" — a
+                # single press exiting the whole session was a sharp
+                # edge. First press warns; a second within the window
+                # exits (same cleanup as Ctrl-D).
+                now = time.monotonic()
+                if now - self._last_ctrl_c < 2.0:
+                    await self._attribute_pending(
+                        success=True, quiet=True
+                    )
+                    await self._fire_repl_hooks("SessionEnd")
+                    console.print("\n[dim]bye[/dim]")
+                    return 0
+                self._last_ctrl_c = now
+                console.print(
+                    "  [dim]press Ctrl-C again to exit "
+                    "(or /exit)[/dim]"
+                )
+                continue
 
             line = line.strip()
             if not line:
@@ -626,14 +944,67 @@ class Repl:
             line = expand_pastes(line)
 
             if line.startswith("/"):
-                should_continue = await self._handle_slash(line)
-                if not should_continue:
-                    await self._attribute_pending(
-                        success=True, quiet=True
+                # Only dispatch KNOWN commands. An absolute filesystem
+                # path (``/Users/me/x.py``) also starts with "/" — it
+                # must reach the agent as a task, not error as an
+                # unknown command. Heuristic: a first token with a
+                # second "/" is a path; a bare unknown token like
+                # "/hlep" still errors (typo protection).
+                first = line.split()[0].lower()
+                known = {c for c, _d, _g in _COMMAND_DEFS}
+                known |= {"/quit", "/computer"}
+                if first in known:
+                    should_continue = await self._handle_slash(line)
+                    if not should_continue:
+                        await self._attribute_pending(
+                            success=True, quiet=True
+                        )
+                        await self._fire_repl_hooks("SessionEnd")
+                        console.print("[dim]bye[/dim]")
+                        return 0
+                    continue
+                if "/" not in first[1:]:
+                    console.print(
+                        f"  unknown command {first} — /help for "
+                        "the list"
                     )
-                    await self._fire_repl_hooks("SessionEnd")
-                    console.print("[dim]bye[/dim]")
-                    return 0
+                    continue
+                # Falls through: a path-shaped line is a task.
+
+            # ``!cmd`` — run a shell command inline, right now, without
+            # spending a model turn. The output is echoed AND stashed so
+            # the NEXT task turn can reference it ("now fix that error").
+            # Matches Claude Code's ``!`` prefix.
+            if line.startswith("!"):
+                try:
+                    await self._run_bang(line[1:].strip())
+                except Exception as exc:  # noqa: BLE001 — never exit
+                    console.print(
+                        Text(f"  ! error: {exc}", style="red")
+                    )
+                continue
+
+            # Expand @-file mentions to inline the referenced files so
+            # the model gets their content, not just the path.
+            line = self._expand_at_mentions(line)
+
+            # Fold in the last ``!cmd`` output (once) so "now fix that"
+            # after a bang command has the output to work from.
+            if self._last_bash_output is not None:
+                line = (
+                    f"{line}\n\n[output of a shell command I just ran]\n"
+                    f"{self._last_bash_output}"
+                )
+                self._last_bash_output = None
+
+            # Pure greeting → answer locally, zero tokens. Placed
+            # BEFORE hooks/attribution/injection on purpose: a "hi"
+            # is neutral chatter — it must not credit the previous
+            # turn as accepted, fire task hooks, or pay the per-turn
+            # context injection.
+            greeting = _greeting_reply(line)
+            if greeting is not None:
+                console.print(f"  {greeting}")
                 continue
 
             # UserPromptSubmit hooks see the prompt before the agent
@@ -684,18 +1055,217 @@ class Repl:
     # ---- input ----------------------------------------------------------
 
     async def _read_line(self) -> str:
-        """Read one line from the user via prompt_toolkit.
+        """Read one line with a clean, framed-feel prompt.
 
-        Async because ``PromptSession.prompt_async`` integrates with
-        the asyncio event loop directly — no thread hop needed.
-        The slash-command autocomplete + history come from the
-        ``PromptSession`` configured in ``__init__``.
+        The separation is owned by the END of each turn: a full-width
+        rule + that turn's tokens/cost (``_print_turn_summary``). The
+        prompt itself stays minimal — one blank line of air, then the
+        bold ``›`` glyph. Cumulative session totals live in ``/cost``
+        (printing them above every prompt duplicated the turn rule and
+        showed a noisy all-zeros line before the first input).
+        Autocomplete / history / paste keybindings come from the
+        ``PromptSession``.
         """
+        console.print()
         return await self._prompt_session.prompt_async(
-            HTML("<ansigreen><b>loom</b></ansigreen>: ")
+            HTML("<ansigreen><b>›</b></ansigreen>  ")
         )
 
+    async def _run_bang(self, cmd: str) -> None:
+        """Run ``cmd`` in the project root right now (``!`` prefix) and
+        echo its output. The result is stashed in ``_last_bash_output``
+        so the next task turn can be told about it — Claude-Code-style
+        "run this, then act on what you see"."""
+        if not cmd:
+            console.print("  [dim]usage: !<shell command>[/dim]")
+            return
+        import functools
+        import subprocess
+
+        # The command AND its output are USER/tool data — render with
+        # markup DISABLED (styling via Text/style=, never inline
+        # ``[dim]{x}[/dim]`` tags). A ``[`` in the command or a line
+        # like ``[FAILED]`` in the output would otherwise be parsed as
+        # a Rich tag → MarkupError, which — uncaught in the input loop
+        # — killed the whole REPL (observed: ``!pytest`` on failing
+        # tests crashed the session).
+        console.print(Text(f"  $ {cmd}", style="dim"))
+        try:
+            # Worker thread so the blocking run can't stall the event
+            # loop (and Ctrl-C at the REPL stays responsive).
+            proc = await anyio.to_thread.run_sync(
+                functools.partial(
+                    subprocess.run,
+                    cmd,
+                    shell=True,
+                    cwd=str(self.project.root),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            )
+        except subprocess.TimeoutExpired:
+            console.print(
+                Text("  ! command timed out (120s)", style="yellow")
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — never kill the REPL
+            console.print(Text(f"  ! failed: {exc}", style="red"))
+            return
+        out = (proc.stdout or "") + (proc.stderr or "")
+        out = out.rstrip()
+        if out:
+            for ln in out.splitlines()[:200]:
+                console.print(Text(f"  {ln}", style="dim"))
+        code = proc.returncode
+        console.print(
+            Text(
+                f"  exit {code}",
+                style="dim" if code == 0 else "yellow",
+            )
+        )
+        # Stash for the next turn (bounded so a huge dump can't bloat
+        # the prompt). Consumed + cleared in the input loop.
+        self._last_bash_output = (
+            f"$ {cmd}\n{out[:4000]}" if out else f"$ {cmd}\n(exit {code})"
+        )
+
+    def _expand_at_mentions(self, line: str) -> str:
+        """Inline file references so the model gets the file CONTENT,
+        not just the name. Two forms with DIFFERENT trust levels:
+
+        * ``@path`` mention — a DELIBERATE reference. Inlines the file
+          AND grants outside-project EDIT consent (see
+          ``loom_code.consent``): typing ``@`` is an unambiguous "act
+          on this file" gesture.
+        * a bare / quoted / pasted absolute path — a convenience for
+          "read this". Inlined for READING only; NO edit consent. This
+          is the safety boundary: a path that merely appears in a
+          pasted stack trace or log line (``…/site-packages/x.py``,
+          ``~/.zshrc``) must never become editable just by being
+          quoted — only an explicit ``@`` unlocks edits.
+
+        The AGENT's own read tool stays project-scoped regardless, so a
+        prompt-injected model can't roam the filesystem; this is purely
+        about the USER pulling a file into the prompt.
+
+        Each existing file is inlined once; non-files are left as
+        literal text. Bounded per file so a giant file can't blow the
+        context."""
+        import re as _re
+
+        # (ref, is_at_mention) — @-mentions grant edit consent, bare
+        # paths don't.
+        refs: list[tuple[str, bool]] = [
+            (m, True) for m in _re.findall(r"@([^\s]+)", line)
+        ]
+        # Bare/quoted absolute paths — READ-only convenience.
+        for m in _re.findall(r"['\"]((?:/|~/)[^'\"]+)['\"]", line):
+            refs.append((m, False))
+        for m in _re.findall(r"(?<!\S)((?:/|~/)[^\s'\"]+)", line):
+            refs.append((m, False))
+        # macOS drag-and-drop escapes spaces (``…/Screenshot\ 2026….png``).
+        for m in _re.findall(
+            r"(?<!\S)((?:/|~/)(?:[^\s'\"\\]|\\ )+)", line
+        ):
+            if "\\ " in m:
+                refs.append((m.replace("\\ ", " "), False))
+        # Last resort for a PASTED path with unescaped spaces.
+        for start in [
+            m.start() for m in _re.finditer(r"(?<!\S)(?=/|~/)", line)
+        ]:
+            tail = line[start:].strip().strip("'\"")
+            words = tail.split(" ")
+            for end in range(len(words), 0, -1):
+                cand = " ".join(words[:end])
+                if Path(cand).expanduser().is_file():
+                    refs.append((cand, False))
+                    break
+        if not refs:
+            return line
+        seen: set[str] = set()
+        blocks: list[str] = []
+        for ref, is_mention in refs:
+            ref = ref.rstrip(".,;:!?")
+            if ref in seen:
+                continue
+            seen.add(ref)
+            p = Path(ref).expanduser()
+            fpath = (
+                p if p.is_absolute() else self.project.root / p
+            ).resolve()
+            # Existence IS the filter — prose that merely looks
+            # path-shaped never resolves to a real file.
+            if not fpath.is_file():
+                continue
+            try:
+                raw = fpath.read_bytes()
+            except OSError:
+                continue
+            if b"\x00" in raw[:8192]:
+                # Binary (image/archive/db) — inlining bytes as text
+                # is garbage. Tell the user instead of silently
+                # skipping; the models here are text-only.
+                console.print(
+                    f"  [yellow]@ {ref} is a binary file — can't "
+                    "inline it (text files only)[/yellow]"
+                )
+                continue
+            # Grant edit consent for ANY path the user typed/pasted —
+            # bare OR @-mentioned. You naming a file IS the permission
+            # (Claude-Code model). This is safe because the approval
+            # gate ALWAYS shows the diff + asks before an outside-
+            # project edit (see ApprovalGate._is_outside_project): a
+            # path incidentally embedded in a pasted stack trace can't
+            # silently mutate anything — the user sees the prompt and
+            # rejects it. ``is_mention`` is kept only for display
+            # nuance, not for the grant decision.
+            del is_mention  # no longer gates consent
+            from . import consent
+
+            consent.grant(fpath)
+            body = raw.decode("utf-8", errors="replace")
+            if len(body) > 8000:
+                body = body[:8000] + "\n… (truncated)"
+            blocks.append(f"--- {ref} ---\n{body}")
+            console.print(f"  [dim]@ inlined {ref}[/dim]")
+        if not blocks:
+            return line
+        # Bare-path turn: the user pasted ONLY a path, no instruction.
+        # Weak models invent a task for it (observed live: an
+        # unprompted multi_edit on the referenced file). Spell the
+        # implicit contract out instead of letting the model guess.
+        residue = line
+        for ref in seen:
+            residue = residue.replace(ref, " ")
+        residue = residue.replace("@", " ").strip(" \t'\".,;:!?")
+        suffix = ""
+        if not residue:
+            suffix = (
+                "\n\n(The user pasted only this file path, with no "
+                "instruction. Summarise the file in 2-3 sentences "
+                "and ask what they'd like done with it. Do NOT "
+                "modify anything.)"
+            )
+        return line + "\n\n" + "\n\n".join(blocks) + suffix
+
     # ---- a task turn ----------------------------------------------------
+
+    async def _update_block_if_changed(
+        self, name: str, content: str
+    ) -> None:
+        """Write a working block only when changed — delegates to the
+        shared :func:`loom_code.turn.update_block_if_changed` so the
+        REPL and the learned-notes injector use ONE dirty-check."""
+        from .turn import update_block_if_changed
+
+        await update_block_if_changed(
+            self.agent.memory,
+            name,
+            content,
+            user_id=_USER_ID,
+            block_hashes=self._block_hashes,
+        )
 
     async def _inject_loom_context(self, prompt: str) -> None:
         """Update the ``loom_index`` working block with a deterministic
@@ -722,20 +1292,19 @@ class Repl:
             # agent edited code.
             body = repo_map_for_root_cached(self.project.root)
             if body:
-                await self.agent.memory.update_block(
-                    "loom_index", body, user_id=_USER_ID
-                )
+                await self._update_block_if_changed("loom_index", body)
             # Auto-reload the project rules file (AGENTS.md): re-read it
             # FRESH each turn into the ``project_rules`` working block, so
             # a mid-session edit applies on the next turn without a
             # restart. The coordinator's static prompt no longer bakes
             # the rules file (see build_unified_coordinator_instructions).
+            # The dirty-check keeps the re-read cheap: an UNCHANGED file
+            # skips the write, so the cache prefix survives.
             from .rules import project_rules_block
 
-            await self.agent.memory.update_block(
+            await self._update_block_if_changed(
                 "project_rules",
                 project_rules_block(self.project.root),
-                user_id=_USER_ID,
             )
         except Exception:  # noqa: BLE001 — injection is best-effort
             pass
@@ -764,7 +1333,11 @@ class Repl:
         from .turn import inject_learned_notes
 
         await inject_learned_notes(
-            self.workspace, self.agent.memory, prompt, user_id=_USER_ID
+            self.workspace,
+            self.agent.memory,
+            prompt,
+            user_id=_USER_ID,
+            block_hashes=self._block_hashes,
         )
 
     async def _inject_file_history(self, prompt: str) -> None:
@@ -789,16 +1362,18 @@ class Repl:
             if not candidates:
                 # Clear any stale block from a prior turn so last turn's
                 # warning doesn't bleed into an unrelated prompt.
-                await self.agent.memory.update_block(
-                    "file_anticipation", "", user_id=_USER_ID
+                # (Dirty-checked: consecutive no-candidate turns — the
+                # common case — write once, then stay cache-warm.)
+                await self._update_block_if_changed(
+                    "file_anticipation", ""
                 )
                 return
             records = file_history.history_for(
                 self.project.root, candidates
             )
             block = file_history.anticipation_block(records)
-            await self.agent.memory.update_block(
-                "file_anticipation", block, user_id=_USER_ID
+            await self._update_block_if_changed(
+                "file_anticipation", block
             )
             if block:
                 # One concise user-visible line per warned file.
@@ -846,32 +1421,117 @@ class Repl:
 
         Extracted so the escalation path can re-run a SECOND agent
         (the supervisor) through the identical consume + error-
-        handling logic without duplicating it."""
+        handling logic without duplicating it.
+
+        Two liveness guards run alongside the consume loop:
+
+        * **Idle watchdog** — no events for ``_idle_timeout`` seconds
+          (approval-prompt waits excluded via ``_gate_active``) means
+          the stream is hung (dead provider, stuck model); cancel the
+          turn instead of burning until ``max_turns``.
+        * **Stall detector** — ``_STALL_REPEATS`` consecutive
+          IDENTICAL tool calls means the model is looping without
+          progress (loomflow's no-progress hook only arms under
+          /goal); cancel early with a clear message.
+        """
+        # Shared mutable state between the consume body and watchdog.
+        state: dict[str, Any] = {
+            "last_event": time.monotonic(),
+            "timed_out": False,
+            "stalled_tool": None,
+            "tool_in_flight": False,
+        }
+        repeat: dict[str, Any] = {"key": None, "count": 0}
+        idle_timeout = self._idle_timeout
+
         try:
-            async for event in agent.stream(
-                prompt,
-                user_id=_USER_ID,
-                session_id=self.session_id,
-            ):
-                renderer.handle(event)
-                # Tick the token-optimisation counters (loomflow
-                # 0.10.13+). The renderer doesn't surface
-                # architecture_events to the user — we inspect them
-                # here to drive the /cost display.
-                kind = getattr(event, "kind", None)
-                payload = getattr(event, "payload", None)
-                if (
-                    payload is not None
-                    and kind is not None
-                    and str(kind).endswith("architecture_event")
-                ):
-                    name = payload.get("name")
-                    if name == "tool_result_summarized":
-                        self.total_summaries += 1
-                    elif name == "auto_compacted":
-                        self.total_compacts += 1
-                    elif name == "messages_snipped":
-                        self.total_snips += 1
+            async with anyio.create_task_group() as tg:
+
+                # Poll at a fraction of the timeout (capped at 5s) so
+                # small timeouts — tests, aggressive configs — still
+                # trip promptly; the default 300s polls every 5s.
+                poll = max(0.05, min(5.0, (idle_timeout or 5.0) / 4))
+
+                async def _watchdog() -> None:
+                    while True:
+                        await anyio.sleep(poll)
+                        # Don't count time the user is at an approval
+                        # prompt, or a tool is legitimately RUNNING
+                        # (a bash test-suite/build emits tool_call then
+                        # nothing until its result — that's work, not a
+                        # hang). Only genuine model-side silence counts.
+                        if self._gate_active or state["tool_in_flight"]:
+                            state["last_event"] = time.monotonic()
+                            continue
+                        idle = time.monotonic() - state["last_event"]
+                        if idle_timeout and idle > idle_timeout:
+                            state["timed_out"] = True
+                            tg.cancel_scope.cancel()
+                            return
+
+                tg.start_soon(_watchdog)
+
+                stream = agent.stream(
+                    prompt,
+                    user_id=_USER_ID,
+                    session_id=self.session_id,
+                )
+                async for event in stream:
+                    state["last_event"] = time.monotonic()
+                    renderer.handle(event)
+                    kind = str(getattr(event, "kind", ""))
+                    payload = getattr(event, "payload", None) or {}
+                    # Tick the token-optimisation counters (loomflow
+                    # 0.10.13+) off architecture events.
+                    if kind.endswith("architecture_event"):
+                        name = payload.get("name")
+                        if name == "tool_result_summarized":
+                            self.total_summaries += 1
+                        elif name == "auto_compacted":
+                            self.total_compacts += 1
+                        elif name == "messages_snipped":
+                            self.total_snips += 1
+                    elif kind.endswith("tool_result"):
+                        # Tool finished → the model is back in control;
+                        # idle time counts again.
+                        state["tool_in_flight"] = False
+                    elif kind.endswith("tool_call"):
+                        # A tool is now RUNNING — pause the idle clock
+                        # until its result arrives (see _watchdog).
+                        state["tool_in_flight"] = True
+                        # Stall detection: same tool + same args,
+                        # over and over, is a loop — not progress.
+                        call = payload.get("call") or {}
+                        try:
+                            args_key = json.dumps(
+                                call.get("args"),
+                                sort_keys=True,
+                                default=str,
+                            )
+                        except (TypeError, ValueError):
+                            args_key = repr(call.get("args"))
+                        key = f"{call.get('tool')}:{args_key}"
+                        if key == repeat["key"]:
+                            repeat["count"] += 1
+                            if repeat["count"] >= _STALL_REPEATS:
+                                state["stalled_tool"] = call.get(
+                                    "tool"
+                                )
+                                # Close the stream generator IN THIS
+                                # task before cancelling — a bare
+                                # ``break`` leaves it suspended for GC
+                                # to finalise in another task, which
+                                # trips anyio's "cancel scope in a
+                                # different task". aclose() unwinds its
+                                # internal task group here, cleanly.
+                                await stream.aclose()
+                                tg.cancel_scope.cancel()
+                                break
+                        else:
+                            repeat["key"] = key
+                            repeat["count"] = 1
+                # Stream done — stop the watchdog.
+                tg.cancel_scope.cancel()
         except KeyboardInterrupt:
             pause_status()
             console.print(
@@ -881,22 +1541,73 @@ class Repl:
         except BaseExceptionGroup as eg:
             # anyio's task groups raise ``ExceptionGroup`` when any
             # child task fails. Unwrap to surface the REAL cause(s)
-            # instead of the opaque wrapper message.
+            # instead of the opaque wrapper message. Ctrl-C inside
+            # the group arrives wrapped — route it to the interrupt
+            # path, not the error path.
             pause_status()
-            for inner in _flatten_exception_group(eg):
+            inners = _flatten_exception_group(eg)
+            interrupted = any(
+                isinstance(i, KeyboardInterrupt) for i in inners
+            )
+            if interrupted:
                 console.print(
-                    f"\n[bold red]error: "
-                    f"{type(inner).__name__}: {inner}[/bold red]"
+                    "\n[yellow]interrupted — turn abandoned[/yellow]"
                 )
+            # Print REAL errors too, even alongside a Ctrl-C — a worker
+            # that crashed (e.g. a 401) at the same moment the user hit
+            # Ctrl-C must not be hidden behind "interrupted", or they
+            # retry the identical prompt into the same silent failure.
+            for inner in inners:
+                if not isinstance(
+                    inner, (KeyboardInterrupt, anyio.get_cancelled_exc_class())
+                ):
+                    self._print_turn_error(inner)
             return False
         except Exception as exc:  # noqa: BLE001 — REPL must survive
             pause_status()
+            self._print_turn_error(exc)
+            return False
+        finally:
+            # The gate can't still be up once the stream ends — render
+            # anything that queued behind an approval prompt.
+            self._gate_active = False
+            renderer.flush_deferred()
+
+        if state["timed_out"]:
+            pause_status()
             console.print(
-                f"\n[bold red]error: "
-                f"{type(exc).__name__}: {exc}[/bold red]"
+                f"\n[yellow]turn aborted — no activity for "
+                f"{int(idle_timeout)}s (stream hung?). The tree is "
+                f"unchanged since the pre-turn checkpoint; /undo "
+                f"restores it if needed. LOOM_IDLE_TIMEOUT=0 "
+                f"disables this guard.[/yellow]"
+            )
+            return False
+        if state["stalled_tool"]:
+            pause_status()
+            console.print(
+                f"\n[yellow]turn aborted — the model repeated the "
+                f"same [cyan]{state['stalled_tool']}[/cyan] call "
+                f"{_STALL_REPEATS}× with identical arguments (a "
+                f"loop, not progress). Try rephrasing, or a "
+                f"stronger model via /model.[/yellow]"
             )
             return False
         return True
+
+    @staticmethod
+    def _print_turn_error(exc: BaseException) -> None:
+        """One error, two lines max: the real cause (dim, for bug
+        reports) + an actionable hint when we recognise the class.
+        The raw ExceptionGroup wrapper never reaches here — callers
+        flatten first — and render's error event suppresses its own
+        copy, so each failure prints exactly once."""
+        console.print(
+            f"\n[red]error: {type(exc).__name__}: {exc}[/red]"
+        )
+        hint = friendly_error_hint(exc)
+        if hint:
+            console.print(f"  [yellow]→ {hint}[/yellow]")
 
     # ---- .loom extensions: trust gate + REPL-lifecycle hooks --------
 
@@ -985,7 +1696,12 @@ class Repl:
 
     def _pause_active_spinner(self) -> None:
         """Stable hook the ApprovalGate calls to stop the current
-        turn's spinner before prompting. No-op between turns."""
+        turn's spinner before prompting. No-op between turns.
+
+        Also marks the gate as active so the idle-watchdog doesn't
+        count the user's thinking time at an approval prompt as
+        "the stream hung"."""
+        self._gate_active = True
         cb = self._active_pause_spinner
         if cb is not None:
             cb()
@@ -993,9 +1709,77 @@ class Repl:
     def _resume_active_spinner(self) -> None:
         """Stable hook the ApprovalGate calls after the prompt to
         bring the spinner back."""
+        self._gate_active = False
         cb = self._active_resume_spinner
         if cb is not None:
             cb()
+
+    def _account_result(
+        self,
+        result: dict[str, Any],
+        renderer: StreamRenderer,
+        prompt: str,
+        *,
+        extend_files: bool = False,
+    ) -> None:
+        """Fold ONE completed stream's result into the session totals:
+        cost, every token bucket (incl. cache-write), turns, this
+        turn's file touches, and the compaction high-water mark.
+
+        Shared by the main turn AND the tool-leak nudge so the two can
+        never drift — a hand-copied second version had already dropped
+        cache_write_tokens and the high-water update, which under-
+        reported /cost and delayed auto-compaction on nudged turns.
+
+        ``extend_files`` appends to the pending file list (nudge, whose
+        touches add to the same turn) instead of replacing it."""
+        cost = float(result.get("cost_usd", 0.0))
+        tin = int(result.get("tokens_in", 0))
+        cached_in = int(result.get("cached_tokens_in", 0))
+        tout = int(result.get("tokens_out", 0))
+        self.total_cost += cost
+        self.total_in += tin + cached_in
+        self.total_cached_in += cached_in
+        self.total_cache_write += int(
+            result.get("cache_write_tokens", 0)
+        )
+        self.total_out += tout
+        self.turns += int(result.get("turns", 0))
+        # Per-turn deltas for the end-of-turn summary line. ``extend``
+        # (the nudge path) ADDS to the same turn's numbers so the
+        # summary reflects the whole turn, main + nudge.
+        if extend_files:
+            self._turn_in += tin + cached_in
+            self._turn_out += tout
+            self._turn_cost += cost
+        else:
+            self._turn_in = tin + cached_in
+            self._turn_out = tout
+            self._turn_cost = cost
+        # Record this turn's file touches immediately as "unknown".
+        # The outcome is revised to success/fail in
+        # ``_attribute_pending`` when the moved-on / good / bad signal
+        # arrives. Recording now means a crash before judgement still
+        # leaves the touch on record — better unjudged than lost.
+        touched = list(renderer.files_touched)
+        if extend_files:
+            self._pending_files.extend(touched)
+        else:
+            self._pending_files = touched
+        self._last_prompt = prompt
+        if touched:
+            file_history.record_touches(
+                self.project.root,
+                touched,
+                outcome="unknown",
+                summary=prompt,
+            )
+        # Context-occupancy estimate for the compaction trigger — the
+        # high-water mark of the last turn's INPUT (not a running sum,
+        # which double-counts resent history and compacts too early).
+        self._compact_tokens = _context_high_water(
+            self._compact_tokens, tokens_in=tin, cached_in=cached_in
+        )
 
     async def _turn(self, prompt: str, *, agent: Any | None = None) -> None:
         """Stream one agent run for ``prompt``, reusing the
@@ -1050,6 +1834,9 @@ class Repl:
             set_status=set_status,
             pause_status=pause_status,
             sandbox=self._sandbox,
+            # Defer event rendering while the approval selector is on
+            # screen — concurrent prints displace its in-place redraw.
+            gate_active=lambda: self._gate_active,
         )
 
         # The Ralph loop now lives in loomflow itself (>=0.10.8) via
@@ -1075,42 +1862,44 @@ class Repl:
         self.last_result = result
         agent_output = ""
         if result:
-            self.total_cost += float(result.get("cost_usd", 0.0))
-            tin = int(result.get("tokens_in", 0))
-            cached_in = int(result.get("cached_tokens_in", 0))
-            cache_write = int(result.get("cache_write_tokens", 0))
-            tout = int(result.get("tokens_out", 0))
-            self.total_in += tin + cached_in
-            self.total_cached_in += cached_in
-            self.total_cache_write += cache_write
-            self.total_out += tout
-            self.turns += int(result.get("turns", 0))
+            self._account_result(result, renderer, prompt)
             self._pending_slugs = list(
                 result.get("cited_slugs") or []
             )
-            # Record this turn's file touches immediately as "unknown".
-            # The outcome is revised to success/fail in
-            # ``_attribute_pending`` when the moved-on / good / bad
-            # signal arrives. Recording now (not at attribution time)
-            # means a crash before judgement still leaves the touch on
-            # record — better an unjudged touch than a lost one.
-            self._pending_files = list(renderer.files_touched)
-            self._last_prompt = prompt
-            if self._pending_files:
-                file_history.record_touches(
-                    self.project.root,
-                    self._pending_files,
-                    outcome="unknown",
-                    summary=prompt,
-                )
-            # Context-occupancy estimate for the compaction trigger.
-            # See ``_context_high_water`` — track the high-water mark of
-            # the last turn's INPUT, not a running sum (the old ``+=``
-            # double-counted resent history and compacted far too early).
-            self._compact_tokens = _context_high_water(
-                self._compact_tokens, tokens_in=tin, cached_in=cached_in
-            )
             agent_output = str(result.get("output") or "")
+
+            # Weak-model guard: the "answer" is a tool call leaked as
+            # text (structured tool_calls was empty, so the loop ended
+            # the turn). Nudge ONCE — same session, so the model sees
+            # its own leaked reply — then take whatever comes back.
+            if _looks_like_leaked_tool_call(agent_output):
+                console.print(
+                    "  [yellow]model emitted a tool call as text — "
+                    "nudging it to use the tool interface[/yellow]"
+                )
+                nudge_renderer = StreamRenderer(
+                    set_status=set_status,
+                    pause_status=pause_status,
+                    sandbox=self._sandbox,
+                    gate_active=lambda: self._gate_active,
+                )
+                ok = await self._consume_agent_stream(
+                    agent if agent is not None else self.agent,
+                    _TOOL_LEAK_NUDGE,
+                    nudge_renderer,
+                    pause_status,
+                )
+                if ok and nudge_renderer.last_result:
+                    n = nudge_renderer.last_result
+                    # Same accounting as the main path (cost, all token
+                    # buckets incl. cache_write, turns, file touches,
+                    # compaction high-water) — via the shared helper so
+                    # a nudged turn can't under-count or stall compaction.
+                    self._account_result(
+                        n, nudge_renderer, prompt, extend_files=True
+                    )
+                    self.last_result = n
+                    agent_output = str(n.get("output") or "")
 
             # Surface framework-level stop-hook exhaustion so the
             # user knows the cap was hit (and can raise it with
@@ -1169,12 +1958,34 @@ class Repl:
                 "  [dim]if that worked, just continue — or "
                 "/bad if it didn't[/dim]"
             )
-        console.print()
+        # End-of-turn separator: a full-width rule closing THIS
+        # response, right-labelled with the turn's own token usage +
+        # cost, so every answer is cleanly delimited and you can see
+        # what it cost at a glance (not just the cumulative session).
+        self._print_turn_summary()
 
         # Maybe compact. Done AFTER the turn renders + the
         # pending-slugs hint prints so the user sees the natural
         # turn boundary before any compaction status appears.
         await self._maybe_compact()
+
+    def _print_turn_summary(self) -> None:
+        """Full-width rule + this turn's tokens / cost, right-aligned —
+        the horizontal separator between responses the user asked for.
+        Zero cost renders as ``free`` (free-tier models) instead of a
+        noisy ``$0.0000``."""
+        cost = (
+            "free" if self._turn_cost == 0 else f"${self._turn_cost:.4f}"
+        )
+        stats = f"{self._turn_in:,} in · {self._turn_out:,} out · {cost}"
+        width = console.size.width
+        # rule that ends with the stats: dashes + " stats" flush right.
+        pad = max(0, width - len(stats) - 3)
+        console.print(
+            f"[bright_black]{'─' * pad}[/bright_black] "
+            f"[dim]{self._turn_in:,} in · {self._turn_out:,} out · "
+            f"[green]{cost}[/green][/dim]"
+        )
 
     # ---- self-improvement attribution -----------------------------------
 
@@ -1368,6 +2179,11 @@ class Repl:
             self._compact_tokens = 0
             self._compact_exchanges.clear()
             reset_paste_stash()
+            # Fresh start also revokes outside-file edit grants —
+            # they belong to the conversation that named them.
+            from . import consent
+
+            consent.reset()
             # Move the on-disk pointer to the NEW session so a
             # later /resume doesn't rewind into the conversation
             # the user just told us to forget. /clear means "I
@@ -1378,6 +2194,8 @@ class Repl:
                 "  [dim]fresh conversation — prior turns "
                 "forgotten[/dim]"
             )
+        elif cmd == "/compact":
+            await self._handle_compact()
         elif cmd == "/compress_token_length":
             self._handle_compress_command(arg)
         elif cmd == "/set_model":
@@ -1385,11 +2203,15 @@ class Repl:
         elif cmd == "/set_web":
             await self._handle_set_web()
         elif cmd == "/resume":
-            await self._handle_resume()
+            await self._handle_resume(arg)
+        elif cmd == "/export":
+            self._handle_export()
         elif cmd == "/set_continue_cap":
             self._handle_set_continue_cap(arg)
         elif cmd == "/effort":
             self._handle_effort(arg)
+        elif cmd == "/mode":
+            self._handle_mode(arg)
         elif cmd == "/isolate":
             self._handle_isolate()
         elif cmd == "/review":
@@ -1484,6 +2306,53 @@ class Repl:
         save_preferred_model(model)
         console.print(
             f"  [dim]switched to {model} — fresh conversation[/dim]"
+        )
+
+    def _handle_mode(self, arg: str) -> None:
+        """``/mode [default|accept-edits|plan|yolo]`` — set the
+        approval mode for calls no permission rule matches. No arg
+        shows the current mode. Takes effect immediately (the gate
+        object is shared by every agent) — no rebuild needed.
+
+        * ``default`` — ask for every mutation (write/edit/bash).
+        * ``accept-edits`` — auto-allow file edits, still ask for bash.
+        * ``plan`` — read-only: deny all mutation; the agent can
+          research and propose but not touch the tree.
+        * ``yolo`` — allow everything (the irreversible-danger gate
+          still fires). Same risk profile as ``--yes``.
+
+        Explicit ``deny`` rules in settings.toml beat every mode."""
+        from .permissions import Mode, parse_mode
+
+        choice = arg.strip()
+        if not choice:
+            console.print(
+                f"  [dim]current mode: {self._gate.mode.value}[/dim] "
+                "[dim](usage: /mode default|accept-edits|plan|yolo)"
+                "[/dim]"
+            )
+            return
+        mode = parse_mode(choice)
+        if mode is None:
+            console.print(
+                f"  [yellow]unknown mode {choice!r}[/yellow] — "
+                "use default | accept-edits | plan | yolo"
+            )
+            return
+        self._gate.mode = mode
+        blurb = {
+            Mode.DEFAULT: "asking before every mutation",
+            Mode.ACCEPT_EDITS: (
+                "auto-allowing file edits; bash still asks"
+            ),
+            Mode.PLAN: "read-only — all mutation denied",
+            Mode.YOLO: (
+                "allowing everything (danger gate still fires)"
+            ),
+        }[mode]
+        console.print(
+            f"  [dim]mode → [/dim][cyan]{mode.value}[/cyan]"
+            f"[dim] — {blurb}[/dim]"
         )
 
     def _handle_effort(self, arg: str) -> None:
@@ -1864,10 +2733,24 @@ class Repl:
     async def _classify_task(self, prompt: str) -> str:
         """One-word SOLO/TEAM vote from the cheap same-provider
         model (~a hundred tokens, fractions of a cent — repaid many
-        times over when it saves one delegation round-trip)."""
+        times over when it saves one delegation round-trip).
+
+        litellm-routed models have no cheap sibling
+        (``cheap_model_for`` returns None to avoid crossing
+        providers) — but disabling the classifier there forced EVERY
+        turn onto the heavy TEAM path, the worst deal for exactly the
+        providers with the weakest models. Classify with the model
+        ITSELF instead: the call is ~100 tokens, and on the free
+        tiers this targets (NVIDIA NIM) it costs nothing. Local
+        ollama/echo stay disabled — an extra local call is pure
+        latency with no cost to save."""
         cheap = cheap_model_for(self.model)
         if cheap is None:
-            return "TEAM"
+            model_str = str(self.model).lower()
+            if model_str.startswith("litellm/"):
+                cheap = self.model  # self-classification
+            else:
+                return "TEAM"
         try:
             if self._router_agent is None:
                 from loomflow import Agent as _Agent
@@ -1942,6 +2825,9 @@ class Repl:
         # solo route / classification rebuilds on the new config.
         self._solo_agent = None
         self._router_agent = None
+        # New agent/memory — forget what blocks we last wrote so the
+        # dirty-check can't wrongly skip the first write.
+        self._block_hashes.clear()
         self._compactor = Compactor(
             model=cheap_model_for(self.model) or self.model
         )
@@ -1949,29 +2835,6 @@ class Repl:
             self._compact_tokens = 0
             self._compact_exchanges.clear()
             self.session_id = new_id()
-
-    # ---- persistent status line ----------------------------------------
-
-    def _print_status_line(self) -> None:
-        """One dim line printed before every prompt so cost/tokens
-        are always visible. Format mirrors the end-of-turn summary
-        (``uncached+cached in / out · $cost``) for consistency —
-        but represents cumulative SESSION totals here, not per-run."""
-        uncached = self.total_in - self.total_cached_in
-        console.print(
-            Text.assemble(
-                ("  ", ""),
-                (f"{self.turns} turns", "dim"),
-                ("  ·  ", "dim"),
-                (
-                    f"{uncached:,}+{self.total_cached_in:,} in / "
-                    f"{self.total_out:,} out",
-                    "dim",
-                ),
-                ("  ·  ", "dim"),
-                (f"${self.total_cost:.4f}", "dim green"),
-            )
-        )
 
     # ---- automatic compaction ------------------------------------------
 
@@ -1999,12 +2862,34 @@ class Repl:
             return
         if not self._compact_exchanges:
             return
-
-        before_tokens = self._compact_tokens
         console.print(
-            f"  [dim]compacting {before_tokens:,} tokens of "
+            f"  [dim]compacting {self._compact_tokens:,} tokens of "
             f"history (threshold {threshold:,})...[/dim]"
         )
+        await self._compact_now()
+
+    async def _handle_compact(self) -> None:
+        """``/compact`` — force a compaction NOW, regardless of the
+        auto threshold. Useful right before a big new task: fold the
+        session so far into a dense summary and start the next turn
+        on a fresh, cheap thread."""
+        if not self._compact_exchanges:
+            console.print(
+                "  [dim]nothing to compact yet — no completed "
+                "turns this session[/dim]"
+            )
+            return
+        console.print(
+            f"  [dim]compacting {self._compact_tokens:,} tokens of "
+            f"history (manual)...[/dim]"
+        )
+        await self._compact_now()
+
+    async def _compact_now(self) -> None:
+        """The shared compaction body: summarise, land the summary as
+        a working block, reset the thread. Callers gate on
+        ``_compact_exchanges`` being non-empty and print their own
+        lead-in line."""
         try:
             summary = await self._compactor.compact(
                 self._compact_exchanges
@@ -2158,6 +3043,53 @@ class Repl:
 
     # ---- /set_model + /set_web (interactive provider setup) ----------
 
+    async def _select_menu(
+        self,
+        title: str,
+        options: list[tuple[str, str]],
+        *,
+        default: int = 0,
+    ) -> str | None:
+        """Arrow-key vertical menu (↑/↓ + Enter, or a number/hotkey) —
+        the same selector the approval prompt uses, for the REPL's
+        pick-a-thing prompts (/set_model, /set_web, model lists, …).
+
+        ``options`` is ``[(key, label), …]``; returns the chosen key,
+        or ``None`` if cancelled (Esc / Ctrl-C). On a non-TTY it falls
+        back to a typed line matched against the keys, so scripted use
+        and tests still work.
+
+        The raw-mode selector runs on a worker thread (its blocking
+        key reads must not stall the event loop), mirroring how the
+        ApprovalGate calls ``_select_option``."""
+        from .approval import _select_option
+
+        console.print()
+        if title:
+            console.print(f"  [bold]{title}[/bold]")
+        # ``_select_option`` OWNS the option rendering (it redraws the
+        # numbered list in place on each keypress); we only print the
+        # title above it. A trailing "Cancel" is the safe last option
+        # the selector maps Esc/EOF to — so cancel is distinguishable
+        # from a real pick.
+        menu = [*options, ("\x00cancel", "Cancel")]
+        try:
+            choice = await anyio.to_thread.run_sync(
+                lambda: _select_option(menu, default=default)
+            )
+        except (EOFError, KeyboardInterrupt):
+            choice = "\x00cancel"
+        # ERASE the whole menu (blank line + title + every option row)
+        # so a subsequent menu REPLACES this one in place rather than
+        # stacking below it. 1 blank + (title?1:0) + len(menu) rows.
+        if sys.stdout.isatty():
+            n = 1 + (1 if title else 0) + len(menu)
+            sys.stdout.write(f"\x1b[{n}F\x1b[0J")
+            sys.stdout.flush()
+        if choice == "\x00cancel":
+            return None
+        return choice
+
     async def _prompt_line(self, message: str) -> str | None:
         """Read one line from the user with a fresh PromptSession.
 
@@ -2196,96 +3128,151 @@ class Repl:
             return None
 
     async def _handle_set_model(self) -> None:
-        """``/set_model`` — pick OpenAI / Anthropic, prompt for the
-        API key if not already set, save it to credentials, switch
-        to that provider's default model. Convenient for the
-        "first run on a new machine" flow."""
-        console.print()
-        console.print("  [bold]Pick a model provider:[/bold]")
+        """``/set_model`` — pick a provider, ensure its API key (ask
+        for it FIRST if missing), then pick a specific model from that
+        provider's list. Key-before-models so you can't choose a model
+        you can't authenticate.
+
+        Two-level navigation: cancelling the MODEL menu returns to the
+        PROVIDER menu (the loop's ``continue``); only cancelling the
+        provider menu itself exits ``/set_model`` entirely."""
+        while True:
+            choice = await self._select_menu(
+                "Pick a model provider:",
+                [
+                    ("1", "OpenAI     (gpt-4.1, gpt-5.1, o4-mini, …)"),
+                    ("2", "Anthropic  (claude-opus-4-8, sonnet-4-6, …)"),
+                    ("3", "NVIDIA     (Nemotron — free at build.nvidia.com)"),
+                    ("4", "Other      (Groq / Together / any litellm)"),
+                ],
+            )
+            if choice is None:
+                # Only a provider-menu cancel exits the command.
+                return
+            if choice == "4":
+                await self._set_model_other()
+                return
+
+            provider = {
+                "1": ("OpenAI", "OPENAI_API_KEY", self._OPENAI_MODELS),
+                "2": (
+                    "Anthropic",
+                    "ANTHROPIC_API_KEY",
+                    self._ANTHROPIC_MODELS,
+                ),
+                "3": ("NVIDIA", "NVIDIA_NIM_API_KEY", self._NVIDIA_MODELS),
+            }[choice]
+            label, env_name, models = provider
+
+            # KEY FIRST — ask for the provider's key before showing
+            # models, so a user without a key sets it up rather than
+            # picking a model that then fails to authenticate. A cancel
+            # here returns to the provider menu (not a full exit).
+            if not await self._ensure_provider_key(label, env_name):
+                continue
+
+            # Then pick a specific model. NVIDIA uses its own picker
+            # (its custom-input routes a bare ``nvidia/x`` through
+            # litellm/nim); OpenAI/Anthropic use the generic list.
+            if choice == "3":
+                target_model = await self._pick_nvidia_model()
+            else:
+                target_model = await self._pick_from_models(label, models)
+            if target_model is None:
+                # Back out to the provider menu instead of exiting.
+                continue
+            console.print(f"  [dim]switching to {target_model}[/dim]")
+            self._switch_model(target_model)
+            return
+
+    async def _ensure_provider_key(
+        self, label: str, env_name: str
+    ) -> bool:
+        """Make sure ``env_name`` is set, prompting + saving it if not.
+        Returns True to proceed, False if the user cancelled. Shown
+        BEFORE the model list in /set_model (key-first flow).
+
+        Silent on the common path: if the key is already set we just
+        proceed to the model list. (Printing "already set" here echoed
+        once per provider re-visit when backing out of the model menu —
+        the stack of "using it" lines the user saw.)"""
+        if os.environ.get(env_name):
+            return True
+        from .credentials import signup_url_for
+
         console.print(
-            "    [cyan]1[/cyan]. OpenAI     "
-            "(gpt-4.1-mini, gpt-4.1, ...)"
+            f"  [yellow]No {env_name} set.[/yellow] "
+            f"loom-code needs it to use {label}."
         )
         console.print(
-            "    [cyan]2[/cyan]. Anthropic  "
-            "(claude-sonnet-4-6, claude-opus-4-7, ...)"
+            f"  Get one at [dim]{signup_url_for(env_name)}[/dim]"
         )
+        key = await self._prompt_secret(f"  Paste your {env_name}: ")
+        if not key:
+            console.print("  [yellow]no key entered — aborting[/yellow]")
+            return False
+        save_credential(env_name, key)
+        os.environ[env_name] = key
         console.print(
-            "    [cyan]3[/cyan]. NVIDIA     "
-            "(Nemotron — [green]free[/green] API at build.nvidia.com)"
+            f"  [green]✓[/green] saved {env_name} "
+            "(future sessions pick it up automatically)"
         )
-        console.print(
-            "    [cyan]4[/cyan]. Other      "
-            "(Groq / Together / any litellm provider)"
+        return True
+
+    async def _pick_from_models(
+        self, label: str, models: list[tuple[str, str, str]]
+    ) -> str | None:
+        """Arrow-key menu over a provider's (name, model_id, note)
+        list, plus a 'type your own' escape. Returns the chosen model
+        string, or None if cancelled."""
+        options = [
+            (str(i), f"{name:24} {note}")
+            for i, (name, _mid, note) in enumerate(models, 1)
+        ]
+        options.append(("custom", "Type a different model id…"))
+        choice = await self._select_menu(
+            f"{label} models:", options
         )
-        choice = await self._prompt_line("  Enter 1-4: ")
         if choice is None:
-            console.print("  [dim]cancelled[/dim]")
-            return
-        if choice == "1":
-            env_name = "OPENAI_API_KEY"
-            target_model = _OPENAI_DEFAULT_MODEL
-            label = "OpenAI"
-        elif choice == "2":
-            env_name = "ANTHROPIC_API_KEY"
-            target_model = _ANTHROPIC_DEFAULT_MODEL
-            label = "Anthropic"
-        elif choice == "3":
-            # NVIDIA NIM — free tier. Let the user pick WHICH model
-            # (the catalog has many; the small 9B is a poor default for
-            # tool-heavy work). Returns None if cancelled.
-            picked = await self._pick_nvidia_model()
-            if picked is None:
-                console.print("  [dim]cancelled[/dim]")
-                return
-            env_name = "NVIDIA_NIM_API_KEY"
-            target_model = picked
-            label = "NVIDIA"
-        elif choice == "4":
-            await self._set_model_other()
-            return
-        else:
-            console.print(
-                f"  [yellow]invalid choice {choice!r} — "
-                "enter 1-4[/yellow]"
-            )
-            return
+            return None
+        if choice.isdigit():
+            return models[int(choice) - 1][1]
+        ans = await self._prompt_line("  Model id: ")
+        if not ans:
+            return None
+        from .credentials import normalize_model
 
-        if not os.environ.get(env_name):
-            console.print(
-                f"  [dim]No {env_name} set yet — paste one to "
-                f"save it for future sessions too.[/dim]"
-            )
-            key = await self._prompt_secret(
-                f"  Paste your {env_name}: "
-            )
-            if not key:
-                console.print(
-                    "  [yellow]no key entered — aborting[/yellow]"
-                )
-                return
-            save_credential(env_name, key)
-            os.environ[env_name] = key
-            console.print(
-                f"  [green]✓[/green] saved {env_name} "
-                "(future sessions pick it up automatically)"
-            )
-        else:
-            console.print(
-                f"  [dim]{env_name} already set — using it[/dim]"
-            )
-        console.print(
-            f"  [dim]switching to {label} model "
-            f"({target_model})[/dim]"
-        )
-        self._switch_model(target_model)
+        return normalize_model(ans)
 
-    # Curated NVIDIA NIM models, ordered small→large. loom-code is
-    # tool-heavy (delegate/write/edit/bash), so models with solid
-    # OpenAI-format function calling do far better — those are marked.
-    # (label, full litellm model string, note). Kept short + editable;
-    # the free-type option covers anything not listed.
-    # Model IDs verified against NVIDIA's live /v1/models catalog.
+    # Curated model lists per provider — (label, model_id, note). The
+    # /set_model flow shows these as a sub-menu after the key is set,
+    # so the user picks a SPECIFIC model, not just a provider default.
+    # A "type your own" escape covers anything not listed.
+    _OPENAI_MODELS: list[tuple[str, str, str]] = [
+        ("gpt-4.1-mini", "gpt-4.1-mini", "fast + cheap, solid tools"),
+        ("gpt-4.1", "gpt-4.1", "stronger general coding"),
+        ("gpt-5.1", "gpt-5.1", "flagship reasoning (if you have access)"),
+        ("o4-mini", "o4-mini", "reasoning, cost-efficient"),
+    ]
+    _ANTHROPIC_MODELS: list[tuple[str, str, str]] = [
+        ("claude-haiku-4-5", "claude-haiku-4-5", "fast + cheap"),
+        (
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            "best speed/intelligence balance",
+        ),
+        (
+            "claude-opus-4-8",
+            "claude-opus-4-8",
+            "most capable — top tool-use + agentic",
+        ),
+        ("claude-opus-4-7", "claude-opus-4-7", "previous-gen Opus"),
+    ]
+
+    # NVIDIA NIM models, ordered small→large. loom-code is tool-heavy
+    # (delegate/write/edit/bash), so models with solid OpenAI-format
+    # function calling do far better — those are marked. IDs verified
+    # against NVIDIA's live /v1/models catalog.
     _NVIDIA_MODELS: list[tuple[str, str, str]] = [
         (
             "nemotron-nano-9b-v2",
@@ -2311,43 +3298,36 @@ class Repl:
     ]
 
     async def _pick_nvidia_model(self) -> str | None:
-        """Menu of common NVIDIA NIM models + free-type. Returns the
-        chosen litellm model string, or None if cancelled.
-
-        The user may enter a list number, or type any model id (a bare
-        ``nvidia/…`` / ``meta/…`` id is normalised to the litellm form,
-        or a full ``litellm/nvidia_nim/…`` string is taken as-is)."""
+        """Arrow-key menu of common NVIDIA NIM models + a "type your
+        own" escape. Returns the chosen litellm model string, or None
+        if cancelled."""
         from .credentials import normalize_model
 
-        console.print()
-        console.print(
-            "  [bold]NVIDIA models[/bold] "
-            "[dim](free at build.nvidia.com)[/dim]"
-        )
-        for i, (name, _model, note) in enumerate(self._NVIDIA_MODELS, 1):
-            console.print(
-                f"    [cyan]{i}[/cyan]. {name:22} [dim]{note}[/dim]"
+        options = [
+            (str(i), f"{name:22} {note}")
+            for i, (name, _model, note) in enumerate(
+                self._NVIDIA_MODELS, 1
             )
-        console.print(
-            "  [dim]enter a number, or type any model id "
-            "(e.g. nvidia/nemotron-…)[/dim]"
+        ]
+        options.append(("custom", "Type a different model id…"))
+        choice = await self._select_menu(
+            "NVIDIA models (free at build.nvidia.com):", options
         )
-        ans = await self._prompt_line("  Model: ")
+        if choice is None:
+            return None
+        if choice.isdigit():
+            return self._NVIDIA_MODELS[int(choice) - 1][1]
+        # "custom" → free-type an id (bare vendor id → routed via NIM,
+        # explicit litellm string kept as-is).
+        ans = await self._prompt_line(
+            "  Model id (e.g. nvidia/nemotron-…): "
+        )
         if not ans:
             return None
-        if ans.isdigit():
-            idx = int(ans) - 1
-            if 0 <= idx < len(self._NVIDIA_MODELS):
-                return self._NVIDIA_MODELS[idx][1]
-            console.print(f"  [yellow]no option {ans}[/yellow]")
-            return None
-        # Free-typed id. If it's already a litellm string, keep it; if
-        # it's a bare vendor id (nvidia/…, meta/…), route it via NIM.
         if ans.lower().startswith("litellm/"):
             return ans
         if "/" in ans:
             return f"litellm/nvidia_nim/{ans}"
-        # A lone token like "nemotron-nano-9b-v2" — assume nvidia vendor.
         return normalize_model(f"nvidia/{ans}")
 
     async def _set_model_other(self) -> None:
@@ -2393,22 +3373,15 @@ class Repl:
         Serper prompts for the API key on first use; DuckDuckGo
         needs nothing. Rebuilds the agent so the new tool wiring
         takes effect on the next turn."""
-        console.print()
-        console.print("  [bold]Web search backend:[/bold]")
-        console.print(
-            "    [cyan]1[/cyan]. Serper      "
-            "(Google, best quality, needs API key)"
+        choice = await self._select_menu(
+            "Web search backend:",
+            [
+                ("1", "Serper      (Google, best quality, needs API key)"),
+                ("2", "DuckDuckGo  (free, no key, lower quality)"),
+                ("3", "Off         (disable web search)"),
+            ],
         )
-        console.print(
-            "    [cyan]2[/cyan]. DuckDuckGo  "
-            "(free, no key, lower quality)"
-        )
-        console.print(
-            "    [cyan]3[/cyan]. Off         (disable web search)"
-        )
-        choice = await self._prompt_line("  Enter 1, 2, or 3: ")
         if choice is None:
-            console.print("  [dim]cancelled[/dim]")
             return
 
         if choice == "1":
@@ -2470,16 +3443,90 @@ class Repl:
         is logged once but never blocks a turn (the file is a
         convenience; the agent's actual memory keys off
         ``session_id`` in loomflow's Memory which we don't touch
-        here)."""
+        here).
+
+        Also appends one record per NEW session_id to
+        ``.loom/sessions.jsonl`` — the history behind ``/resume pick``
+        and ``--resume``. One line per session (first turn only), with
+        a first-prompt hint so the picker is legible."""
         try:
             p = self._session_pointer_path()
             p.parent.mkdir(exist_ok=True)
             p.write_text(self.session_id + "\n", encoding="utf-8")
+            if self.session_id != self._recorded_session_id:
+                import datetime as _dt
+
+                record = {
+                    "session_id": self.session_id,
+                    "ts": _dt.datetime.now(_dt.UTC).isoformat(
+                        timespec="seconds"
+                    ),
+                    "hint": (self._last_prompt or "")[:80],
+                    "model": str(self.model),
+                }
+                with (p.parent / "sessions.jsonl").open(
+                    "a", encoding="utf-8"
+                ) as fh:
+                    fh.write(json.dumps(record) + "\n")
+                self._recorded_session_id = self.session_id
         except OSError:
             # Silent failure: a read-only filesystem or perms
             # issue would otherwise spam the chat with the same
             # warning every turn.
             pass
+
+    def _recent_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Recent sessions from ``.loom/sessions.jsonl``, newest first,
+        current session excluded. Lenient on malformed lines."""
+        path = self.project.root / LOOM_DIR / "sessions.jsonl"
+        out: list[dict[str, Any]] = []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return out
+        for raw in reversed(lines):
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            sid = rec.get("session_id")
+            if not sid or sid == self.session_id:
+                continue
+            if any(s["session_id"] == sid for s in out):
+                continue
+            out.append(rec)
+            if len(out) >= limit:
+                break
+        return out
+
+    async def _pick_session(self) -> str | None:
+        """Numbered menu over recent sessions; returns the chosen
+        session_id or None on cancel / nothing to show."""
+        sessions = self._recent_sessions()
+        if not sessions:
+            console.print(
+                "  [yellow]no other recorded sessions for this "
+                "project.[/yellow]"
+            )
+            return None
+        console.print()
+        console.print("  [bold]Recent sessions[/bold]")
+        for i, s in enumerate(sessions, 1):
+            ts = str(s.get("ts", ""))[:16].replace("T", " ")
+            hint = s.get("hint") or "(no prompt recorded)"
+            console.print(
+                f"    [cyan]{i}[/cyan]. [dim]{ts}[/dim] "
+                f"{s['session_id'][:8]}…  {hint}"
+            )
+        ans = await self._prompt_line("  Resume which? (number): ")
+        if not ans or not ans.isdigit():
+            console.print("  [dim]cancelled[/dim]")
+            return None
+        idx = int(ans) - 1
+        if not 0 <= idx < len(sessions):
+            console.print(f"  [yellow]no option {ans}[/yellow]")
+            return None
+        return str(sessions[idx]["session_id"])
 
     def _load_session_pointer(self) -> str | None:
         """Read the last saved session_id for this project, or
@@ -2494,9 +3541,61 @@ class Repl:
         except OSError:
             return None
 
-    async def _handle_resume(self) -> None:
-        """``/resume`` — point the REPL at the LAST session_id used
-        on this project.
+    def _handle_export(self) -> None:
+        """``/export`` — write this session's turns to a markdown file
+        under ``.loom/exports/`` and print the path. Uses the same
+        (prompt, response) pairs the compactor sees, so it covers the
+        current conversation thread."""
+        if not self._compact_exchanges:
+            console.print(
+                "  [dim]nothing to export yet — no completed turns "
+                "this session[/dim]"
+            )
+            return
+        import datetime as _dt
+
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = self.project.root / LOOM_DIR / "exports"
+        out_path = out_dir / f"session-{ts}.md"
+        lines = [
+            "# loom-code session",
+            "",
+            f"- project: `{self.project.root}`",
+            f"- model: `{self.model}`",
+            f"- session: `{self.session_id}`",
+            f"- exported: {ts}",
+            "",
+        ]
+        for i, (prompt, reply) in enumerate(
+            self._compact_exchanges, 1
+        ):
+            lines += [
+                f"## Turn {i}",
+                "",
+                f"**user:** {prompt}",
+                "",
+                f"**loom-code:** {reply}",
+                "",
+            ]
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError as exc:
+            console.print(f"  [red]export failed: {exc}[/red]")
+            return
+        console.print(
+            f"  [green]✓[/green] exported "
+            f"{len(self._compact_exchanges)} turn(s) → "
+            f"[cyan]{out_path.relative_to(self.project.root)}[/cyan]"
+        )
+
+    async def _handle_resume(self, arg: str = "") -> None:
+        """``/resume`` — pick up a prior session on this project.
+
+        * no arg → the LAST session (the 95% case, unchanged).
+        * ``pick`` / ``list`` → numbered menu of recent sessions
+          (from ``.loom/sessions.jsonl``), choose one.
+        * a session-id prefix → resume that session directly.
 
         loomflow's Memory keys episodes by ``(user_id, session_id)``;
         when the agent's next ``run()`` reuses the same session_id,
@@ -2509,7 +3608,28 @@ class Repl:
         from a different model. We don't try to guard against
         either — /resume is a deliberate gesture the user owns.
         """
-        prior = self._load_session_pointer()
+        arg = arg.strip()
+        prior: str | None
+        if arg in ("pick", "list"):
+            prior = await self._pick_session()
+            if prior is None:
+                return
+        elif arg:
+            # A session-id prefix.
+            matches = [
+                s["session_id"]
+                for s in self._recent_sessions()
+                if s["session_id"].startswith(arg)
+            ]
+            if not matches:
+                console.print(
+                    f"  [yellow]no recorded session starts with "
+                    f"{arg!r} — try /resume pick[/yellow]"
+                )
+                return
+            prior = matches[0]
+        else:
+            prior = self._load_session_pointer()
         if prior is None:
             console.print(
                 "  [yellow]no prior session recorded for this "
@@ -2870,13 +3990,19 @@ async def run_repl(
     *,
     sandbox: bool = False,
     sandbox_allow_network: bool = False,
+    resume: str | None = None,
 ) -> int:
     """Entry point for the interactive REPL — construct the Repl and
-    run its loop until the user exits."""
+    run its loop until the user exits.
+
+    ``resume`` maps the CLI flags onto the /resume machinery before
+    the first prompt: ``"last"`` (--continue) rejoins the most recent
+    session, ``"pick"`` (--resume) shows the session picker."""
     repl = Repl(
         project,
         model,
         sandbox=sandbox,
         sandbox_allow_network=sandbox_allow_network,
+        startup_resume=resume,
     )
     return await repl.run()

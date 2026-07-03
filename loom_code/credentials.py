@@ -216,6 +216,39 @@ def _load_user_providers_and_aliases() -> (
     return providers, aliases
 
 
+def patient_retry_policy_for(model: str):
+    """A more patient retry schedule for litellm-routed providers, or
+    ``None`` to accept loomflow's default (3 attempts) elsewhere.
+
+    Free tiers rate-limit hard — NVIDIA NIM allows 40 req/min — and a
+    multi-agent turn bursts several calls, so the stock 3-attempt /
+    30s-cap schedule can exhaust inside one limit window and surface a
+    RateLimitError the user didn't deserve. 6 attempts with a 90s cap
+    rides out a full window. First-party APIs (OpenAI/Anthropic) have
+    high limits; the default is right for them, so return None.
+
+    Returned object is loomflow's ``RetryPolicy`` (imported lazily so
+    this module stays importable without loomflow, e.g. in docs
+    tooling); typed loosely for the same reason.
+    """
+    # A pre-constructed Model OBJECT (tests pass ScriptedModel; adapters
+    # are legal too) isn't litellm-routed by us — leave its retry
+    # behaviour to whoever built it.
+    if not isinstance(model, str):
+        return None
+    if not model.lower().startswith("litellm/"):
+        return None
+    from loomflow.governance.retry import RetryPolicy
+
+    return RetryPolicy(
+        max_attempts=6,
+        initial_delay_s=2.0,
+        max_delay_s=90.0,
+        multiplier=2.0,
+        jitter=0.2,
+    )
+
+
 def quiet_litellm_model_warnings(model: str) -> None:
     """Silence loomflow's two "unknown model" ``UserWarning``s for a
     litellm-routed model, where they're expected noise rather than a

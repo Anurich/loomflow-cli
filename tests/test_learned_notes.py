@@ -31,6 +31,10 @@ def _fake_repl(workspace: InMemoryWorkspace, memory: InMemoryMemory):
     return SimpleNamespace(
         workspace=workspace,
         agent=SimpleNamespace(memory=memory),
+        # Dirty-check state the real Repl carries (see
+        # _update_block_if_changed) — fresh per fake, so each test
+        # starts with "nothing written yet".
+        _block_hashes={},
     )
 
 
@@ -112,6 +116,8 @@ async def test_injection_failure_never_raises(tmp_path: Path) -> None:
             raise RuntimeError("workspace down")
 
     fake = SimpleNamespace(
-        workspace=_Boom(), agent=SimpleNamespace(memory=None)
+        workspace=_Boom(),
+        agent=SimpleNamespace(memory=None),
+        _block_hashes={},
     )
     await Repl._inject_learned_notes(fake, "anything")  # no raise

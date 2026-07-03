@@ -57,9 +57,11 @@ from loomflow.tools import (
 )
 
 from .code_index import codebase_search_tool
+from .credentials import patient_retry_policy_for
 from .edit_tool import multi_edit_tool
 from .edit_tool import verifying_edit_tool as edit_tool
 from .extensions import AgentSpec
+from .file_tools import loom_read_tool
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .lsp_tools import lsp_tools
 from .project import Project
@@ -319,7 +321,10 @@ def _build_coder(
     else:
         bash = bash_tool(root, timeout=300.0)
     static_tools: list[Any] = [
-        read_tool(root),
+        # Policy-bounded read (loom_read_tool): reaches user-referenced
+        # files outside the project too, matching edit/multi_edit; a
+        # self-initiated outside read the user never named is refused.
+        loom_read_tool(root),
         write_tool(root),
         edit_tool(root),
         multi_edit_tool(root),
@@ -391,6 +396,9 @@ def _build_coder(
         # of re-running `read`. (False on the solo fast path — see
         # the docstring.)
         persist_tool_transcripts=persist_tool_transcripts,
+        # Patient retry schedule on free-tier/litellm providers (None
+        # elsewhere = loomflow default). See patient_retry_policy_for.
+        tuning=Tuning(retry_policy=patient_retry_policy_for(model)),
     )
 
 
@@ -430,7 +438,8 @@ def _build_explorer(
         # are off on workers) cannot provide.
         tool_result_summarizer=tool_result_summarizer,
         tuning=Tuning(
-            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS
+            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS,
+            retry_policy=patient_retry_policy_for(model),
         ),
         effort=effort,
         # See ``_build_coder`` for the rationale. Explorer benefits
@@ -468,7 +477,8 @@ def _build_auditor(
         # Same rationale as the explorer: briefings, not exact edits.
         tool_result_summarizer=tool_result_summarizer,
         tuning=Tuning(
-            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS
+            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS,
+            retry_policy=patient_retry_policy_for(model),
         ),
         effort=effort,
         # Same rationale as explorer — auditor accumulates context
@@ -515,7 +525,8 @@ def _build_reviewer(
         # pytest dump keeps the failures, drops the dots.
         tool_result_summarizer=tool_result_summarizer,
         tuning=Tuning(
-            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS
+            tool_result_summary_threshold=SUMMARY_THRESHOLD_CHARS,
+            retry_policy=patient_retry_policy_for(model),
         ),
         effort=effort,
         # Reviewer benefits too: re-review cycles ("you flagged X,
@@ -741,4 +752,7 @@ def build_custom_worker(
         auto_compact_at_tokens=auto_compact_at_tokens,
         effort=effort,
         persist_tool_transcripts=True,
+        tuning=Tuning(
+            retry_policy=patient_retry_policy_for(spec.model or model)
+        ),
     )

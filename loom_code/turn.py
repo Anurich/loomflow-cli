@@ -70,23 +70,60 @@ async def learned_notes_block(
     return "\n".join(lines)
 
 
+async def update_block_if_changed(
+    memory: Any,
+    name: str,
+    content: str,
+    *,
+    user_id: str | None,
+    block_hashes: dict[str, str] | None,
+) -> None:
+    """Write a working block only when its content changed since the
+    last write this session — the one dirty-check both the REPL and
+    :func:`inject_learned_notes` share.
+
+    ``block_hashes`` (caller-owned) is the per-session content-hash
+    map; ``None`` disables the check (always writes). The hash is
+    recorded only AFTER a successful write, so a failed write can't
+    convince a later turn the block is up to date. Rationale: skips a
+    redundant sqlite write + the churn of re-serialising an unchanged
+    block every turn (loomflow's update_block is a plain UPSERT)."""
+    if block_hashes is None:
+        await memory.update_block(name, content, user_id=user_id)
+        return
+    import hashlib
+
+    h = hashlib.sha1(content.encode("utf-8")).hexdigest()
+    if block_hashes.get(name) == h:
+        return
+    await memory.update_block(name, content, user_id=user_id)
+    block_hashes[name] = h
+
+
 async def inject_learned_notes(
     workspace: Any,
     memory: Any,
     prompt: str,
     *,
     user_id: str | None,
+    block_hashes: dict[str, str] | None = None,
 ) -> None:
     """Write this turn's active-recall block into ``memory``.
 
     Best-effort by contract: memory/workspace I/O failing must never
-    kill a turn, so callers can ``await`` this bare."""
+    kill a turn, so callers can ``await`` this bare. ``block_hashes``
+    (optional) enables the shared dirty-check — see
+    :func:`update_block_if_changed`."""
     try:
         body = await learned_notes_block(
             workspace, prompt, user_id=user_id
         )
-        await memory.update_block(
-            "learned_notes", body, user_id=user_id
+        await update_block_if_changed(
+            memory,
+            "learned_notes",
+            body,
+            user_id=user_id,
+            block_hashes=block_hashes,
         )
     except Exception:  # noqa: BLE001 — recall is best-effort
         pass

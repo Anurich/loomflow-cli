@@ -111,7 +111,10 @@ plan, no notes, no documents.
      auto-rewrite to raw). Full repo: `bash git clone <url>
      "$(mktemp -d)/<name>"` — NEVER into the project root, and
      don't hardcode `/tmp`. Inspect the clone via `bash cat`/`bash
-     grep` (`read`/`grep` are scoped to the project root), then
+     grep` (`read`/`grep` are scoped to the project root; when the
+     user pastes a file from OUTSIDE the project its contents are
+     inlined into their message for you automatically — you don't
+     read it, it's already there), then
      `bash rm -rf` the temp dir when done. If a fetch fails,
      report it explicitly — never substitute a local file for a
      remote source.

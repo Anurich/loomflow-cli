@@ -31,7 +31,9 @@ from loomflow.tools import find_tool, ls_tool, read_tool
 from loomflow.workspace import LocalDiskWorkspace
 
 from .code_index import codebase_search_tool
+from .credentials import patient_retry_policy_for
 from .extensions import Extensions, safe_role_name
+from .file_tools import loom_read_tool
 from .grep_tool import enhanced_grep_tool as grep_tool
 from .hooks import attach_tool_hooks
 from .lsp_tools import lsp_tools
@@ -300,7 +302,9 @@ def build_agent(
     # worker roster idle — a prompt nudge alone didn't hold.
     root = project.root
     coordinator_tools: list[object] = [
-        read_tool(root),
+        # Policy-bounded read — reaches user-referenced files outside
+        # the project (grep/find/ls stay project-scoped).
+        loom_read_tool(root),
         grep_tool(root),
         # Semantic search — finds code by MEANING where grep needs the
         # literal string. Embeds in the SAME space (``embedder``) as
@@ -428,6 +432,9 @@ def build_agent(
         auto_compact_summariser=cheap_model,
         effort=effort,
         persist_tool_transcripts=True,
+        # Patient retry schedule on free-tier/litellm providers —
+        # None elsewhere keeps loomflow's default 3 attempts.
+        retry_policy=patient_retry_policy_for(model),
         **_coord_extra,
     )
 
