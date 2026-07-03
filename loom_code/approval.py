@@ -112,6 +112,30 @@ def _read_key_raw(fd: int) -> str:
     return ch.lower()
 
 
+def _read_key_msvcrt() -> str:
+    """Windows equivalent of :func:`_read_key_raw` — one LOGICAL key
+    via ``msvcrt.getwch()`` (already raw + no echo, so no mode
+    setup/teardown is needed).
+
+    Arrow keys arrive as a TWO-event sequence: a ``'\\xe0'`` (or
+    ``'\\x00'`` for some layouts) prefix, then ``'H'`` (up) /
+    ``'P'`` (down). Ctrl-C surfaces as ``'\\x03'`` and maps to the
+    SAFE 'esc', mirroring the POSIX reader."""
+    import msvcrt
+
+    ch = msvcrt.getwch()
+    if ch in ("\r", "\n"):
+        return "enter"
+    if ch == "\x03":  # Ctrl-C
+        return "esc"
+    if ch == "\x1b":
+        return "esc"
+    if ch in ("\xe0", "\x00"):  # extended-key prefix
+        final = msvcrt.getwch()
+        return {"H": "up", "P": "down"}.get(final, "esc")
+    return ch.lower()
+
+
 def _read_key() -> str:
     """Single-key read that manages its own raw-mode window. Prefer
     :func:`_read_key_raw` inside a selector that enters raw mode ONCE
@@ -187,23 +211,54 @@ def _select_option(options: list[tuple[str, str]], default: int = 0) -> str:
             out.write("\r\n")  # explicit CR+LF for raw mode
         out.flush()
 
-    # Enter raw mode ONCE for the whole selector session — no
+    # Pick the platform's key reader + raw-mode strategy.
+    #
+    # POSIX: enter raw mode ONCE for the whole selector session — no
     # per-keypress termios churn, and no cooked-mode gap between keys
     # where type-ahead would echo raw escape bytes onto the prompt.
-    import termios
-    import tty
+    #
+    # Windows: there is NO termios (the bare import crashed /set_model
+    # for pipx users with ModuleNotFoundError). msvcrt.getwch() is
+    # already raw + unbuffered, so no mode management is needed at
+    # all; ``os.system("")`` nudges legacy conhost into processing the
+    # ANSI redraw sequences (Windows Terminal has VT on by default).
+    def _restore() -> None:
+        return None
 
-    fd = sys.stdin.fileno()
+    def _reader() -> str:
+        return _read_key()
+
     try:
-        old = termios.tcgetattr(fd)
-    except Exception:
-        old = None
-    if old is not None:
-        tty.setraw(fd)
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        try:
+            old = termios.tcgetattr(fd)
+        except Exception:
+            old = None
+        if old is not None:
+            tty.setraw(fd)
+
+            def _reader() -> str:
+                return _read_key_raw(fd)
+
+            def _restore() -> None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except ImportError:
+        try:
+            import msvcrt  # noqa: F401 — probe: Windows console?
+            import os
+
+            os.system("")  # enable VT processing on legacy conhost
+            _reader = _read_key_msvcrt
+        except ImportError:
+            pass  # exotic platform → keep the _read_key fallback
+
     try:
         _draw(first=True)
         while True:
-            key = _read_key_raw(fd) if old is not None else _read_key()
+            key = _reader()
             if key == "up":
                 idx = (idx - 1) % n
             elif key == "down":
@@ -221,8 +276,7 @@ def _select_option(options: list[tuple[str, str]], default: int = 0) -> str:
                 continue  # unknown key: ignore, keep waiting
             _draw(first=False)
     finally:
-        if old is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        _restore()
 
 
 def _read_single_key() -> str:
