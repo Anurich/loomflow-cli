@@ -136,11 +136,18 @@ async def test_network_is_blocked_by_default(tmp_root: Path) -> None:
     bash = sandboxed_bash_tool(tmp_root, allow_network=False)
     # A DNS/connect attempt must fail under the no-network policy. Use a
     # short timeout so a (wrongly) reachable network doesn't hang the test.
+    #
+    # The sentinel is CONCATENATED inside the probe ("CONN"+"ECTED"):
+    # Python 3.13+ tracebacks echo the failing SOURCE LINE, so a literal
+    # print("CONNECTED") put the sentinel into the output even when the
+    # connect was correctly refused (observed on the CI macOS runner's
+    # python 3.14). The joined string can only appear if connect()
+    # genuinely succeeded and the print ran.
     out = await bash.fn(
         command=(
             "python3 -c 'import socket,sys; "
             "s=socket.create_connection((\"1.1.1.1\",53),timeout=4); "
-            "print(\"CONNECTED\"); s.close()' 2>&1 || echo BLOCKED"
+            "print(\"CONN\"+\"ECTED\"); s.close()' 2>&1 || echo BLOCKED"
         )
     )
     assert "CONNECTED" not in out, f"network not blocked:\n{out}"
