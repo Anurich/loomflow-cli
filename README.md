@@ -52,11 +52,12 @@ load-bearing — the agent loop, tools, planning, memory — is loomflow.
 ## Install
 
 ```bash
-pipx install git+https://github.com/Anurich/loomflow-cli
+pipx install loom-code
 ```
 
-(`pip install` works too; `pipx` keeps CLI tools in their own venvs.
-No pipx? `brew install pipx` or `python -m pip install --user pipx`.)
+(`pip install loom-code` works too; `pipx` keeps CLI tools in their
+own venvs. No pipx? `brew install pipx` or
+`python -m pip install --user pipx`.)
 
 Requires Python 3.11+. To update: `pipx upgrade loom-code`.
 
