@@ -427,6 +427,12 @@ _COMMAND_DEFS: list[tuple[str, str, str]] = [
         "resume the last session — or `/resume pick` to choose one",
         "Session",
     ),
+    (
+        "/fork",
+        "branch this session — explore a tangent without touching it",
+        "Session",
+    ),
+    ("/tree", "show the session tree (branches + forks)", "Session"),
     ("/export", "save this conversation to a markdown file", "Session"),
     (
         "/set_continue_cap",
@@ -2307,6 +2313,10 @@ class Repl:
             await self._handle_set_web()
         elif cmd == "/resume":
             await self._handle_resume(arg)
+        elif cmd == "/fork":
+            self._handle_fork()
+        elif cmd == "/tree":
+            self._handle_tree()
         elif cmd == "/export":
             self._handle_export()
         elif cmd == "/set_continue_cap":
@@ -3642,6 +3652,96 @@ class Repl:
         """
         return self.project.root / ".loom" / "last_session.txt"
 
+    def _handle_fork(self) -> None:
+        """``/fork`` — branch the session HERE (pi-style session
+        tree). The fork inherits the full history up to this point
+        (episodes copied under a fresh session_id, so loomflow
+        rehydrates them); the parent stays exactly as it was —
+        ``/resume <its id>`` returns to it, ``/tree`` shows the
+        graph. Use it to chase a tangent without polluting the main
+        thread's context."""
+        old = self.session_id
+        new = new_id()
+        db = self.project.root / LOOM_DIR / "memory.db"
+        copied = _fork_episodes(db, old, new)
+        self.session_id = new
+        # Record the fork edge immediately (don't wait for the next
+        # turn's pointer save — /tree should show it right away) and
+        # mark it recorded so _save_session_pointer doesn't duplicate.
+        try:
+            import datetime as _dt
+
+            record = {
+                "session_id": new,
+                "ts": _dt.datetime.now(_dt.UTC).isoformat(
+                    timespec="seconds"
+                ),
+                "hint": f"fork of {old[:8]}",
+                "model": str(self.model),
+                "parent": old,
+            }
+            loom = self.project.root / LOOM_DIR
+            loom.mkdir(exist_ok=True)
+            with (loom / "sessions.jsonl").open(
+                "a", encoding="utf-8"
+            ) as fh:
+                fh.write(json.dumps(record) + "\n")
+            self._recorded_session_id = new
+            (loom / "last_session.txt").write_text(
+                new + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+        console.print(
+            f"  [green]✓[/green] forked [cyan]{old[:8]}…[/cyan] → "
+            f"[cyan]{new[:8]}…[/cyan] ({copied} turn"
+            f"{'s' if copied != 1 else ''} inherited)"
+        )
+        console.print(
+            "  [dim]you're on the fork now — the original is "
+            f"untouched. /tree to see branches, /resume {old[:8]} "
+            "to go back.[/dim]"
+        )
+
+    def _handle_tree(self) -> None:
+        """``/tree`` — render the session graph for this project:
+        every recorded session, forks indented under their parent,
+        current position marked."""
+        path = self.project.root / LOOM_DIR / "sessions.jsonl"
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        try:
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                sid = rec.get("session_id")
+                if sid and sid not in seen:
+                    seen.add(sid)
+                    records.append(rec)
+        except OSError:
+            pass
+        # The live session may not be recorded yet (no turn taken) —
+        # show it anyway so /tree is never confusingly empty.
+        if self.session_id not in seen:
+            records.append(
+                {
+                    "session_id": self.session_id,
+                    "ts": "",
+                    "hint": "(current — no turns yet)",
+                }
+            )
+        lines = _render_session_tree(records, self.session_id)
+        console.print()
+        console.print("  [bold]session tree[/bold]")
+        for line in lines:
+            console.print(f"  {line}", markup=False, style="dim")
+        console.print(
+            "  [dim]/fork branches here · /resume <id-prefix> jumps "
+            "to any node[/dim]"
+        )
+
     def _save_session_pointer(self) -> None:
         """Write the current ``session_id`` to the project's
         ``.loom/last_session.txt``. Best-effort — a write failure
@@ -4201,6 +4301,104 @@ def _migrate_legacy_per_route_episodes(
             return int(migrated)
     except (sqlite3.Error, OSError):
         return 0
+
+
+def _fork_episodes(
+    db_path: Path, old_session_id: str, new_session_id: str
+) -> int:
+    """Copy every episode of ``old_session_id`` (plus tool
+    transcripts) under ``new_session_id`` — the storage half of
+    ``/fork``. loomflow rehydrates by session_id, so after the copy
+    the fork "remembers" everything up to the fork point while the
+    parent stays untouched (pi-style session branching, on the same
+    sqlite the rest of loom-code already manages directly).
+
+    Returns episodes copied; 0 on any failure — a failed fork must
+    never block the REPL (the fork still works go-forward, it just
+    starts blank)."""
+    if not db_path.is_file():
+        return 0
+    try:
+        import sqlite3
+        with sqlite3.connect(str(db_path)) as conn:
+            cur = conn.cursor()
+            rows = cur.execute(
+                "SELECT id, user_id, occurred_at, input, output, "
+                "embedding FROM episodes WHERE session_id = ? "
+                "ORDER BY occurred_at",
+                (old_session_id,),
+            ).fetchall()
+            copied = 0
+            for eid, uid, at, inp, outp, emb in rows:
+                new_eid = f"{eid}_fork_{new_session_id[-8:]}"
+                cur.execute(
+                    "INSERT OR IGNORE INTO episodes "
+                    "(id, session_id, user_id, occurred_at, input, "
+                    "output, embedding) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        new_eid,
+                        new_session_id,
+                        uid,
+                        at,
+                        inp,
+                        outp,
+                        emb,
+                    ),
+                )
+                copied += cur.rowcount or 0
+                cur.execute(
+                    "INSERT OR IGNORE INTO episode_tool_transcripts "
+                    "(episode_id, sequence, message_json) "
+                    "SELECT ?, sequence, message_json "
+                    "FROM episode_tool_transcripts "
+                    "WHERE episode_id = ?",
+                    (new_eid, eid),
+                )
+            conn.commit()
+            return copied
+    except (sqlite3.Error, OSError):
+        return 0
+
+
+def _render_session_tree(
+    records: list[dict[str, Any]], current_session_id: str
+) -> list[str]:
+    """ASCII tree over the session records (each ``{session_id, ts,
+    hint, parent?}``). Roots are sessions without a recorded parent
+    (or whose parent predates the log); children indent under their
+    parent, oldest first. The current session is marked. Pure —
+    testable without a REPL."""
+    by_id = {r["session_id"]: r for r in records if r.get("session_id")}
+    children: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for r in records:
+        sid = r.get("session_id")
+        if not sid:
+            continue
+        parent = r.get("parent")
+        if parent and parent in by_id:
+            children.setdefault(parent, []).append(sid)
+        else:
+            roots.append(sid)
+
+    lines: list[str] = []
+
+    def _walk(sid: str, depth: int) -> None:
+        r = by_id[sid]
+        marker = "●" if sid == current_session_id else "○"
+        hint = _truncate_one_line(str(r.get("hint") or ""), 60)
+        ts = str(r.get("ts") or "")[:16].replace("T", " ")
+        indent = "  " * depth + ("└─ " if depth else "")
+        you = "  ← you are here" if sid == current_session_id else ""
+        lines.append(
+            f"{indent}{marker} {sid[:8]}…  {ts}  {hint}{you}"
+        )
+        for child in children.get(sid, []):
+            _walk(child, depth + 1)
+
+    for root in roots:
+        _walk(root, 0)
+    return lines
 
 
 def _scrub_prose_from_tool_transcripts(
