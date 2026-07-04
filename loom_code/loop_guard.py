@@ -42,7 +42,9 @@ _EDIT_TOOLS = frozenset({"edit", "multi_edit", "write"})
 # "binary not found" shapes across shells/OSes. Group 1 (when present)
 # is the binary name.
 _NOT_FOUND_PATTERNS = (
-    re.compile(r"(?:bash|sh|zsh):(?: line \d+:)? ([^\s:]+): command not found"),
+    re.compile(
+        r"(?:bash|sh|zsh):(?: line \d+:)? ([^\s:]+): command not found"
+    ),
     re.compile(r"^([^\s:]+): command not found", re.MULTILINE),
     re.compile(r"'([^']+)' is not recognized as an internal or external"),
     re.compile(r"([^\s:]+): No such file or directory", re.MULTILINE),
