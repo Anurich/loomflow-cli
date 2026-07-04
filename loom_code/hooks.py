@@ -76,6 +76,31 @@ class HookOutcome:
     updated_input: dict[str, Any] | None = None
 
 
+# Strong references to in-flight background hook tasks — asyncio only
+# keeps weak refs to tasks, so without this set a fire-and-forget hook
+# could be garbage-collected mid-run. Done-callback discards.
+_background_tasks: set[Any] = set()
+
+
+def _fire_and_forget(
+    spec: HookSpec, payload: dict[str, Any], *, cwd: Path
+) -> None:
+    """Schedule ``_run`` without awaiting it (``background = true``
+    hooks): the turn continues immediately; exit code and stdout are
+    ignored by design. Falls back to a silent no-op when there's no
+    running loop (sync callers in tests)."""
+    import asyncio
+
+    try:
+        task = asyncio.get_running_loop().create_task(
+            _run(spec, payload, cwd=cwd)
+        )
+    except RuntimeError:
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 async def _run(
     spec: HookSpec, payload: dict[str, Any], *, cwd: Path
 ) -> HookOutcome:
@@ -170,6 +195,11 @@ def _make_pre_tool_hook(spec: HookSpec, *, cwd: Path) -> Any:
             "tool_input": dict(call.args),
             "cwd": str(cwd),
         }
+        if spec.background:
+            # Fire-and-forget: cannot block or rewrite the call —
+            # documented contract of ``background = true``.
+            _fire_and_forget(spec, payload, cwd=cwd)
+            return None
         outcome = await _run(spec, payload, cwd=cwd)
         if outcome.updated_input is not None:
             call.args.clear()
@@ -202,6 +232,9 @@ def _make_post_tool_hook(spec: HookSpec, *, cwd: Path) -> Any:
             "ok": result.ok,
             "cwd": str(cwd),
         }
+        if spec.background:
+            _fire_and_forget(spec, payload, cwd=cwd)
+            return
         await _run(spec, payload, cwd=cwd)
 
     return hook
@@ -268,6 +301,10 @@ async def run_repl_hooks(
         payload: dict[str, Any] = {"hook_event_name": event, "cwd": str(cwd)}
         if prompt is not None:
             payload["prompt"] = prompt
+        if spec.background:
+            # Fire-and-forget: can't block the turn or add context.
+            _fire_and_forget(spec, payload, cwd=cwd)
+            continue
         outcome = await _run(spec, payload, cwd=cwd)
         if outcome.block:
             out.blocked = True

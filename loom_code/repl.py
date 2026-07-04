@@ -3160,7 +3160,12 @@ class Repl:
         """The shared compaction body: summarise, land the summary as
         a working block, reset the thread. Callers gate on
         ``_compact_exchanges`` being non-empty and print their own
-        lead-in line."""
+        lead-in line.
+
+        Fires the ``PreCompact`` / ``PostCompact`` REPL hooks around
+        the fold (auto AND manual /compact both route here), so users
+        can e.g. export the full transcript before it's summarised."""
+        await self._fire_repl_hooks("PreCompact")
         try:
             summary = await self._compactor.compact(
                 self._compact_exchanges
@@ -3203,6 +3208,7 @@ class Repl:
             f"~{after:,}-token summary (kept in every future prompt); "
             "fresh conversation thread.[/dim]"
         )
+        await self._fire_repl_hooks("PostCompact")
 
     def _handle_set_continue_cap(self, arg: str) -> None:
         """``/set_continue_cap [N]`` — view or set the auto-continue cap.

@@ -67,7 +67,17 @@ USER_DIRNAME = ".loom-code"
 TOOL_HOOK_EVENTS = frozenset({"PreToolUse", "PostToolUse"})
 STOP_HOOK_EVENTS = frozenset({"Stop"})
 REPL_HOOK_EVENTS = frozenset(
-    {"UserPromptSubmit", "SessionStart", "SessionEnd"}
+    {
+        "UserPromptSubmit",
+        "SessionStart",
+        "SessionEnd",
+        # Compaction lifecycle — fired by the REPL around _compact_now
+        # (auto AND manual /compact). PreCompact sees the session
+        # before history is folded; PostCompact after the summary
+        # landed and the thread reset. Claude-Code-parity events.
+        "PreCompact",
+        "PostCompact",
+    }
 )
 KNOWN_HOOK_EVENTS = TOOL_HOOK_EVENTS | STOP_HOOK_EVENTS | REPL_HOOK_EVENTS
 
@@ -154,6 +164,11 @@ class HookSpec:
     matcher: str = "*"
     timeout: float = 60.0
     source: str = "project"  # "user" | "project"
+    # ``background = true`` in the TOML: fire-and-forget. The hook is
+    # scheduled and the turn continues immediately — its exit code and
+    # stdout are IGNORED, so a background PreToolUse can neither block
+    # nor rewrite the call. For notifications, loggers, metrics.
+    background: bool = False
 
 
 @dataclass(frozen=True)
@@ -432,6 +447,7 @@ def _discover_hooks(base: Path, source: str) -> list[HookSpec]:
             timeout = float(entry.get("timeout", 60.0))
         except (TypeError, ValueError):
             timeout = 60.0
+        background = bool(entry.get("background", False))
         out.append(
             HookSpec(
                 event=event,
@@ -439,6 +455,7 @@ def _discover_hooks(base: Path, source: str) -> list[HookSpec]:
                 matcher=matcher,
                 timeout=timeout,
                 source=source,
+                background=background,
             )
         )
     return out

@@ -366,3 +366,64 @@ def test_is_trusted_empty_hooks_is_true(tmp_path: Path) -> None:
     assert is_trusted(tmp_path, [], trust_store=tmp_path / "t.json")
     record_trust(tmp_path, [], trust_store=tmp_path / "t.json")
     assert not (tmp_path / "t.json").exists()
+
+
+# ---- background (fire-and-forget) hooks ------------------------------
+
+
+async def test_background_repl_hook_does_not_block_or_inject(
+    tmp_path: Path,
+) -> None:
+    """background=true: the hook runs (side effect lands) but its
+    stdout/exit code are ignored — no context, no block, no wait."""
+    import anyio
+
+    marker = tmp_path / "bg-ran"
+    specs = [
+        HookSpec(
+            event="SessionEnd",
+            # exit 2 + stdout would BLOCK/inject if run foreground —
+            # background must ignore both.
+            command=f"touch {marker} && echo ctx && exit 2",
+            background=True,
+        )
+    ]
+    result = await run_repl_hooks(specs, "SessionEnd", cwd=tmp_path)
+    assert not result.blocked
+    assert not result.contexts
+    # the task was scheduled — give it a beat to actually run
+    for _ in range(80):
+        if marker.exists():
+            break
+        await anyio.sleep(0.05)
+    assert marker.exists()
+
+
+async def test_precompact_event_accepted(tmp_path: Path) -> None:
+    """PreCompact/PostCompact are valid REPL events end-to-end
+    (discovery accepts them; run_repl_hooks fires them)."""
+    marker = tmp_path / "compact-hook"
+    specs = [
+        HookSpec(event="PreCompact", command=f"touch {marker}")
+    ]
+    await run_repl_hooks(specs, "PreCompact", cwd=tmp_path)
+    assert marker.exists()
+
+
+def test_discovery_parses_background_and_compact_events(
+    tmp_path: Path,
+) -> None:
+    from loom_code.extensions import discover
+
+    user = tmp_path / "user"
+    user.mkdir()
+    (user / "settings.toml").write_text(
+        '[[hooks]]\nevent = "PreCompact"\ncommand = "echo hi"\n'
+        "background = true\n"
+    )
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    ext = discover(proj, user_dir=user)
+    (spec,) = ext.hook_specs
+    assert spec.event == "PreCompact"
+    assert spec.background is True
