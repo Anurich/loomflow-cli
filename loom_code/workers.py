@@ -320,6 +320,8 @@ def _build_coder(
         )
     else:
         bash = bash_tool(root, timeout=300.0)
+    from .background import background_tools
+
     static_tools: list[Any] = [
         # Policy-bounded read (loom_read_tool): reaches user-referenced
         # files outside the project too, matching edit/multi_edit; a
@@ -332,6 +334,10 @@ def _build_coder(
         find_tool(root),
         ls_tool(root),
         bash,
+        # Long-running processes (dev servers, watchers, big builds):
+        # bash_background / bash_output / bash_kill. bash_background is
+        # destructive → same approval gate + rules as bash.
+        *background_tools(root),
         web_fetch_tool(),
         # LSP navigation (jedi) — the writer locates the symbol to
         # change by resolution, not grep, before editing. Read-only.

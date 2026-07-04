@@ -60,7 +60,7 @@ def _is_danger_command(tool: str, args: dict[str, Any]) -> str | None:
     past the check. False positives are acceptable here: an extra
     confirmation on a benign ``git reset --hard`` to a known-safe ref
     costs one keypress; a missed ``rm -rf .git`` costs the repo."""
-    if tool != "bash":
+    if tool not in ("bash", "bash_background"):
         return None
     cmd = str(args.get("command", "")).lower()
     norm = " ".join(cmd.split())

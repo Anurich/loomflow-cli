@@ -73,10 +73,11 @@ class Rules:
 def call_target(tool: str, args: dict[str, Any]) -> str:
     """The string a rule matches against: ``tool(target)``.
 
-    ``target`` is the command for bash, the path for edits/writes, so a
-    user writes intuitive patterns: ``bash(pytest*)``, ``edit(*.env)``.
+    ``target`` is the command for bash (and bash_background — same
+    rules bite both), the path for edits/writes, so a user writes
+    intuitive patterns: ``bash(pytest*)``, ``edit(*.env)``.
     """
-    if tool == "bash":
+    if tool in ("bash", "bash_background"):
         target = str(args.get("command", "")).strip()
     else:
         target = str(args.get("path", "")).strip()

@@ -866,6 +866,17 @@ class Repl:
         finally:
             await self._aclose_mcp()
             await self._aclose_browsers()
+            # Background processes the agent started (dev servers,
+            # watchers) die with the session — no orphans. atexit
+            # backstops a hard crash; this is the friendly path.
+            from . import background
+
+            killed = background.kill_all()
+            if killed:
+                console.print(
+                    f"  [dim]stopped {killed} background process"
+                    f"{'es' if killed != 1 else ''}[/dim]"
+                )
 
     async def _aclose_mcp(self) -> None:
         """Best-effort teardown of the MCP registry's sessions. Never
