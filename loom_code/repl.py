@@ -376,7 +376,8 @@ _COMMAND_DEFS: list[tuple[str, str, str]] = [
     ("/plan", "show the current plan, or start one", "Coding"),
     (
         "/goal",
-        "work until a condition is met (/goal make all tests pass)",
+        "work until a condition is met — durable across restarts "
+        "(/goal resume)",
         "Coding",
     ),
     ("/undo", "restore the working tree to the last checkpoint", "Coding"),
@@ -946,6 +947,15 @@ class Repl:
                 "  [dim]• [cyan]/resume[/cyan]        pick up "
                 "the last session for this project (rehydrates "
                 "prior turns)[/dim]"
+            )
+        # An unfinished durable goal survives restarts — surface it
+        # so the user knows one is waiting (codex-parity /goal).
+        _goal = _load_goal_state(self.project.root / LOOM_DIR)
+        if _goal is not None:
+            console.print(
+                f"  [dim]🎯 unfinished goal: "
+                f"{_truncate_one_line(str(_goal['task']), 60)} — "
+                "[cyan]/goal resume[/cyan] continues it[/dim]"
             )
         self._print_extensions_banner()
         console.print()
@@ -2712,18 +2722,47 @@ class Repl:
         ``/goal <task> :: <condition>`` — everything before ``::`` is
         what to do, everything after is what the checker tests."""
         arg = arg.strip()
+        loom_dir = self.project.root / LOOM_DIR
         if not arg:
             console.print(
                 "  [yellow]usage: /goal <task> — e.g. "
                 "/goal make all tests pass[/yellow]\n"
                 "  [dim]optional explicit condition: "
-                "/goal <task> :: <condition>[/dim]"
+                "/goal <task> :: <condition> · resume an unfinished "
+                "goal: /goal resume[/dim]"
             )
             return
 
-        # Split the optional "task :: condition" form. Default: the task
-        # is also the condition (the framework's str happy-path).
-        if "::" in arg:
+        if arg.lower() == "resume":
+            # Durable goals: pick up where a prior process left off.
+            state = _load_goal_state(loom_dir)
+            if state is None:
+                console.print(
+                    "  [dim]no unfinished goal recorded for this "
+                    "project.[/dim]"
+                )
+                return
+            task = str(state["task"])
+            condition = str(state.get("condition") or task)
+            prior_sid = str(state.get("session_id") or "")
+            if prior_sid and prior_sid != self.session_id:
+                # Rejoin the goal's conversation so the agent
+                # remembers what it already tried (loomflow
+                # rehydrates by session_id).
+                self.session_id = prior_sid
+                self._compact_tokens = 0
+                self._compact_exchanges.clear()
+                console.print(
+                    f"  [dim]rejoined goal session "
+                    f"{prior_sid[:8]}…[/dim]"
+                )
+            console.print(
+                f"  [dim]resuming goal from "
+                f"{str(state.get('started_at') or '')[:16]}[/dim]"
+            )
+        # Split the optional "task :: condition" form. Default: the
+        # task is also the condition (the framework's str happy-path).
+        elif "::" in arg:
             task, _, condition = arg.partition("::")
             task, condition = task.strip(), condition.strip()
             if not task or not condition:
@@ -2734,6 +2773,16 @@ class Repl:
                 return
         else:
             task = condition = arg
+
+        # Persist BEFORE running: a crash, Ctrl-C, or guardrail stop
+        # leaves the goal on disk, resumable across restarts.
+        _save_goal_state(
+            loom_dir,
+            task=task,
+            condition=condition,
+            session_id=self.session_id,
+            model=str(self.model),
+        )
 
         # Cheap same-provider checker (Haiku / gpt-4.1-mini); falls back
         # to the main model inside the framework when no cheap key.
@@ -2808,14 +2857,18 @@ class Repl:
             }.get(why, why)
             console.print(
                 f"  [yellow]⚠ goal not confirmed — {pretty}.[/yellow] "
-                "[dim]Review the work above; re-run /goal to continue.[/dim]"
+                "[dim]Review the work above; /goal resume continues "
+                "it — even after a restart.[/dim]"
             )
         elif reason == "stop_hook_iterations_exhausted":
             console.print(
                 "  [yellow]⚠ goal not confirmed — auto-continue cap "
-                "reached.[/yellow]"
+                "reached.[/yellow] [dim]/goal resume continues it — "
+                "even after a restart.[/dim]"
             )
         else:
+            # Confirmed met — retire the durable record.
+            _clear_goal_state(loom_dir)
             console.print(
                 "  [green]✓ goal met[/green] — the checker confirmed the "
                 "condition."
@@ -4368,6 +4421,67 @@ def _migrate_legacy_per_route_episodes(
             return int(migrated)
     except (sqlite3.Error, OSError):
         return 0
+
+
+def _save_goal_state(
+    loom_dir: Path,
+    *,
+    task: str,
+    condition: str,
+    session_id: str,
+    model: str,
+) -> None:
+    """Persist the active goal to ``.loom/goal.json`` so it survives
+    restarts (codex-parity: /goal is a durable, multi-day workflow,
+    not a per-process one). Best-effort — persistence failing must
+    never block the goal itself."""
+    try:
+        import datetime as _dt
+
+        loom_dir.mkdir(exist_ok=True)
+        (loom_dir / "goal.json").write_text(
+            json.dumps(
+                {
+                    "task": task,
+                    "condition": condition,
+                    "session_id": session_id,
+                    "model": model,
+                    "status": "active",
+                    "started_at": _dt.datetime.now(
+                        _dt.UTC
+                    ).isoformat(timespec="seconds"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _load_goal_state(loom_dir: Path) -> dict[str, Any] | None:
+    """The persisted goal, or None when absent/done/corrupt."""
+    try:
+        data = json.loads(
+            (loom_dir / "goal.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("status") != "active":
+        return None
+    if not str(data.get("task") or "").strip():
+        return None
+    return data
+
+
+def _clear_goal_state(loom_dir: Path) -> None:
+    """Mark the goal done (file removed). Best-effort."""
+    try:
+        (loom_dir / "goal.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _fork_episodes(
