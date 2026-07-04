@@ -462,22 +462,27 @@ _COMMAND_DEFS: list[tuple[str, str, str]] = [
 _HELP_GROUP_ORDER = ("Coding", "Isolate", "Model", "Session")
 
 
-def _render_help() -> str:
+def _render_help(
+    extra: list[tuple[str, str, str]] | None = None,
+) -> str:
     """Build the /help text from :data:`_COMMAND_DEFS` so it can never
     drift from the commands the REPL actually accepts (the old
     hand-maintained blob had silently lost a third of them). Commands
-    cluster under their group header, aligned on the description."""
+    cluster under their group header, aligned on the description.
+    ``extra`` appends per-instance entries (custom markdown commands)
+    in the same (cmd, desc, group) shape."""
     from collections import defaultdict
 
+    defs = [*_COMMAND_DEFS, *(extra or [])]
     by_group: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    for cmd, desc, group in _COMMAND_DEFS:
+    for cmd, desc, group in defs:
         by_group[group].append((cmd, desc))
     order = [g for g in _HELP_GROUP_ORDER if g in by_group]
     order += [g for g in by_group if g not in _HELP_GROUP_ORDER]
 
     # Align descriptions on the widest command across ALL groups so the
     # columns line up down the whole list, not just within a group.
-    width = max(len(cmd) for cmd, _, _ in _COMMAND_DEFS)
+    width = max(len(cmd) for cmd, _, _ in defs)
     lines = ["[bold]loom-code commands[/bold]"]
     for group in order:
         lines.append(f"\n  [dim]{group}[/dim]")
@@ -505,8 +510,15 @@ class _SlashCompleter(Completer):
     A normal task message with neither trigger stays clean, no popup.
     """
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        extra_commands: list[tuple[str, str]] | None = None,
+    ) -> None:
         self._root = root
+        # User/project custom slash commands — [(cmd, desc)], shown
+        # in the same menu as the builtins.
+        self._extra_commands = list(extra_commands or [])
         # Cached (rel-path list, monotonic timestamp). complete_while_
         # typing fires this on EVERY keystroke, so we walk the tree at
         # most once per _FILE_CACHE_TTL and filter the cached list per
@@ -520,7 +532,10 @@ class _SlashCompleter(Completer):
     ):
         text = document.text_before_cursor
         if text.startswith("/"):
-            for cmd, desc, _group in _COMMAND_DEFS:
+            builtin = [
+                (cmd, desc) for cmd, desc, _group in _COMMAND_DEFS
+            ]
+            for cmd, desc in (*builtin, *self._extra_commands):
                 if cmd.startswith(text):
                     yield Completion(
                         cmd,
@@ -685,6 +700,12 @@ class Repl:
         self._extensions = self._consume_trusted_extensions(
             discover_extensions(project.root)
         )
+        # Custom slash commands (markdown prompt templates from
+        # ~/.loom-code/commands/ + <repo>/.loom/commands/). Keyed by
+        # name for dispatch; builtins always win a clash there.
+        self._custom_commands = {
+            c.name: c for c in self._extensions.command_specs
+        }
         # /computer browser-control mode. When on, the agent gets the
         # Playwright MCP server (browser_navigate/snapshot/click/type …)
         # + a browser-oriented prompt. Off by default — toggled by the
@@ -816,7 +837,13 @@ class Repl:
         # the visible prompt stays readable; expand_pastes() restores
         # the full content before the line goes to the agent.
         self._prompt_session: PromptSession[str] = PromptSession(
-            completer=_SlashCompleter(root=project.root),
+            completer=_SlashCompleter(
+                root=project.root,
+                extra_commands=[
+                    (f"/{c.name}", c.description)
+                    for c in self._extensions.command_specs
+                ],
+            ),
             complete_while_typing=True,
             key_bindings=build_paste_keybindings(),
         )
@@ -994,13 +1021,29 @@ class Repl:
                         console.print("[dim]bye[/dim]")
                         return 0
                     continue
-                if "/" not in first[1:]:
+                custom = self._custom_commands.get(first[1:])
+                if custom is not None:
+                    # A user-authored markdown command: expand the
+                    # template and FALL THROUGH — the result runs as
+                    # an ordinary task turn (same approval gate).
+                    from .extensions import expand_command_template
+
+                    line = expand_command_template(
+                        custom.template,
+                        line[len(first):].strip(),
+                    )
+                    console.print(
+                        f"  [dim]{first} → running its prompt "
+                        f"({custom.source} command)[/dim]"
+                    )
+                elif "/" not in first[1:]:
                     console.print(
                         f"  unknown command {first} — /help for "
                         "the list"
                     )
                     continue
-                # Falls through: a path-shaped line is a task.
+                # Falls through: a path-shaped line (or an expanded
+                # custom command) is a task.
 
             # ``!cmd`` — run a shell command inline, right now, without
             # spending a model turn. The output is echoed AND stashed so
@@ -2135,7 +2178,14 @@ class Repl:
         if cmd in ("/exit", "/quit"):
             return False
         if cmd == "/help":
-            console.print(_render_help())
+            console.print(
+                _render_help(
+                    extra=[
+                        (f"/{c.name}", c.description, "Custom")
+                        for c in self._extensions.command_specs
+                    ]
+                )
+            )
         elif cmd == "/init-loom":
             from .rules import init_agents_md
 

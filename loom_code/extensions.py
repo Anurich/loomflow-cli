@@ -98,6 +98,45 @@ class AgentSpec:
 
 
 @dataclass(frozen=True)
+class CommandSpec:
+    """A user-authored slash command parsed from
+    ``<scope>/commands/<name>.md`` — a reusable prompt template the
+    user invokes as ``/<name> [args]`` (Claude-Code-style custom
+    commands).
+
+    The markdown body is the template; ``$ARGUMENTS`` receives the
+    whole argument string and ``$1``–``$9`` the whitespace-split
+    positionals. Frontmatter carries an optional ``description`` for
+    /help + autocomplete. Builtin commands always win a name clash at
+    dispatch (a repo must not be able to shadow ``/undo``), and the
+    expansion runs as an ORDINARY task turn — same approval gate,
+    same everything — so a hostile template can't do anything the
+    user couldn't type themselves.
+    """
+
+    name: str
+    description: str
+    template: str
+    source: str = "project"  # "user" | "project"
+    path: Path | None = None
+
+
+def expand_command_template(template: str, args: str) -> str:
+    """Substitute ``$1``–``$9`` and ``$ARGUMENTS`` into ``template``.
+
+    Positionals first, ``$ARGUMENTS`` last — so a ``$2`` inside the
+    user's OWN argument text survives verbatim instead of being
+    re-substituted. Missing positionals become empty strings."""
+    parts = args.split()
+    out = template
+    for i in range(1, 10):
+        out = out.replace(
+            f"${i}", parts[i - 1] if i - 1 < len(parts) else ""
+        )
+    return out.replace("$ARGUMENTS", args)
+
+
+@dataclass(frozen=True)
 class HookSpec:
     """A hook parsed from a ``[[hooks]]`` entry in ``settings.toml``.
 
@@ -147,6 +186,7 @@ class Extensions:
     skill_paths: list[Path] = field(default_factory=list)
     agent_specs: list[AgentSpec] = field(default_factory=list)
     hook_specs: list[HookSpec] = field(default_factory=list)
+    command_specs: list[CommandSpec] = field(default_factory=list)
     # MCP servers declared in settings.toml [[mcp]] blocks, each tagged
     # with its source ("user" | "project") so the trust gate can drop
     # project-declared servers from an untrusted repo — same posture as
@@ -160,6 +200,7 @@ class Extensions:
             or self.agent_specs
             or self.hook_specs
             or self.mcp_specs
+            or self.command_specs
         )
 
 
@@ -220,6 +261,14 @@ def discover(
     ext.hook_specs = _discover_hooks(user_base, "user") + _discover_hooks(
         project_base, "project"
     )
+    # Custom slash commands — project wins on duplicate name (same
+    # rule as agents); builtins always win at dispatch regardless.
+    merged_cmds: dict[str, CommandSpec] = {}
+    for cspec in _discover_commands(user_base, "user"):
+        merged_cmds[cspec.name] = cspec
+    for cspec in _discover_commands(project_base, "project"):
+        merged_cmds[cspec.name] = cspec
+    ext.command_specs = list(merged_cmds.values())
     # MCP servers — additive across scopes like hooks. A project's
     # [[mcp]] servers ride the same trust gate (see loom_code.trust).
     ext.mcp_specs = _discover_mcp(user_base, "user") + _discover_mcp(
@@ -244,6 +293,47 @@ def _discover_skill_dirs(base: Path) -> list[Path]:
     for entry in sorted(skills_dir.iterdir()):
         if entry.is_dir() and (entry / "SKILL.md").is_file():
             out.append(entry)
+    return out
+
+
+# ---- commands -------------------------------------------------------
+
+
+def _discover_commands(base: Path, source: str) -> list[CommandSpec]:
+    """Parse every ``<base>/commands/*.md`` into a :class:`CommandSpec`.
+
+    The filename stem (lowercased) is the command name — hyphens are
+    fine (``review-pr.md`` → ``/review-pr``). A file with an empty
+    body is skipped (a command with no template does nothing).
+    Unreadable/malformed files are skipped, never fatal."""
+    commands_dir = base / "commands"
+    if not commands_dir.is_dir():
+        return []
+    out: list[CommandSpec] = []
+    for path in sorted(commands_dir.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, body = _parse_frontmatter(text)
+        body = body.strip()
+        if not body:
+            continue
+        name = path.stem.strip().lower()
+        if not name:
+            continue
+        description = str(
+            fm.get("description") or body.splitlines()[0]
+        ).strip()[:80]
+        out.append(
+            CommandSpec(
+                name=name,
+                description=description,
+                template=body,
+                source=source,
+                path=path,
+            )
+        )
     return out
 
 
