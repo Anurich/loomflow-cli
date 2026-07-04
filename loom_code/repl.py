@@ -1816,6 +1816,13 @@ class Repl:
         a generic "thinking..." between events. The point is to
         avoid the long blank stretches the old "drop on first event"
         scheme produced in Supervisor mode."""
+        # Fresh doom-loop counters for this turn (the guard's post-tool
+        # hook steers the model when it re-edits one file or re-runs
+        # one failing command; counts are per-turn by design).
+        from . import loop_guard
+
+        loop_guard.reset()
+
         status = console.status(
             "[dim]loomflowing...[/dim]", spinner="dots"
         )

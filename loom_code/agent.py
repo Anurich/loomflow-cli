@@ -442,10 +442,15 @@ def build_agent(
     # coordinator only reads, but a user PreToolUse hook can match
     # ``read``/``grep`` too, so keep it in the set; the workers (which
     # write + run bash) are the main target. No-op when none declared.
+    # The loop guard (doom-loop + missing-binary steering) rides the
+    # same registries — it's a native post hook, not a shell spec.
+    from . import loop_guard
+
     for tool_agent in (coordinator, *workers.values()):
         attach_tool_hooks(
             tool_agent, extensions.hook_specs, cwd=project.root
         )
+        loop_guard.attach(tool_agent)
 
     # Stash the MCP registry on the coordinator so the REPL / sidecar can
     # tear it down (``await coordinator._mcp_registry.aclose()``) on exit
@@ -534,6 +539,9 @@ def build_solo_agent(
         from loomflow.tools import web_tool
         agent.add_tool(web_tool(backend=web_backend))  # type: ignore[arg-type]
     attach_tool_hooks(agent, extensions.hook_specs, cwd=project.root)
+    from . import loop_guard
+
+    loop_guard.attach(agent)
     return agent
 
 
