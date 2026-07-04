@@ -407,6 +407,16 @@ _COMMAND_DEFS: list[tuple[str, str, str]] = [
     # Session — state, cost, and history for the whole run.
     ("/cost", "session cost + token totals", "Session"),
     (
+        "/context",
+        "what's in the model's context right now (tokens + %)",
+        "Session",
+    ),
+    (
+        "/prompt",
+        "dump the full system prompt + injected blocks",
+        "Session",
+    ),
+    (
         "/resume",
         "resume the last session — or `/resume pick` to choose one",
         "Session",
@@ -723,6 +733,11 @@ class Repl:
         self._turn_in = 0
         self._turn_out = 0
         self._turn_cost = 0.0
+        # Context-window cache for the ctx% readout — resolved once
+        # per model string (context_window_for warns on unknown
+        # models; recomputing every turn would spam that warning).
+        self._ctx_window = 0
+        self._ctx_window_model: str | None = None
         # Framework-event counters (loomflow 0.10.13+):
         # ``total_summaries`` ticks each time
         # ``tool_result_summarized`` fires (per-tool-result LLM
@@ -1970,21 +1985,32 @@ class Repl:
         await self._maybe_compact()
 
     def _print_turn_summary(self) -> None:
-        """Full-width rule + this turn's tokens / cost, right-aligned —
-        the horizontal separator between responses the user asked for.
-        Zero cost renders as ``free`` (free-tier models) instead of a
-        noisy ``$0.0000``."""
+        """Full-width rule + this turn's tokens / cost / context
+        occupancy, right-aligned — the horizontal separator between
+        responses. Zero cost renders as ``free`` (free-tier models)
+        instead of a noisy ``$0.0000``. The ``ctx`` figure is the
+        context high-water mark as a % of the model's window — ambient
+        context observability, so the user never wonders how close
+        they are to compaction."""
+        from .context_report import context_percent
+
         cost = (
             "free" if self._turn_cost == 0 else f"${self._turn_cost:.4f}"
         )
-        stats = f"{self._turn_in:,} in · {self._turn_out:,} out · {cost}"
+        pct = context_percent(
+            self._compact_tokens, self._context_window()
+        )
+        stats = (
+            f"{self._turn_in:,} in · {self._turn_out:,} out · "
+            f"{cost} · {pct}% ctx"
+        )
         width = console.size.width
         # rule that ends with the stats: dashes + " stats" flush right.
         pad = max(0, width - len(stats) - 3)
         console.print(
             f"[bright_black]{'─' * pad}[/bright_black] "
             f"[dim]{self._turn_in:,} in · {self._turn_out:,} out · "
-            f"[green]{cost}[/green][/dim]"
+            f"[green]{cost}[/green] · {pct}% ctx[/dim]"
         )
 
     # ---- self-improvement attribution -----------------------------------
@@ -2068,6 +2094,10 @@ class Repl:
                     "[dim]no plan yet — give loom-code a task, or "
                     "`/plan <task>` to start one[/dim]"
                 )
+        elif cmd == "/context":
+            await self._handle_context()
+        elif cmd == "/prompt":
+            await self._handle_prompt()
         elif cmd == "/cost":
             uncached = self.total_in - self.total_cached_in
             # Cache-hit ratio over total input tokens. The ratio
@@ -2868,6 +2898,81 @@ class Repl:
         )
         await self._compact_now()
 
+    def _context_window(self) -> int:
+        """The active model's context window, cached per model string
+        (``context_window_for`` warns on unknown models — resolve once,
+        not every turn)."""
+        if self._ctx_window_model != self.model:
+            import warnings
+
+            from loomflow.agent.auto_compact import context_window_for
+
+            from .credentials import context_window_override
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                self._ctx_window = context_window_override(
+                    self.model
+                ) or context_window_for(self.model)
+            self._ctx_window_model = self.model
+        return self._ctx_window
+
+    async def _working_blocks(self) -> list[tuple[str, str]]:
+        """Every working block loomflow will inject into the next
+        system prompt, as ``(name, content)``. Empty list when the
+        memory backend doesn't expose ``working`` (custom backends)
+        — observability degrades, never crashes."""
+        try:
+            blocks = await self.agent.memory.working(user_id=_USER_ID)
+            return [
+                (str(b.name), str(b.content or "")) for b in blocks
+            ]
+        except Exception:  # noqa: BLE001 — report-only path
+            return []
+
+    async def _handle_context(self) -> None:
+        """``/context`` — show exactly what occupies the model's
+        context: window, used tokens (the same high-water figure the
+        auto-compactor keys on), every injected working block with its
+        size, and where compaction will fire. The transparency answer
+        to harnesses that inject invisibly."""
+        from .context_report import context_report
+
+        report = context_report(
+            model=self.model,
+            window=self._context_window(),
+            used_tokens=self._compact_tokens,
+            threshold=self._active_threshold(),
+            blocks=await self._working_blocks(),
+            n_exchanges=len(self._compact_exchanges),
+        )
+        console.print()
+        for line in report.splitlines():
+            # markup OFF (block names may contain [ ]), style via kwarg
+            console.print(f"  {line}", markup=False, style="dim")
+
+    async def _handle_prompt(self) -> None:
+        """``/prompt`` — dump the model's ACTUAL system prompt: the
+        coordinator's static instructions plus every working block,
+        verbatim. No other harness shows this; loom-code's position is
+        that you should be able to read every byte the model reads."""
+        from .context_report import prompt_dump
+
+        instructions = getattr(self.agent, "_instructions", None)
+        dump = prompt_dump(
+            instructions=(
+                str(instructions) if instructions else None
+            ),
+            blocks=await self._working_blocks(),
+        )
+        console.print()
+        console.print(dump, markup=False, highlight=False)
+        console.print()
+        console.print(
+            "  [dim](this + the conversation is everything the model "
+            "sees; blocks refresh each turn)[/dim]"
+        )
+
     async def _handle_compact(self) -> None:
         """``/compact`` — force a compaction NOW, regardless of the
         auto threshold. Useful right before a big new task: fold the
@@ -2920,12 +3025,17 @@ class Repl:
             )
             return
 
+        # Visible before → after: never compact silently (the silent
+        # version is a top harness-trust complaint elsewhere).
+        before = self._compact_tokens
+        after = max(1, len(summary) // 4)
         self.session_id = new_id()
         self._compact_tokens = 0
         self._compact_exchanges.clear()
         console.print(
-            f"  [dim]compacted into {len(summary)}-char summary "
-            f"in memory; new conversation thread.[/dim]"
+            f"  [dim]compacted: {before:,} tokens of history → "
+            f"~{after:,}-token summary (kept in every future prompt); "
+            "fresh conversation thread.[/dim]"
         )
 
     def _handle_set_continue_cap(self, arg: str) -> None:
