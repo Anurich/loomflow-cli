@@ -387,6 +387,12 @@ _COMMAND_DEFS: list[tuple[str, str, str]] = [
     ),
     ("/good", "mark the last turn useful (credit notes)", "Coding"),
     ("/bad", "mark the last turn unhelpful", "Coding"),
+    (
+        "/verify",
+        "verify-before-done gate: on | off (nudges the agent to run "
+        "tests before claiming done)",
+        "Coding",
+    ),
     ("/init-loom", "create a starter AGENTS.md rules file", "Coding"),
     # Isolation — sandbox this session in its own git worktree.
     ("/isolate", "run this session in its own git worktree", "Isolate"),
@@ -787,6 +793,10 @@ class Repl:
         # the agent picks the new backend up by adding (or not
         # adding) a ``web_tool`` to coder + explorer.
         self._web_backend: str | None = None
+        # Verify-before-done gate (on by default; /verify off): a turn
+        # that edits code + claims completion without running the
+        # project's tests gets one nudge to run them.
+        self._verify_gate = True
         # ``self._auto_continue_limit`` is initialised earlier in
         # __init__ (before build_agent is called) so the framework
         # gets the right ``max_stop_hook_iterations`` on construction.
@@ -1923,6 +1933,60 @@ class Repl:
                     self.last_result = n
                     agent_output = str(n.get("output") or "")
 
+            # Verify-before-done gate: the turn CHANGED code, CLAIMS
+            # completion (prose claim or all-done plan), and never ran
+            # the project's tests → one bounded nudge to run them.
+            # Composes with the anti-poison gate below: instead of
+            # merely deleting a false "done" episode after the fact,
+            # make the claim true first. /verify off disables.
+            if self._verify_gate:
+                from . import verify_gate as vg
+
+                active_root = (
+                    self._isolated_project or self.project
+                ).root
+                claims_done = _looks_like_completion_claim(
+                    agent_output
+                ) or vg.plan_all_done(renderer.last_plan)
+                if vg.should_verify(
+                    claims_done=claims_done,
+                    files_touched=renderer.files_touched,
+                    bash_commands=renderer.bash_commands,
+                ):
+                    test_cmd = vg.detect_test_command(active_root)
+                    if test_cmd is not None:
+                        console.print(
+                            "  [dim]verify gate: changes were made "
+                            "but no tests ran — asking the agent to "
+                            f"run {test_cmd}[/dim]"
+                        )
+                        verify_renderer = StreamRenderer(
+                            set_status=set_status,
+                            pause_status=pause_status,
+                            sandbox=self._sandbox,
+                            gate_active=lambda: self._gate_active,
+                        )
+                        ok = await self._consume_agent_stream(
+                            agent
+                            if agent is not None
+                            else self.agent,
+                            vg.VERIFY_NUDGE.format(cmd=test_cmd),
+                            verify_renderer,
+                            pause_status,
+                        )
+                        if ok and verify_renderer.last_result:
+                            v = verify_renderer.last_result
+                            self._account_result(
+                                v,
+                                verify_renderer,
+                                prompt,
+                                extend_files=True,
+                            )
+                            self.last_result = v
+                            agent_output = str(
+                                v.get("output") or ""
+                            )
+
             # Surface framework-level stop-hook exhaustion so the
             # user knows the cap was hit (and can raise it with
             # /set_continue_cap N).
@@ -2105,6 +2169,8 @@ class Repl:
             await self._handle_context()
         elif cmd == "/prompt":
             await self._handle_prompt()
+        elif cmd == "/verify":
+            self._handle_verify(arg)
         elif cmd == "/cost":
             uncached = self.total_in - self.total_cached_in
             # Cache-hit ratio over total input tokens. The ratio
@@ -2978,6 +3044,28 @@ class Repl:
         console.print(
             "  [dim](this + the conversation is everything the model "
             "sees; blocks refresh each turn)[/dim]"
+        )
+
+    def _handle_verify(self, arg: str) -> None:
+        """``/verify [on|off]`` — toggle the verify-before-done gate.
+        Bare ``/verify`` shows the current state."""
+        arg = arg.strip().lower()
+        if arg == "on":
+            self._verify_gate = True
+        elif arg == "off":
+            self._verify_gate = False
+        elif arg:
+            console.print(
+                f"  [yellow]unknown option {arg!r} — use /verify "
+                "on|off[/yellow]"
+            )
+            return
+        state = "on" if self._verify_gate else "off"
+        console.print(
+            f"  [dim]verify-before-done gate: {state} — a turn that "
+            "edits code and claims completion without running tests "
+            f"{'gets' if self._verify_gate else 'would get'} one "
+            "nudge to run them[/dim]"
         )
 
     async def _handle_compact(self) -> None:
