@@ -1155,21 +1155,92 @@ class Repl:
     # ---- input ----------------------------------------------------------
 
     async def _read_line(self) -> str:
-        """Read one line with a clean, framed-feel prompt.
+        """Read one line inside a bordered input box that grows down as
+        you type past the edge — an HTML-chat-textarea feel in the
+        terminal.
 
-        The separation is owned by the END of each turn: a full-width
-        rule + that turn's tokens/cost (``_print_turn_summary``). The
-        prompt itself stays minimal — one blank line of air, then the
-        bold ``›`` glyph. Cumulative session totals live in ``/cost``
-        (printing them above every prompt duplicated the turn rule and
-        showed a noisy all-zeros line before the first input).
-        Autocomplete / history / paste keybindings come from the
-        ``PromptSession``.
+        Enter submits; Alt+Enter inserts a newline; long input word-
+        wraps and the box height follows. The box is a real
+        ``prompt_toolkit`` ``Frame`` around a multiline ``TextArea``
+        (owns its whole region, so the border stays connected — unlike
+        a hand-drawn box around ``prompt_async``, which can't close its
+        right edge). The TextArea reuses the session's completer +
+        history + paste keybindings so nothing regresses.
+
+        Any failure (non-TTY, exotic terminal) falls back to the plain
+        single-line prompt — the box is cosmetic, never load-bearing.
         """
         console.print()
-        return await self._prompt_session.prompt_async(
-            HTML("<ansigreen><b>›</b></ansigreen>  ")
+        if not sys.stdin.isatty():
+            return await self._prompt_session.prompt_async(
+                HTML("<ansigreen><b>›</b></ansigreen>  ")
+            )
+        try:
+            return await self._boxed_prompt()
+        except Exception:  # noqa: BLE001 — box is cosmetic
+            return await self._prompt_session.prompt_async(
+                HTML("<ansigreen><b>›</b></ansigreen>  ")
+            )
+
+    async def _boxed_prompt(self) -> str:
+        """The bordered, auto-growing input box (see ``_read_line``)."""
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.formatted_text import HTML as PTHTML
+        from prompt_toolkit.key_binding import (
+            KeyBindings,
+            merge_key_bindings,
         )
+        from prompt_toolkit.layout import Layout
+        from prompt_toolkit.layout.dimension import Dimension as D
+        from prompt_toolkit.widgets import Frame, TextArea
+
+        cols = console.size.width
+        area = TextArea(
+            prompt=PTHTML("<ansigreen><b>› </b></ansigreen>"),
+            multiline=True,
+            wrap_lines=True,
+            height=D(min=1),  # grows with wrapped content
+            completer=self._prompt_session.completer,
+            complete_while_typing=True,
+            history=self._prompt_session.history,
+            focus_on_click=True,
+        )
+
+        kb = KeyBindings()
+
+        @kb.add("enter")
+        def _submit(event: Any) -> None:
+            event.app.exit(result=area.text)
+
+        @kb.add("escape", "enter")  # Alt/Option+Enter → newline
+        def _newline(event: Any) -> None:
+            area.buffer.insert_text("\n")
+
+        @kb.add("c-c")
+        @kb.add("c-d")
+        def _abort(event: Any) -> None:
+            # Ctrl-C/-D on an EMPTY box exits the REPL (EOFError, same
+            # as the plain prompt); on a non-empty box it clears.
+            if area.text:
+                area.text = ""
+            else:
+                event.app.exit(exception=EOFError())
+
+        # Paste-collapse bindings from the session share the same
+        # Buffer API, so they compose onto the TextArea's buffer.
+        merged = merge_key_bindings(
+            [build_paste_keybindings(), kb]
+        )
+        # width = cols-1 keeps the closing corner off the terminal's
+        # auto-wrap column so the frame never staircases.
+        app: Application[str] = Application(
+            layout=Layout(Frame(area, width=D(max=max(20, cols - 1)))),
+            key_bindings=merged,
+            full_screen=False,
+            erase_when_done=False,
+        )
+        result = await app.run_async()
+        return result if result is not None else ""
 
     async def _run_bang(self, cmd: str) -> None:
         """Run ``cmd`` in the project root right now (``!`` prefix) and
