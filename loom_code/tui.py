@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.formatted_text import ANSI, HTML
@@ -52,6 +53,19 @@ from prompt_toolkit.widgets import Frame, TextArea
 from rich.console import Console
 
 
+class _PaneConsole(Console):
+    """A Rich console that pushes into the TUI pane after every print,
+    so output appears live without the REPL calling ``flush()``."""
+
+    def __init__(self, tui: ChatTUI, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.__tui = tui
+
+    def print(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        super().print(*args, **kwargs)
+        self.__tui.flush()
+
+
 class ChatTUI:
     """A full-screen chat application. One instance per REPL session."""
 
@@ -67,7 +81,12 @@ class ChatTUI:
         self._sel_future: asyncio.Future[str | None] | None = None
         self._ansi = ""  # accumulated conversation, ANSI-encoded
         self._sink = io.StringIO()  # Rich renders here; flush() drains
-        self.console = Console(
+        # A console whose every print immediately lands in the pane —
+        # so the REPL keeps calling console.print(...) unchanged and the
+        # output appears live, no scattered flush() calls. Streaming
+        # chunks (console.print(end="")) flush too.
+        self.console = _PaneConsole(
+            self,
             file=self._sink,
             force_terminal=True,
             color_system="truecolor",

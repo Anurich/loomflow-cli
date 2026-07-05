@@ -19,7 +19,46 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.text import Text
 
-console = Console()
+
+class _ConsoleProxy:
+    """A stand-in for the Rich ``console`` that forwards every
+    attribute to the *current* target console.
+
+    Why: dozens of modules do ``from .render import console`` at import
+    time, binding the name by-reference. When the full-screen TUI turns
+    on it needs ALL that output to flow into its scroll pane — but
+    reassigning ``render.console`` wouldn't reach those already-bound
+    names. A proxy solves it in one place: swap ``proxy._target`` and
+    every ``console.print`` in the app follows, no per-module rewiring.
+    The default target is a normal stdout console (classic behaviour).
+    """
+
+    def __init__(self, target: Console) -> None:
+        object.__setattr__(self, "_target", target)
+
+    def _set_target(self, target: Console) -> None:
+        object.__setattr__(self, "_target", target)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_target"), name, value)
+
+
+_stdout_console = Console()
+console = _ConsoleProxy(_stdout_console)
+
+
+def set_console_target(target: Console) -> None:
+    """Point the shared ``console`` proxy at ``target`` (the TUI's
+    pane-backed console). Everything printed app-wide now lands there."""
+    console._set_target(target)
+
+
+def reset_console_target() -> None:
+    """Restore the default stdout console (TUI teardown / --classic)."""
+    console._set_target(_stdout_console)
 
 # Tools whose results are worth showing in full-ish; others get a
 # one-line summary so the terminal doesn't flood. We cap BOTH char

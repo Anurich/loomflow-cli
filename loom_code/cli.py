@@ -420,6 +420,15 @@ def main() -> None:
             "resume (same as typing /resume pick first)."
         ),
     )
+    parser.add_argument(
+        "--classic",
+        action="store_true",
+        help=(
+            "Use the classic inline input box instead of the "
+            "full-screen chat UI (fixed bottom box + scrolling "
+            "conversation). Auto-selected on a non-TTY."
+        ),
+    )
     args = parser.parse_args()
 
     # 1. Read ~/.loom-code/credentials so any keys saved on a
@@ -463,6 +472,9 @@ def main() -> None:
         resume = (
             "pick" if args.resume else "last" if args.continue_ else None
         )
+        # Full-screen chat UI by default; --classic (or a non-TTY,
+        # where a full-screen app can't run) uses the inline box.
+        classic = args.classic or not sys.stdout.isatty()
         exit_code = anyio.run(
             functools.partial(
                 run_repl,
@@ -471,6 +483,7 @@ def main() -> None:
                 sandbox=args.sandbox,
                 sandbox_allow_network=args.sandbox_allow_network,
                 resume=resume,
+                classic=classic,
             )
         )
         sys.exit(exit_code)

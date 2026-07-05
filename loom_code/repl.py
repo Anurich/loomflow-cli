@@ -615,9 +615,18 @@ class Repl:
         sandbox: bool = False,
         sandbox_allow_network: bool = False,
         startup_resume: str | None = None,
+        use_tui: bool = False,
     ) -> None:
         self.project = project
         self.model = model
+        # Full-screen chat TUI (fixed bottom box + scrolling pane).
+        # Constructed lazily in ``run()`` so a non-TTY / construction
+        # failure degrades to the inline box. ``_tui`` is None until
+        # then; every TUI branch guards on it.
+        self._use_tui = use_tui
+        self._tui: Any | None = None
+        # Original render.console, restored on exit when we redirect.
+        self._saved_console: Any | None = None
         # "last" / "pick" / None — consumed once at the top of the
         # loop (the --continue / --resume CLI flags).
         self._startup_resume = startup_resume
@@ -862,9 +871,21 @@ class Repl:
         are child processes). Closing them on every exit path — normal
         quit, Ctrl-C, or an exception — avoids leaking processes.
         """
+        # Bring up the full-screen chat TUI (default). On any failure —
+        # non-TTY, exotic terminal, import issue — fall back to the
+        # classic inline box so the REPL always runs.
+        self._maybe_start_tui()
+
         try:
+            if self._tui is not None:
+                async with self._tui.session():
+                    return await self._run_inner()
             return await self._run_inner()
         finally:
+            if self._tui is not None:
+                from .render import reset_console_target
+
+                reset_console_target()
             await self._aclose_mcp()
             await self._aclose_browsers()
             # Let any in-flight background HOOKS (fire-and-forget
@@ -883,6 +904,29 @@ class Repl:
                     f"  [dim]stopped {killed} background process"
                     f"{'es' if killed != 1 else ''}[/dim]"
                 )
+
+    def _maybe_start_tui(self) -> None:
+        """Construct the full-screen chat TUI and redirect all output
+        into its scroll pane. Best-effort: any failure leaves
+        ``self._tui`` None and the REPL uses the classic inline box."""
+        if not self._use_tui or not sys.stdout.isatty():
+            return
+        try:
+            from . import render
+            from .tui import ChatTUI
+
+            tui = ChatTUI()
+            # Route ALL console output into the pane (one proxy swap
+            # reaches every ``from .render import console`` binding).
+            self._saved_console = True
+            render.set_console_target(tui.console)
+            # Slash / @-mention completion in the box.
+            tui.attach_completer(self._prompt_session.completer)
+            # Approval Yes/All/No + slash menus select in-app.
+            self._gate.select_hook = tui.select
+            self._tui = tui
+        except Exception:  # noqa: BLE001 — box is optional
+            self._tui = None
 
     async def _aclose_mcp(self) -> None:
         """Best-effort teardown of the MCP registry's sessions. Never
@@ -1170,6 +1214,11 @@ class Repl:
         Any failure (non-TTY, exotic terminal) falls back to the plain
         single-line prompt — the box is cosmetic, never load-bearing.
         """
+        # Full-screen TUI: the box is already on screen (pinned at the
+        # bottom); just await the next submission. Raises EOFError on
+        # empty Ctrl-D, matching the classic prompt's contract.
+        if self._tui is not None:
+            return await self._tui.read_line()
         console.print()
         if not sys.stdin.isatty():
             return await self._prompt_session.prompt_async(
@@ -2023,28 +2072,44 @@ class Repl:
 
         loop_guard.reset()
 
-        status = console.status(
-            "[dim]loomflowing...[/dim]", spinner="dots"
-        )
-        status.start()
-        status_running = True
+        tui = self._tui
+        if tui is not None:
+            # Full-screen TUI: drive the pane's status line (Rich's
+            # console.status Live can't render into the scroll buffer).
+            # Every status change flushes so streamed prose appears
+            # live in the pane.
+            def set_status(label: str) -> None:
+                tui.set_status(f"⏳ {label}")
+                tui.flush()
 
-        def set_status(label: str) -> None:
-            """Update the spinner label, restarting it if it was
-            paused for a prose burst."""
-            nonlocal status_running
-            if not status_running:
-                status.start()
-                status_running = True
-            status.update(f"[dim]{label}[/dim]")
+            def pause_status() -> None:
+                tui.clear_status()
+                tui.flush()
 
-        def pause_status() -> None:
-            """Stop the spinner so streamed text can use the cursor
-            line cleanly. ``set_status`` restarts it later."""
-            nonlocal status_running
-            if status_running:
-                status.stop()
-                status_running = False
+            set_status("loomflowing…")
+        else:
+            status = console.status(
+                "[dim]loomflowing...[/dim]", spinner="dots"
+            )
+            status.start()
+            status_running = True
+
+            def set_status(label: str) -> None:
+                """Update the spinner label, restarting it if it was
+                paused for a prose burst."""
+                nonlocal status_running
+                if not status_running:
+                    status.start()
+                    status_running = True
+                status.update(f"[dim]{label}[/dim]")
+
+            def pause_status() -> None:
+                """Stop the spinner so streamed text can use the cursor
+                line cleanly. ``set_status`` restarts it later."""
+                nonlocal status_running
+                if status_running:
+                    status.stop()
+                    status_running = False
 
         # Point the ApprovalGate's spinner hooks at THIS turn's
         # closures. Resume re-labels to a neutral "thinking..." since
@@ -3519,6 +3584,12 @@ class Repl:
         ApprovalGate calls ``_select_option``."""
         from .approval import _select_option
 
+        # Full-screen TUI: select in-app (a raw-mode selector would
+        # fight the running Application for the terminal).
+        if self._tui is not None:
+            key = await self._tui.select(title, options, default=default)
+            return key  # None on cancel — same contract as below
+
         console.print()
         if title:
             console.print(f"  [bold]{title}[/bold]")
@@ -4767,6 +4838,7 @@ async def run_repl(
     sandbox: bool = False,
     sandbox_allow_network: bool = False,
     resume: str | None = None,
+    classic: bool = False,
 ) -> int:
     """Entry point for the interactive REPL — construct the Repl and
     run its loop until the user exits.
@@ -4780,5 +4852,6 @@ async def run_repl(
         sandbox=sandbox,
         sandbox_allow_network=sandbox_allow_network,
         startup_resume=resume,
+        use_tui=not classic,
     )
     return await repl.run()
