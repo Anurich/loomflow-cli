@@ -108,10 +108,17 @@ class ChatTUI:
         # ptk's own scroll logic.
         self._pane_height = 20  # updated from render_info each frame
         self._pane = Window(
-            FormattedTextControl(text=self._pane_text, focusable=False),
+            FormattedTextControl(
+                text=self._pane_text,
+                focusable=False,
+            ),
             wrap_lines=True,
             always_hide_cursor=True,
         )
+        # Mouse-wheel scrolls the conversation (what most people reach
+        # for). The window itself gets the wheel events via mouse
+        # support; we translate them to _scroll_back moves.
+        self._pane.content.mouse_handler = self._pane_mouse
         self._status_win = Window(
             FormattedTextControl(text=self._status_text),
             height=D(max=1),
@@ -136,6 +143,22 @@ class ChatTUI:
         import shutil
 
         return max(40, shutil.get_terminal_size((100, 24)).columns)
+
+    def _pane_mouse(self, mouse_event: Any) -> Any:
+        """Wheel-scroll the conversation. Returns None to consume the
+        event, NotImplemented to let ptk handle other mouse actions."""
+        from prompt_toolkit.mouse_events import MouseEventType
+
+        et = mouse_event.event_type
+        if et == MouseEventType.SCROLL_UP:
+            self._scroll_back += 3
+            self._app.invalidate()
+            return None
+        if et == MouseEventType.SCROLL_DOWN:
+            self._scroll_back = max(0, self._scroll_back - 3)
+            self._app.invalidate()
+            return None
+        return NotImplemented
 
     def _pane_text(self) -> Any:
         """Render the TAIL of the conversation that fits the pane, so
@@ -256,30 +279,33 @@ class ChatTUI:
             self._input.buffer.insert_text("\n")
 
         # ---- scrollback through the conversation ----
-        @kb.add("pageup", filter=input_active)
+        # eager=True so these win over the focused TextArea's own
+        # PageUp/PageDown (which would scroll the tiny input buffer
+        # instead of the conversation).
+        @kb.add("pageup", filter=input_active, eager=True)
         def _page_up(event: Any) -> None:
             self._scroll_back += max(1, self._pane_height - 2)
             self._app.invalidate()
 
-        @kb.add("pagedown", filter=input_active)
+        @kb.add("pagedown", filter=input_active, eager=True)
         def _page_down(event: Any) -> None:
             self._scroll_back = max(
                 0, self._scroll_back - max(1, self._pane_height - 2)
             )
             self._app.invalidate()
 
-        @kb.add("c-up", filter=input_active)
+        @kb.add("c-up", filter=input_active, eager=True)
         def _line_up(event: Any) -> None:
-            self._scroll_back += 1
+            self._scroll_back += 3
             self._app.invalidate()
 
-        @kb.add("c-down", filter=input_active)
+        @kb.add("c-down", filter=input_active, eager=True)
         def _line_down(event: Any) -> None:
-            self._scroll_back = max(0, self._scroll_back - 1)
+            self._scroll_back = max(0, self._scroll_back - 3)
             self._app.invalidate()
 
-        @kb.add("end", filter=input_active)
-        @kb.add("escape", "end", filter=input_active)
+        @kb.add("end", filter=input_active, eager=True)
+        @kb.add("escape", "end", filter=input_active, eager=True)
         def _jump_live(event: Any) -> None:
             self._scroll_back = 0
             self._app.invalidate()
@@ -358,7 +384,7 @@ class ChatTUI:
             layout=Layout(root, focused_element=self._input),
             key_bindings=kb,
             full_screen=True,
-            mouse_support=False,
+            mouse_support=True,
         )
 
     def _resolve_select(self, value: str | None) -> None:
