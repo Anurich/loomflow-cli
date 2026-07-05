@@ -1682,6 +1682,61 @@ class Repl:
         except Exception:  # noqa: BLE001 — checkpointing is best-effort
             pass
 
+    def _handle_checkpoints(self) -> None:
+        """``/checkpoints`` — list the auto-checkpoint stack (newest
+        last, matching the seq a ``/undo <seq>`` takes)."""
+        cps = _checkpoint.list_checkpoints(self.project.root)
+        if not cps:
+            console.print(
+                "  [dim]no checkpoints yet — one is taken "
+                "automatically before each turn that can edit[/dim]"
+            )
+            return
+        console.print("  [bold]checkpoints[/bold] (newest last)")
+        for cp in cps:
+            when = cp.created_at.replace("T", " ")[:19]
+            summary = cp.summary[:60] + (
+                "…" if len(cp.summary) > 60 else ""
+            )
+            console.print(
+                f"    [cyan]#{cp.seq}[/cyan]  [dim]{when}[/dim]  "
+                f"{summary}"
+            )
+        console.print(
+            "  [dim]/undo restores the latest · /undo <seq> a "
+            "specific one[/dim]"
+        )
+
+    def _handle_undo(self, arg: str) -> None:
+        """``/undo [seq]`` — restore the working tree to a checkpoint
+        (the latest when no seq). Pure working-tree revert; HEAD is
+        untouched, and a safety checkpoint of the current state is
+        taken first so /undo is itself undoable."""
+        seq: int | None = None
+        if arg.strip():
+            try:
+                seq = int(arg.strip().lstrip("#"))
+            except ValueError:
+                console.print(
+                    f"  [yellow]/undo takes a checkpoint number "
+                    f"(got {arg.strip()!r}) — /checkpoints lists "
+                    f"them[/yellow]"
+                )
+                return
+        restored, err = _checkpoint.restore(self.project.root, seq=seq)
+        if restored is None:
+            console.print(f"  [yellow]{err}[/yellow]")
+            return
+        summary = restored.summary[:60] + (
+            "…" if len(restored.summary) > 60 else ""
+        )
+        console.print(
+            f"  [green]restored[/green] working tree to checkpoint "
+            f"[cyan]#{restored.seq}[/cyan] [dim]({summary})[/dim]\n"
+            f"  [dim]a safety checkpoint of the pre-undo state was "
+            f"taken — /undo again reverses this[/dim]"
+        )
+
     async def _consume_agent_stream(
         self,
         agent: Any,
@@ -2605,6 +2660,10 @@ class Repl:
             await self._handle_computer(arg)
         elif cmd == "/goal":
             await self._handle_goal(arg)
+        elif cmd == "/checkpoints":
+            self._handle_checkpoints()
+        elif cmd == "/undo":
+            self._handle_undo(arg)
         else:
             console.print(
                 f"  [yellow]unknown command {cmd}[/yellow] — "

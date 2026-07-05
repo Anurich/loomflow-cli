@@ -97,3 +97,31 @@ def test_hint_for_rate_limit() -> None:
 
 def test_no_hint_for_unknown_errors() -> None:
     assert friendly_error_hint(Exception("something novel")) is None
+
+
+# ---- every advertised command has a dispatch branch -----------------------
+
+
+def test_every_defined_command_is_dispatched() -> None:
+    """Every command in ``_COMMAND_DEFS`` (the completion menu + the
+    known-command gate) must have a branch in ``_handle_slash``.
+
+    Regression: ``/checkpoints`` and ``/undo`` were advertised in the
+    menu — and their whole backend existed in checkpoint.py — but the
+    dispatcher had no branch for them, so picking them from the menu
+    errored "unknown command". The completer, the gate, and the
+    dispatcher are three separate lists; this pins them together.
+    """
+    import inspect
+    import re
+
+    from loom_code.repl import _COMMAND_DEFS, Repl
+
+    defined = {c for c, _d, _g in _COMMAND_DEFS}
+    body = inspect.getsource(Repl._handle_slash)
+    handled = set(re.findall(r'"(/[a-z_-]+)"', body))
+    missing = sorted(defined - handled)
+    assert not missing, (
+        f"commands advertised in _COMMAND_DEFS but not dispatched in "
+        f"_handle_slash (they will error 'unknown command'): {missing}"
+    )
