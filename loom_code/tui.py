@@ -79,6 +79,10 @@ class ChatTUI:
         self._sel_options: list[tuple[str, str]] = []
         self._sel_idx = 0
         self._sel_future: asyncio.Future[str | None] | None = None
+        # Scrollback: 0 = pinned to bottom (auto-follow newest). PageUp
+        # / mouse-wheel-up increase it to reveal older lines; new output
+        # resets it to 0 so you snap back to live.
+        self._scroll_back = 0
         self._ansi = ""  # accumulated conversation, ANSI-encoded
         self._sink = io.StringIO()  # Rich renders here; flush() drains
         # A console whose every print immediately lands in the pane —
@@ -144,13 +148,25 @@ class ChatTUI:
                 self._pane_height = max(1, info.window_height)
             except Exception:  # noqa: BLE001
                 pass
-        # Slice to the last N logical lines. Wrapping means a logical
-        # line can occupy several rows, so keep a little extra headroom
-        # (×1.0 is usually fine since most lines don't wrap); ptk clamps
-        # if we overshoot.
+        # Show ``h`` lines ending ``_scroll_back`` lines up from the
+        # very bottom (0 = live tail). Clamp so you can't scroll past
+        # the top. When scrolled up, a bottom hint shows how many lines
+        # are hidden below + how to jump back to live.
         lines = self._ansi.split("\n")
-        tail = lines[-self._pane_height:]
-        return ANSI("\n".join(tail))
+        h = self._pane_height
+        max_back = max(0, len(lines) - h)
+        back = max(0, min(self._scroll_back, max_back))
+        self._scroll_back = back  # persist the clamp
+        end = len(lines) - back  # exclusive index of the last shown line
+        if back == 0:
+            return ANSI("\n".join(lines[max(0, end - h): end]))
+        # Reserve one row for the hint at the bottom of the pane.
+        window = lines[max(0, end - (h - 1)): end]
+        hint = (
+            f"\x1b[2m  ↓ {back} line(s) below · End=live "
+            "PgDn=down\x1b[0m"
+        )
+        return ANSI("\n".join([*window, hint]))
 
     def flush(self) -> None:
         """Move buffered Rich output into the pane + repaint. The REPL
@@ -161,6 +177,9 @@ class ChatTUI:
             self._ansi += text
             self._sink.seek(0)
             self._sink.truncate(0)
+            # New output snaps back to the live tail (you don't want to
+            # be stuck reading history while the agent streams below).
+            self._scroll_back = 0
         if self._app.is_running:
             self._app.invalidate()
 
@@ -235,6 +254,35 @@ class ChatTUI:
         @kb.add("escape", "enter", filter=input_active)  # Alt+Enter
         def _newline(event: Any) -> None:
             self._input.buffer.insert_text("\n")
+
+        # ---- scrollback through the conversation ----
+        @kb.add("pageup", filter=input_active)
+        def _page_up(event: Any) -> None:
+            self._scroll_back += max(1, self._pane_height - 2)
+            self._app.invalidate()
+
+        @kb.add("pagedown", filter=input_active)
+        def _page_down(event: Any) -> None:
+            self._scroll_back = max(
+                0, self._scroll_back - max(1, self._pane_height - 2)
+            )
+            self._app.invalidate()
+
+        @kb.add("c-up", filter=input_active)
+        def _line_up(event: Any) -> None:
+            self._scroll_back += 1
+            self._app.invalidate()
+
+        @kb.add("c-down", filter=input_active)
+        def _line_down(event: Any) -> None:
+            self._scroll_back = max(0, self._scroll_back - 1)
+            self._app.invalidate()
+
+        @kb.add("end", filter=input_active)
+        @kb.add("escape", "end", filter=input_active)
+        def _jump_live(event: Any) -> None:
+            self._scroll_back = 0
+            self._app.invalidate()
 
         @kb.add("c-c", filter=input_active)
         @kb.add("c-d", filter=input_active)
