@@ -37,9 +37,17 @@ from typing import Any, AsyncIterator
 from prompt_toolkit.application import Application
 from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import (
+    ConditionalContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    Layout,
+    Window,
+)
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension as D
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.widgets import Frame, TextArea
 from rich.console import Console
 
@@ -48,6 +56,15 @@ class ChatTUI:
     """A full-screen chat application. One instance per REPL session."""
 
     def __init__(self) -> None:
+        # Selector state: when active, its bindings win and the input
+        # box is ignored. Driven by :meth:`select`; a filter gates
+        # which key-binding group is live, so we never reassign
+        # ``app.key_bindings`` on a running app (ptk caches the
+        # processor — a swap doesn't reliably take effect).
+        self._sel_active = False
+        self._sel_options: list[tuple[str, str]] = []
+        self._sel_idx = 0
+        self._sel_future: asyncio.Future[str | None] | None = None
         self._ansi = ""  # accumulated conversation, ANSI-encoded
         self._sink = io.StringIO()  # Rich renders here; flush() drains
         self.console = Console(
@@ -77,6 +94,8 @@ class ChatTUI:
             wrap_lines=True,
             height=D(min=1, max=8),
             dont_extend_height=True,
+            completer=None,  # set by attach_completer() from the REPL
+            complete_while_typing=True,
         )
         # Submitted lines flow through this queue to the REPL loop.
         self._submissions: asyncio.Queue[str | None] = asyncio.Queue()
@@ -111,41 +130,132 @@ class ChatTUI:
         self.set_status("")
 
     def _status_text(self) -> Any:
+        # While a selector is active, this region shows the menu.
+        if self._sel_active:
+            lines = []
+            for i, (_key, label) in enumerate(self._sel_options):
+                if i == self._sel_idx:
+                    lines.append(
+                        f"  <ansicyan><b>❯ {i + 1}. {label}</b>"
+                        "</ansicyan>"
+                    )
+                else:
+                    lines.append(
+                        f"  <ansibrightblack>  {i + 1}. {label}"
+                        "</ansibrightblack>"
+                    )
+            return HTML("\n".join(lines))
         if not self._status:
             return ""
         return HTML(f"  <ansibrightblack>{self._status}</ansibrightblack>")
 
+    def attach_completer(self, completer: Any) -> None:
+        """Wire the REPL's slash/@-mention completer onto the input
+        box so typing ``/`` still pops the command menu (parity with
+        the inline prompt). Called once by the REPL after construction."""
+        self._input.completer = completer
+        self._input.control.completer = completer
+
     # ---- layout ---------------------------------------------------------
 
     def _build_app(self) -> Application[Any]:
+        from prompt_toolkit.filters import Condition
+
+        input_active = Condition(lambda: not self._sel_active)
+        sel_active = Condition(lambda: self._sel_active)
+
         kb = KeyBindings()
 
-        @kb.add("enter")
+        # ---- input-box bindings (live only when NOT selecting) ----
+        # Enter with the completion menu open should ACCEPT the
+        # completion, not submit — matches the old prompt's feel where
+        # picking a slash-command from the menu doesn't fire the turn.
+        @kb.add("enter", filter=input_active)
         def _submit(event: Any) -> None:
+            buf = self._input.buffer
+            if buf.complete_state:
+                buf.apply_completion(
+                    buf.complete_state.current_completion
+                    or buf.complete_state.completions[0]
+                )
+                return
             text = self._input.text
             self._input.text = ""
             self._submissions.put_nowait(text)
 
-        @kb.add("escape", "enter")  # Alt+Enter → newline
+        @kb.add("escape", "enter", filter=input_active)  # Alt+Enter
         def _newline(event: Any) -> None:
             self._input.buffer.insert_text("\n")
 
-        @kb.add("c-c")
-        @kb.add("c-d")
+        @kb.add("c-c", filter=input_active)
+        @kb.add("c-d", filter=input_active)
         def _abort(event: Any) -> None:
             if self._input.text:
                 self._input.text = ""
                 self._app.invalidate()
             else:
-                # Signal EOF to the REPL loop; the loop tears down.
                 self._submissions.put_nowait(None)
 
-        root = HSplit(
+        # ---- selector bindings (live only WHILE selecting) ----
+        @kb.add("up", filter=sel_active)
+        def _sel_up(event: Any) -> None:
+            self._sel_idx = (self._sel_idx - 1) % len(self._sel_options)
+            self._app.invalidate()
+
+        @kb.add("down", filter=sel_active)
+        def _sel_down(event: Any) -> None:
+            self._sel_idx = (self._sel_idx + 1) % len(self._sel_options)
+            self._app.invalidate()
+
+        @kb.add("enter", filter=sel_active)
+        def _sel_pick(event: Any) -> None:
+            self._resolve_select(self._sel_options[self._sel_idx][0])
+
+        @kb.add("escape", filter=sel_active)
+        @kb.add("c-c", filter=sel_active)
+        def _sel_cancel(event: Any) -> None:
+            self._resolve_select(None)
+
+        # number + first-letter hotkeys, gated on the selector filter
+        for n in range(1, 10):
+            @kb.add(str(n), filter=sel_active)
+            def _sel_num(event: Any, _n: int = n) -> None:
+                if _n <= len(self._sel_options):
+                    self._resolve_select(
+                        self._sel_options[_n - 1][0]
+                    )
+
+        for letter in "abcdefghijklmnopqrstuvwxyz":
+            @kb.add(letter, filter=sel_active)
+            def _sel_letter(event: Any, _l: str = letter) -> None:
+                for key, _label in self._sel_options:
+                    if key and key[0].lower() == _l:
+                        self._resolve_select(key)
+                        return
+
+        body = HSplit(
             [
                 self._pane,  # scrolls, fills available height
-                self._status_win,  # one-line status (spinner slot)
+                self._status_win,  # status line / selector overlay
                 Frame(self._input),  # fixed at the bottom
             ]
+        )
+        # The completion menu (for ``/`` commands + ``@`` files) floats
+        # above the input — this is what makes the popup appear at all;
+        # a TextArea's completer is inert without a CompletionsMenu in
+        # the layout. Gated so it never shows while a selector is up.
+        root = FloatContainer(
+            content=body,
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    content=ConditionalContainer(
+                        CompletionsMenu(max_height=12, scroll_offset=1),
+                        filter=input_active,
+                    ),
+                ),
+            ],
         )
         return Application(
             layout=Layout(root, focused_element=self._input),
@@ -153,6 +263,15 @@ class ChatTUI:
             full_screen=True,
             mouse_support=False,
         )
+
+    def _resolve_select(self, value: str | None) -> None:
+        fut = self._sel_future
+        self._sel_active = False
+        self._sel_future = None
+        self._status_win.height = D(max=1)
+        if fut is not None and not fut.done():
+            fut.set_result(value)
+        self._app.invalidate()
 
     # ---- drive ----------------------------------------------------------
 
@@ -181,6 +300,43 @@ class ChatTUI:
         if text is None:
             raise EOFError
         return text
+
+    async def select(
+        self,
+        title: str,
+        options: list[tuple[str, str]],
+        *,
+        default: int = 0,
+    ) -> str | None:
+        """An in-app option selector — the approval gate + slash-menu
+        picker route through this while the full-screen app owns the
+        terminal (a raw-termios selector would fight the app for input).
+
+        Sets the selector state; the app's ``sel_active``-filtered
+        bindings drive ↑/↓ + Enter + number/hotkey selection and the
+        status region renders the menu. Returns the chosen key, or None
+        on cancel (Esc). ``options`` is ``[(key, label), …]``.
+
+        No overlapping selects — the gate/menus are strictly one at a
+        time, which matches how they were before."""
+        if title:
+            self.console.print(f"  [bold]{title}[/bold]")
+            self.flush()
+        self._sel_options = list(options)
+        self._sel_idx = max(0, min(default, len(options) - 1))
+        self._sel_future = asyncio.get_event_loop().create_future()
+        self._status_win.height = D(max=len(options))
+        self._sel_active = True
+        self._app.invalidate()
+        try:
+            return await self._sel_future
+        finally:
+            # _resolve_select already cleared state; this is the
+            # belt-and-suspenders path if the future was cancelled.
+            self._sel_active = False
+            self._sel_options = []
+            self._status_win.height = D(max=1)
+            self._app.invalidate()
 
     @property
     def app(self) -> Application[Any]:
