@@ -96,17 +96,17 @@ class ChatTUI:
         # set_status/pause_status; empty string hides it.
         self._status = ""
 
-        # The conversation pane. ``ignore_content_height`` + a vertical
-        # scroll pinned to the bottom keeps the LATEST output visible
-        # just above the input box (chat-style), instead of content
-        # sitting at the top with a blank gap below it.
+        # The conversation pane. It renders the TAIL of the ANSI that
+        # fits the window, so the newest output is always pinned just
+        # above the input box (chat-style). The tail slicing happens in
+        # ``_pane_text`` using the last known window height — simple and
+        # reliable, where a get_vertical_scroll hook gets clamped by
+        # ptk's own scroll logic.
+        self._pane_height = 20  # updated from render_info each frame
         self._pane = Window(
-            FormattedTextControl(
-                text=lambda: ANSI(self._ansi), focusable=False
-            ),
+            FormattedTextControl(text=self._pane_text, focusable=False),
             wrap_lines=True,
             always_hide_cursor=True,
-            get_vertical_scroll=self._pane_scroll,
         )
         self._status_win = Window(
             FormattedTextControl(text=self._status_text),
@@ -133,17 +133,24 @@ class ChatTUI:
 
         return max(40, shutil.get_terminal_size((100, 24)).columns)
 
-    def _pane_scroll(self, window: Any) -> int:
-        """Pin the pane to the BOTTOM: return the scroll offset that
-        keeps the last rendered line visible just above the input box.
-        Without this, short conversations float at the top (blank gap
-        below) and long ones don't follow the newest output."""
-        try:
-            content_h = window.render_info.content_height
-            visible_h = window.render_info.window_height
-        except Exception:  # noqa: BLE001 — first paint before render_info
-            return 0
-        return max(0, content_h - visible_h)
+    def _pane_text(self) -> Any:
+        """Render the TAIL of the conversation that fits the pane, so
+        the newest output is pinned just above the input box. Track the
+        window height from the previous frame's render_info; on the
+        first paint use a sane default."""
+        info = self._pane.render_info
+        if info is not None:
+            try:
+                self._pane_height = max(1, info.window_height)
+            except Exception:  # noqa: BLE001
+                pass
+        # Slice to the last N logical lines. Wrapping means a logical
+        # line can occupy several rows, so keep a little extra headroom
+        # (×1.0 is usually fine since most lines don't wrap); ptk clamps
+        # if we overshoot.
+        lines = self._ansi.split("\n")
+        tail = lines[-self._pane_height:]
+        return ANSI("\n".join(tail))
 
     def flush(self) -> None:
         """Move buffered Rich output into the pane + repaint. The REPL
