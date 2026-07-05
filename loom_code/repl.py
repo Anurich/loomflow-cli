@@ -1064,6 +1064,16 @@ class Repl:
             if not line:
                 continue
 
+            # Show life IMMEDIATELY on submit. Pre-turn setup (agent
+            # build, checkpoint snapshot, memory rehydrate — and on a
+            # cold first run an HF tokenizer download that can take a
+            # minute) all happens before _turn sets its own status; a
+            # user's very first message otherwise stares at a dead
+            # screen. _turn / command handlers overwrite this.
+            if self._tui is not None and not line.startswith("/"):
+                self._tui.set_status("⏳ thinking…")
+                self._tui.flush()
+
             # Expand any [paste-N: ...] placeholders to the full
             # stashed content BEFORE dispatch — slash commands
             # generally won't contain pastes, but expanding here

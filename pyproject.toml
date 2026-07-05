@@ -63,7 +63,9 @@ dependencies = [
     # composed surfaces (Team kwargs, stop hooks, working blocks). Raise
     # the ceiling deliberately after testing, not by accident on a
     # user's machine mid-`pipx upgrade`.
-    "loomflow[litellm,web,mcp]>=0.10.30,<0.11",
+    # >=0.10.31: approval-gate fix — hooks attached to an agent
+    # silently bypassed the ask/approval flow for destructive tools.
+    "loomflow[litellm,web,mcp]>=0.10.31,<0.11",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user

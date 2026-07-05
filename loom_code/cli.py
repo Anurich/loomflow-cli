@@ -19,13 +19,16 @@ import os
 import subprocess
 import sys
 
-# Silence huggingface_hub's unauthenticated-request notice (pulled in
-# transitively via graphifyy). It writes to raw stdout, which would
-# otherwise leak into the full-screen TUI's layout. Set before any
-# import that might load huggingface_hub.
+# Silence huggingface_hub's "unauthenticated requests to the HF Hub"
+# notice. litellm's token_counter downloads the llama tokenizer from
+# HF on first use, and huggingface_hub relays the server's Warning
+# header via its ``utils._http`` logger — which leaked into piped
+# output and (pre-patch_stdout) the TUI layout. HF_HUB_VERBOSITY is
+# the library's own verbosity knob, read at import time — the
+# DISABLE_* flags do NOT cover this logger (verified by tracing the
+# emit). Set before any import that might load huggingface_hub.
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
-os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 import anyio
 
