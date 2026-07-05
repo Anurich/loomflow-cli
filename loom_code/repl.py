@@ -499,6 +499,25 @@ def _render_help(
     return "\n".join(lines)
 
 
+class _SteeringQueue:
+    """Mid-turn user guidance, drained by loomflow's ReAct loop.
+
+    Passed per-run in ``metadata["_loom_steering"]``; the loop calls
+    ``pop_all()`` before each model call and appends the entries as
+    fresh USER messages (loomflow >= 0.10.32). Plain list — producer
+    and consumer share one asyncio thread, so no locking."""
+
+    def __init__(self) -> None:
+        self._items: list[str] = []
+
+    def push(self, text: str) -> None:
+        self._items.append(text)
+
+    def pop_all(self) -> list[str]:
+        out, self._items = self._items, []
+        return out
+
+
 class _SlashCompleter(Completer):
     """Two completions in one:
 
@@ -735,6 +754,10 @@ class Repl:
         # sharing the team's memory + notebook; the router agent is
         # the cheap one-word SOLO/TEAM classifier.
         self._solo_agent: Any | None = None
+        # Clipboard images staged by Ctrl-V in the TUI ([image-N]
+        # placeholders in the prompt); consumed by the next run as
+        # loomflow's ``_loom_images`` metadata, then cleared.
+        self._pending_images: list[dict[str, str]] = []
         self._router_agent: Any | None = None
         # Graphify and other bundled skills are auto-registered
         # by build_agent (see _bundled_skill_paths). No per-session
@@ -924,9 +947,34 @@ class Repl:
             tui.attach_completer(self._prompt_session.completer)
             # Approval Yes/All/No + slash menus select in-app.
             self._gate.select_hook = tui.select
+            # Ctrl-V vision paste: grab a clipboard image, stage it
+            # for the next run, hand back the [image-N] placeholder.
+            tui.image_paste_hook = self._stage_clipboard_image
             self._tui = tui
         except Exception:  # noqa: BLE001 — box is optional
             self._tui = None
+
+    def _stage_clipboard_image(self) -> str | None:
+        """Ctrl-V handler: clipboard image → staged for the next run.
+
+        Returns the placeholder to insert in the input box ("[image-N] ")
+        or None when the clipboard holds no image. The staged bytes ride
+        loomflow's ``_loom_images`` metadata on the next submit."""
+        from .clipboard_image import grab_clipboard_image, to_loom_image
+
+        grabbed = grab_clipboard_image()
+        if grabbed is None:
+            return None
+        data, media_type = grabbed
+        self._pending_images.append(to_loom_image(data, media_type))
+        n = len(self._pending_images)
+        size_kb = len(data) // 1024
+        console.print(
+            f"  [dim]📎 image {n} staged from clipboard "
+            f"({size_kb} KB {media_type}) — sends with your next "
+            f"message[/dim]"
+        )
+        return f"[image-{n}] "
 
     async def _aclose_mcp(self) -> None:
         """Best-effort teardown of the MCP registry's sessions. Never
@@ -1769,9 +1817,21 @@ class Repl:
             "timed_out": False,
             "stalled_tool": None,
             "tool_in_flight": False,
+            "interrupted": False,
         }
         repeat: dict[str, Any] = {"key": None, "count": 0}
         idle_timeout = self._idle_timeout
+
+        # Run metadata: steering + vision (both ride loomflow's
+        # metadata contract — ``_loom_steering`` drained at each ReAct
+        # iteration, ``_loom_images`` attached to the user message).
+        steering = _SteeringQueue()
+        metadata: dict[str, Any] = {"_loom_steering": steering}
+        # getattr: the liveness tests drive this method on a bare
+        # namespace stub without the full Repl surface.
+        if getattr(self, "_pending_images", None):
+            metadata["_loom_images"] = self._pending_images
+            self._pending_images = []
 
         try:
             async with anyio.create_task_group() as tg:
@@ -1800,10 +1860,42 @@ class Repl:
 
                 tg.start_soon(_watchdog)
 
+                # Steering (TUI only): the input box stays live while
+                # the turn runs — anything the user submits mid-turn is
+                # pushed into the steering queue (injected by loomflow
+                # before its next model call) and echoed so they know
+                # it landed. Esc interrupts the whole turn.
+                if getattr(self, "_tui", None) is not None:
+                    tui = self._tui
+
+                    def _interrupt() -> None:
+                        state["interrupted"] = True
+                        tg.cancel_scope.cancel()
+
+                    tui.interrupt_hook = _interrupt
+
+                    async def _drain_steering() -> None:
+                        # No echo here — the TUI's submit handler
+                        # already rendered the message with a
+                        # ``steering ↳`` badge (it knows a turn is
+                        # live via interrupt_hook).
+                        while True:
+                            try:
+                                text = await tui.read_line()
+                            except EOFError:
+                                return  # Ctrl-D mid-turn: stop draining
+                            text = text.strip()
+                            if not text:
+                                continue
+                            steering.push(text)
+
+                    tg.start_soon(_drain_steering)
+
                 stream = agent.stream(
                     prompt,
                     user_id=_USER_ID,
                     session_id=self.session_id,
+                    metadata=metadata,
                 )
                 async for event in stream:
                     state["last_event"] = time.monotonic()
@@ -1901,7 +1993,17 @@ class Repl:
             # anything that queued behind an approval prompt.
             self._gate_active = False
             renderer.flush_deferred()
+            if getattr(self, "_tui", None) is not None:
+                self._tui.interrupt_hook = None
 
+        if state["interrupted"]:
+            pause_status()
+            console.print(
+                "\n[yellow]⏹ turn interrupted (Esc)[/yellow] — "
+                "[dim]context is kept; type to continue or redirect"
+                "[/dim]"
+            )
+            return False
         if state["timed_out"]:
             pause_status()
             console.print(

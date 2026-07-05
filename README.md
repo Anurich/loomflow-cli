@@ -99,6 +99,17 @@ type. Enter sends; Alt+Enter adds a newline. Scroll the history with
 the mouse wheel, PageUp/PageDown, or Ctrl-Up/Down; End jumps back to
 live. Typing `/` pops the command menu.
 
+**Steer while it works** — the input box stays live during a turn.
+Type guidance and press Enter and it's injected into the *running*
+turn before the model's next step (tagged `steering ↳` in the
+conversation). Press **Esc** to interrupt the turn entirely; context
+is kept, so you can redirect.
+
+**Paste images** — **Ctrl-V** grabs an image straight off your
+clipboard (screenshots!): an `[image-N]` placeholder lands in the box
+and the image rides along to the model with your next message
+(vision-capable models: Claude, GPT-4.1, …).
+
 Prefer a plain inline prompt (or on a terminal the full-screen UI
 doesn't suit)? `loom-code --classic`. Piped/non-TTY use falls back to
 classic automatically.

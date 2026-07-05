@@ -99,6 +99,14 @@ class ChatTUI:
         # Status line (spinner replacement) — driven by the renderer's
         # set_status/pause_status; empty string hides it.
         self._status = ""
+        # Turn integration hooks, installed by the REPL:
+        # - interrupt_hook: Esc while a turn runs → cancel the turn
+        #   (None when idle, so Esc does nothing then).
+        # - image_paste_hook: Ctrl-V → grab a clipboard image; returns
+        #   the placeholder text to insert (e.g. "[image-1] ") or None
+        #   when the clipboard has no image.
+        self.interrupt_hook: Any | None = None
+        self.image_paste_hook: Any | None = None
 
         # The conversation pane. It renders the TAIL of the ANSI that
         # fits the window, so the newest output is always pinned just
@@ -275,15 +283,58 @@ class ChatTUI:
             self._input.text = ""
             # Echo the submitted message into the pane (chat-style) so
             # the user sees what they sent above the response — the box
-            # clears, so without this the message would vanish.
+            # clears, so without this the message would vanish. While a
+            # turn is RUNNING (interrupt_hook installed), a submission
+            # is mid-turn steering — tag it so it reads as guidance
+            # injected into the running turn, not a queued question.
             if text.strip():
                 shown = text.strip().replace("\n", "\n  ")
-                self._ansi += f"\n\x1b[32m› {shown}\x1b[0m\n"
+                if self.interrupt_hook is not None:
+                    self._ansi += (
+                        f"\n\x1b[32m› {shown}\x1b[0m "
+                        f"\x1b[30;43m steering ↳ \x1b[0m\n"
+                    )
+                else:
+                    self._ansi += f"\n\x1b[32m› {shown}\x1b[0m\n"
             self._submissions.put_nowait(text)
 
         @kb.add("escape", "enter", filter=input_active)  # Alt+Enter
         def _newline(event: Any) -> None:
             self._input.buffer.insert_text("\n")
+
+        @kb.add("escape", filter=input_active)
+        def _escape(event: Any) -> None:
+            # Esc: close an open completion menu first; otherwise, if a
+            # turn is running, interrupt it (Claude-Code-style). Idle
+            # with no menu → no-op.
+            buf = self._input.buffer
+            if buf.complete_state:
+                buf.cancel_completion()
+                return
+            if self.interrupt_hook is not None:
+                self.interrupt_hook()
+
+        @kb.add("c-v", filter=input_active)
+        def _paste_image(event: Any) -> None:
+            # Ctrl-V: vision paste. Terminals never deliver clipboard
+            # IMAGES through the text-paste path, so this chord asks
+            # the OS clipboard directly; a placeholder lands in the
+            # box and the bytes ride to the model with the next
+            # submit. No image on the clipboard → a status hint.
+            # (Text pastes keep working via the terminal's normal
+            # Cmd/Ctrl-Shift-V bracketed paste — this chord is only
+            # the image path.)
+            if self.image_paste_hook is None:
+                return
+            placeholder = self.image_paste_hook()
+            if placeholder:
+                self._input.buffer.insert_text(placeholder)
+            else:
+                self.set_status(
+                    "no image on the clipboard (text pastes use the "
+                    "terminal's own paste)"
+                )
+            self._app.invalidate()
 
         # ---- scrollback through the conversation ----
         # eager=True so these win over the focused TextArea's own

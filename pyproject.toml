@@ -65,7 +65,10 @@ dependencies = [
     # user's machine mid-`pipx upgrade`.
     # >=0.10.31: approval-gate fix — hooks attached to an agent
     # silently bypassed the ask/approval flow for destructive tools.
-    "loomflow[litellm,web,mcp]>=0.10.31,<0.11",
+    # >=0.10.32: _loom_steering metadata queue — mid-turn steering
+    # (type while the agent works) injects USER messages before the
+    # next model call. Vision (_loom_images) predates it.
+    "loomflow[litellm,web,mcp]>=0.10.32,<0.11",
     "rich>=13",
     # prompt_toolkit drives the REPL line editor — gives us inline
     # slash-command autocomplete (a menu pops the moment the user
