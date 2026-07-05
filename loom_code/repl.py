@@ -1199,7 +1199,13 @@ class Repl:
             prompt=PTHTML("<ansigreen><b>› </b></ansigreen>"),
             multiline=True,
             wrap_lines=True,
-            height=D(min=1),  # grows with wrapped content
+            # min=1 so the box is ONE row tall when empty; it grows as
+            # content wraps, capped at 10 so a huge paste can't eat the
+            # screen. dont_extend_height is the load-bearing bit — a
+            # Frame in a non-full-screen app otherwise stretches to
+            # fill every remaining terminal row (the "huge empty box").
+            height=D(min=1, max=10),
+            dont_extend_height=True,
             completer=self._prompt_session.completer,
             complete_while_typing=True,
             history=self._prompt_session.history,
