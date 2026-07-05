@@ -867,7 +867,12 @@ class Repl:
         finally:
             await self._aclose_mcp()
             await self._aclose_browsers()
-            # Background processes the agent started (dev servers,
+            # Let any in-flight background HOOKS (fire-and-forget
+            # notifications) finish rather than being cut off by exit.
+            from .hooks import drain_background_hooks
+
+            await drain_background_hooks(deadline_s=3.0)
+            # Background PROCESSES the agent started (dev servers,
             # watchers) die with the session — no orphans. atexit
             # backstops a hard crash; this is the friendly path.
             from . import background

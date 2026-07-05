@@ -101,6 +101,27 @@ def _fire_and_forget(
     task.add_done_callback(_background_tasks.discard)
 
 
+async def drain_background_hooks(deadline_s: float = 5.0) -> None:
+    """Await every in-flight background hook (bounded by
+    ``deadline_s`` wall-clock). The REPL calls this on exit so a
+    fire-and-forget notification isn't cut off when the process ends;
+    tests call it to keep a scheduled task from outliving its event
+    loop (which surfaces as loop-teardown noise and, under load,
+    cross-test interference). No-op when idle."""
+    import asyncio
+
+    tasks = list(_background_tasks)
+    if not tasks:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=deadline_s,
+        )
+    except TimeoutError:
+        pass
+
+
 async def _run(
     spec: HookSpec, payload: dict[str, Any], *, cwd: Path
 ) -> HookOutcome:

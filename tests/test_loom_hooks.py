@@ -34,6 +34,21 @@ from loom_code.trust import (
 pytestmark = pytest.mark.anyio
 
 
+@pytest.fixture(autouse=True)
+def _no_leaked_background_hooks():
+    """Reap any background hook a test scheduled BEFORE the next test's
+    event loop starts — a task that outlives its loop tied up the
+    subprocess watcher on slower CI runners and mangled a later test's
+    hook output (observed once as an empty additionalContext). Cheap,
+    deterministic, module-global set so it works across tests."""
+    from loom_code import hooks
+
+    yield
+    for task in list(hooks._background_tasks):  # noqa: SLF001
+        task.cancel()
+    hooks._background_tasks.clear()  # noqa: SLF001
+
+
 # ---- matcher --------------------------------------------------------
 
 
@@ -376,7 +391,6 @@ async def test_background_repl_hook_does_not_block_or_inject(
 ) -> None:
     """background=true: the hook runs (side effect lands) but its
     stdout/exit code are ignored — no context, no block, no wait."""
-    import anyio
 
     marker = tmp_path / "bg-ran"
     specs = [
@@ -391,11 +405,12 @@ async def test_background_repl_hook_does_not_block_or_inject(
     result = await run_repl_hooks(specs, "SessionEnd", cwd=tmp_path)
     assert not result.blocked
     assert not result.contexts
-    # the task was scheduled — give it a beat to actually run
-    for _ in range(80):
-        if marker.exists():
-            break
-        await anyio.sleep(0.05)
+    # Drain the scheduled task deterministically — and so it never
+    # outlives this test's event loop (a leaked task surfaces as
+    # loop-teardown noise / cross-test flakiness under CI load).
+    from loom_code.hooks import drain_background_hooks
+
+    await drain_background_hooks()
     assert marker.exists()
 
 
