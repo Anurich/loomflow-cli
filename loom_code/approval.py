@@ -381,6 +381,12 @@ class ApprovalGate:
         # around the prompt and resume after.
         self._pause_spinner = pause_spinner or (lambda: None)
         self._resume_spinner = resume_spinner or (lambda: None)
+        # In-TUI selector hook. When the full-screen chat TUI is
+        # active, a raw-termios ``_select_option`` would fight the
+        # running Application for input — so the REPL installs
+        # ``tui.select`` here and the gate routes its Yes/All/No prompt
+        # through it. ``None`` → the classic worker-thread selector.
+        self.select_hook: Any | None = None
 
     async def handler(
         self, call: Any, user_id: str | None = None
@@ -460,9 +466,33 @@ class ApprovalGate:
             console.print(
                 Text(f"  {_question_for(tool)}", style="bold")
             )
-            # Selector runs on a worker thread so the raw-mode key
-            # reads don't stall the anyio event loop.
-            choice = await anyio.to_thread.run_sync(self._ask)
+            if self.select_hook is not None:
+                # Full-screen TUI active → select in-app (no raw-mode
+                # thread that would fight the running Application).
+                choice = await self.select_hook(
+                    "",
+                    [
+                        ("y", "Yes"),
+                        ("a", "Yes, and don't ask again this session"),
+                        ("n", "No (esc)"),
+                    ],
+                    default=0,
+                )
+                choice = choice or "n"  # Esc / cancel → safe No
+                console.print(
+                    {
+                        "y": Text("  → yes", style="green"),
+                        "a": Text(
+                            "  → yes, allowing all this session",
+                            "yellow",
+                        ),
+                        "n": Text("  → no", style="red"),
+                    }[choice]
+                )
+            else:
+                # Classic path: worker thread so the raw-mode key reads
+                # don't stall the anyio event loop.
+                choice = await anyio.to_thread.run_sync(self._ask)
         finally:
             self._resume_spinner()
         # ``_ask`` already echoed the choice — no second line here
