@@ -341,9 +341,21 @@ async def auto_approve(call: Any, user_id: str | None = None) -> bool:
 
 
 class ApprovalGate:
-    """Stateful approval handler — remembers an 'allow all this
-    session' choice so the user isn't asked twice for the same
-    kind of risk.
+    """Stateful approval handler — remembers the user's 'don't ask
+    again this session' choices so they aren't asked twice for the
+    same KIND of risk.
+
+    The remembered scope is deliberately narrow (a user report drove
+    this: they approved a file write with "don't ask again", then a
+    later ``rm`` deleted a file with no prompt — "don't ask again"
+    read as writes-only but meant everything):
+
+    * 'a' at a **write/edit** prompt → future edits/writes skip the
+      prompt; bash still asks.
+    * 'a' at a **bash** prompt → future bash commands with the SAME
+      leading binary skip the prompt (``python …`` approved once
+      covers ``python x.py``, but ``rm`` still asks).
+    * 'a' at any other destructive tool (MCP etc.) → that tool only.
 
     Pass :meth:`handler` as the Agent's ``approval_handler``.
     """
@@ -357,10 +369,11 @@ class ApprovalGate:
         mode: Any | None = None,
         project_root: Any | None = None,
     ) -> None:
-        # Once the user picks 'a' (allow all), every subsequent
-        # destructive call this session auto-approves. Reset only
-        # by restarting loom-code.
-        self._allow_all = False
+        # Session "don't ask again" state, scoped per risk kind (see
+        # class docstring). Reset only by restarting loom-code.
+        self._allow_edits = False
+        self._allow_bash_prefixes: set[str] = set()
+        self._allow_tools: set[str] = set()
         # Permission rules (allow/ask/deny globs) + session mode
         # (default/accept-edits/plan/yolo). Imported here to keep the
         # module import-light. The REPL swaps ``mode`` via /mode.
@@ -404,16 +417,20 @@ class ApprovalGate:
           irreversible history-/repo-destroyers, which ALWAYS get a
           fresh high-friction confirm even under allow-all / yolo.
 
-        Session 'allow all' is modelled as an effective yolo mode
-        INSIDE ``decide`` (not a shortcut above it), so an explicit
-        ``ask`` rule the user configured still forces the prompt —
-        one careless 'a' can't silently defeat their own ask-rules."""
+        A session 'don't ask again' is modelled as an effective yolo
+        mode INSIDE ``decide`` for the matching call (not a shortcut
+        above it), so an explicit ``ask`` rule the user configured
+        still forces the prompt — one careless 'a' can't silently
+        defeat their own ask-rules. The scope is per risk kind:
+        edits, one bash binary, or one named tool (class docstring)."""
         tool = getattr(call, "tool", "?")
         args = getattr(call, "args", {}) or {}
 
         from .permissions import Decision, Mode, decide
 
-        effective_mode = Mode.YOLO if self._allow_all else self.mode
+        effective_mode = self.mode
+        if self._session_allowed(tool, args):
+            effective_mode = Mode.YOLO
         decision = decide(tool, args, self.rules, effective_mode)
 
         # An edit/write to a file OUTSIDE the project always shows the
@@ -466,6 +483,7 @@ class ApprovalGate:
             console.print(
                 Text(f"  {_question_for(tool)}", style="bold")
             )
+            allow_label = self._allow_label(tool, args)
             if self.select_hook is not None:
                 # Full-screen TUI active → select in-app (no raw-mode
                 # thread that would fight the running Application).
@@ -473,7 +491,7 @@ class ApprovalGate:
                     "",
                     [
                         ("y", "Yes"),
-                        ("a", "Yes, and don't ask again this session"),
+                        ("a", allow_label),
                         ("n", "No (esc)"),
                     ],
                     default=0,
@@ -482,27 +500,73 @@ class ApprovalGate:
                 console.print(
                     {
                         "y": Text("  → yes", style="green"),
-                        "a": Text(
-                            "  → yes, allowing all this session",
-                            "yellow",
-                        ),
+                        "a": Text(f"  → {allow_label}", "yellow"),
                         "n": Text("  → no", style="red"),
                     }[choice]
                 )
             else:
                 # Classic path: worker thread so the raw-mode key reads
                 # don't stall the anyio event loop.
-                choice = await anyio.to_thread.run_sync(self._ask)
+                choice = await anyio.to_thread.run_sync(
+                    lambda: self._ask(allow_label)
+                )
         finally:
             self._resume_spinner()
         # ``_ask`` already echoed the choice — no second line here
         # (the old "→ denied" after "→ no" read as a double refusal).
         if choice == "a":
-            self._allow_all = True
+            self._remember_allow(tool, args)
             return True
         return choice == "y"
 
     # ---- internals ------------------------------------------------------
+
+    _EDIT_TOOLS = ("edit", "multi_edit", "write")
+    _BASH_TOOLS = ("bash", "bash_background")
+
+    @staticmethod
+    def _bash_prefix(args: dict[str, Any]) -> str:
+        """The command's leading binary — the 'don't ask again' scope
+        for bash ('python hello.py' → 'python'). Empty commands map
+        to '' which is never stored, so they always re-ask."""
+        cmd = str(args.get("command", "")).strip()
+        return cmd.split()[0].lower() if cmd.split() else ""
+
+    def _session_allowed(self, tool: str, args: dict[str, Any]) -> bool:
+        """Did a previous 'a' this session cover THIS call's risk
+        kind? (Edits cover edits; a bash 'a' covers only the same
+        leading binary; anything else covers only that tool.)"""
+        if tool in self._EDIT_TOOLS:
+            return self._allow_edits
+        if tool in self._BASH_TOOLS:
+            prefix = self._bash_prefix(args)
+            return bool(prefix) and prefix in self._allow_bash_prefixes
+        return tool in self._allow_tools
+
+    def _remember_allow(self, tool: str, args: dict[str, Any]) -> None:
+        """Record an 'a' choice with the narrow scope for this call."""
+        if tool in self._EDIT_TOOLS:
+            self._allow_edits = True
+        elif tool in self._BASH_TOOLS:
+            prefix = self._bash_prefix(args)
+            if prefix:
+                self._allow_bash_prefixes.add(prefix)
+        else:
+            self._allow_tools.add(tool)
+
+    def _allow_label(self, tool: str, args: dict[str, Any]) -> str:
+        """The 'a' option's label — names the exact scope so the user
+        knows what they're waiving (the generic 'this session' read as
+        broader than users expected)."""
+        if tool in self._EDIT_TOOLS:
+            return "Yes, don't ask again for file edits this session"
+        if tool in self._BASH_TOOLS:
+            prefix = self._bash_prefix(args) or "this"
+            return (
+                f"Yes, don't ask again for '{prefix}' commands "
+                f"this session"
+            )
+        return f"Yes, don't ask again for {tool} this session"
 
     def _is_outside_project(self, path: Any) -> bool:
         """True if ``path`` resolves outside the project root. False
@@ -562,23 +626,26 @@ class ApprovalGate:
         console.print("[green]cancelled[/green]")
         return False
 
-    def _ask(self) -> str:
+    def _ask(self, allow_label: str) -> str:
         """Blocking option-selector. Runs on a worker thread.
 
         Claude-Code-style vertical menu: ↑/↓ + Enter, number keys, or
         the y/a/n hotkeys. Esc / Ctrl-C picks "No" so a startled user
-        can always back out safely. Returns 'y' / 'a' / 'n'."""
+        can always back out safely. Returns 'y' / 'a' / 'n'.
+
+        ``allow_label`` names the scoped 'don't ask again' option for
+        THIS call (edits / one bash binary / one tool)."""
         choice = _select_option(
             [
                 ("y", "Yes"),
-                ("a", "Yes, and don't ask again this session"),
+                ("a", allow_label),
                 ("n", "No (esc)"),
             ],
             default=0,
         )
         echo = {
             "y": Text("  → yes", style="green"),
-            "a": Text("  → yes, allowing all this session", "yellow"),
+            "a": Text(f"  → {allow_label}", "yellow"),
             "n": Text("  → no", style="red"),
         }[choice]
         console.print(echo)

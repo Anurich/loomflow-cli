@@ -44,32 +44,51 @@ async def test_auto_approve_ignores_the_user_id() -> None:
 
 async def test_approval_gate_starts_locked() -> None:
     # Fresh gate must NOT auto-approve — the user hasn't said
-    # "allow all" yet. If this regresses, --yes-equivalent
-    # behavior leaks into the REPL with no user consent.
+    # "don't ask again" for anything yet. If this regresses,
+    # --yes-equivalent behavior leaks into the REPL with no consent.
     gate = ApprovalGate()
-    assert gate._allow_all is False
+    assert gate._allow_edits is False
+    assert gate._allow_bash_prefixes == set()
+    assert gate._allow_tools == set()
 
 
-async def test_approval_gate_allow_all_short_circuits() -> None:
-    # Once the user picks 'a', subsequent calls must allow without
-    # prompting (no Prompt.ask reached — that would block on stdin
-    # and hang the test). The handler returns True via the
-    # ``if self._allow_all`` early return at the top.
+async def test_bash_prefix_allow_short_circuits_same_binary() -> None:
+    # 'a' at a bash prompt covers the SAME leading binary — the next
+    # call with that binary allows without prompting (no selector
+    # reached — that would block on stdin and hang the test).
     gate = ApprovalGate()
-    gate._allow_all = True
+    gate._allow_bash_prefixes = {"rm"}
     call = ToolCall(tool="bash", args={"command": "rm file.txt"})
     assert await gate.handler(call) is True
 
 
-async def test_approval_gate_allow_all_works_for_every_tool() -> None:
-    # Allow-all is gate-wide, not per-tool. If anyone ever scopes
-    # it (e.g. "allow all bash but re-ask on edit"), this catches
-    # the regression — the property is currently universal.
+async def test_edit_allow_covers_edits_only() -> None:
+    # The scoped 'don't ask again': edits-allow covers write/edit/
+    # multi_edit but NOT bash — a user who waived edit prompts must
+    # still be asked before a shell command runs. (This was a live
+    # report: 'a' on a write, then an rm deleted a file silently.)
     gate = ApprovalGate()
-    gate._allow_all = True
-    for tool in ("bash", "edit", "write"):
-        call = ToolCall(tool=tool, args={})
+    gate._allow_edits = True
+    for tool in ("edit", "write", "multi_edit"):
+        call = ToolCall(tool=tool, args={"path": "x.py"})
         assert await gate.handler(call) is True
+    # bash must NOT be covered — it would prompt (and a prompt on a
+    # non-TTY test runner resolves to the safe last option = deny).
+    call = ToolCall(tool="bash", args={"command": "rm x.py"})
+    assert await gate.handler(call) is False
+
+
+async def test_bash_prefix_does_not_cover_other_binaries() -> None:
+    # 'a' on `python …` must not waive the prompt for `rm …`.
+    gate = ApprovalGate()
+    gate._allow_bash_prefixes = {"python"}
+    assert await gate.handler(
+        ToolCall(tool="bash", args={"command": "python hello.py"})
+    ) is True
+    # rm not covered → prompts → non-TTY resolves to safe deny.
+    assert await gate.handler(
+        ToolCall(tool="bash", args={"command": "rm hello.py"})
+    ) is False
 
 
 # ---- Windows key reader (msvcrt) -------------------------------------

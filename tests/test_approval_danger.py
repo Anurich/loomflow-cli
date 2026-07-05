@@ -56,14 +56,14 @@ async def test_allow_all_does_not_bypass_danger(monkeypatch) -> None:
     # explicitly confirm.
     monkeypatch.setattr(approval, "_read_single_key", lambda: "n")
     gate = ApprovalGate()
-    gate._allow_all = True
+    gate._allow_bash_prefixes = {"rm"}
     assert await gate.handler(_Call()) is False
 
 
 async def test_explicit_yes_confirms_danger(monkeypatch) -> None:
     monkeypatch.setattr(approval, "_read_single_key", lambda: "y")
     gate = ApprovalGate()
-    gate._allow_all = True
+    gate._allow_bash_prefixes = {"rm"}
     assert await gate.handler(_Call()) is True
 
 
