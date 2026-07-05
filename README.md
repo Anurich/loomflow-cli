@@ -91,6 +91,18 @@ loom-code --yes "scaffold a FastAPI backend"   # skip approval prompts
 Works on existing code and empty directories alike — scaffolding new
 projects is a first-class path.
 
+## The interface
+
+loom-code runs a **full-screen chat UI**: the conversation scrolls in
+a pane, the input box stays pinned at the bottom, and it grows as you
+type. Enter sends; Alt+Enter adds a newline. Scroll the history with
+the mouse wheel, PageUp/PageDown, or Ctrl-Up/Down; End jumps back to
+live. Typing `/` pops the command menu.
+
+Prefer a plain inline prompt (or on a terminal the full-screen UI
+doesn't suit)? `loom-code --classic`. Piped/non-TTY use falls back to
+classic automatically.
+
 ## Models
 
 | model string | provider | env key |
