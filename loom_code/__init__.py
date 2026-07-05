@@ -19,4 +19,4 @@ belongs in the framework, not here. loom-code is the dogfood test
 that keeps loomflow honest.
 """
 
-__version__ = "0.3.3"
+__version__ = "0.4.0"
