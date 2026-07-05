@@ -1190,8 +1190,13 @@ class Repl:
             KeyBindings,
             merge_key_bindings,
         )
-        from prompt_toolkit.layout import Layout
+        from prompt_toolkit.layout import (
+            Float,
+            FloatContainer,
+            Layout,
+        )
         from prompt_toolkit.layout.dimension import Dimension as D
+        from prompt_toolkit.layout.menus import CompletionsMenu
         from prompt_toolkit.widgets import Frame, TextArea
 
         cols = console.size.width
@@ -1216,6 +1221,23 @@ class Repl:
 
         @kb.add("enter")
         def _submit(event: Any) -> None:
+            # If the completion menu is open, Enter ACCEPTS the
+            # highlighted command (fills the box) instead of submitting
+            # — parity with the old inline prompt, where picking a
+            # slash-command from the menu doesn't fire the turn.
+            buf = area.buffer
+            if buf.complete_state:
+                comp = (
+                    buf.complete_state.current_completion
+                    or (
+                        buf.complete_state.completions[0]
+                        if buf.complete_state.completions
+                        else None
+                    )
+                )
+                if comp is not None:
+                    buf.apply_completion(comp)
+                    return
             event.app.exit(result=area.text)
 
         @kb.add("escape", "enter")  # Alt/Option+Enter → newline
@@ -1237,10 +1259,26 @@ class Repl:
         merged = merge_key_bindings(
             [build_paste_keybindings(), kb]
         )
-        # width = cols-1 keeps the closing corner off the terminal's
-        # auto-wrap column so the frame never staircases.
+        # The completion menu floats over the box — WITHOUT a
+        # CompletionsMenu in the layout a TextArea's completer is inert
+        # (typing "/" showed nothing, the reported bug). xcursor/ycursor
+        # anchor it to the caret. width = cols-1 keeps the closing
+        # corner off the terminal's auto-wrap column so the frame never
+        # staircases.
+        framed = FloatContainer(
+            content=Frame(area, width=D(max=max(20, cols - 1))),
+            floats=[
+                Float(
+                    xcursor=True,
+                    ycursor=True,
+                    content=CompletionsMenu(
+                        max_height=12, scroll_offset=1
+                    ),
+                ),
+            ],
+        )
         app: Application[str] = Application(
-            layout=Layout(Frame(area, width=D(max=max(20, cols - 1)))),
+            layout=Layout(framed),
             key_bindings=merged,
             full_screen=False,
             erase_when_done=False,
