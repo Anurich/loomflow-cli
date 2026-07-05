@@ -96,12 +96,17 @@ class ChatTUI:
         # set_status/pause_status; empty string hides it.
         self._status = ""
 
+        # The conversation pane. ``ignore_content_height`` + a vertical
+        # scroll pinned to the bottom keeps the LATEST output visible
+        # just above the input box (chat-style), instead of content
+        # sitting at the top with a blank gap below it.
         self._pane = Window(
             FormattedTextControl(
                 text=lambda: ANSI(self._ansi), focusable=False
             ),
             wrap_lines=True,
             always_hide_cursor=True,
+            get_vertical_scroll=self._pane_scroll,
         )
         self._status_win = Window(
             FormattedTextControl(text=self._status_text),
@@ -127,6 +132,18 @@ class ChatTUI:
         import shutil
 
         return max(40, shutil.get_terminal_size((100, 24)).columns)
+
+    def _pane_scroll(self, window: Any) -> int:
+        """Pin the pane to the BOTTOM: return the scroll offset that
+        keeps the last rendered line visible just above the input box.
+        Without this, short conversations float at the top (blank gap
+        below) and long ones don't follow the newest output."""
+        try:
+            content_h = window.render_info.content_height
+            visible_h = window.render_info.window_height
+        except Exception:  # noqa: BLE001 — first paint before render_info
+            return 0
+        return max(0, content_h - visible_h)
 
     def flush(self) -> None:
         """Move buffered Rich output into the pane + repaint. The REPL
@@ -200,6 +217,12 @@ class ChatTUI:
                 return
             text = self._input.text
             self._input.text = ""
+            # Echo the submitted message into the pane (chat-style) so
+            # the user sees what they sent above the response — the box
+            # clears, so without this the message would vanish.
+            if text.strip():
+                shown = text.strip().replace("\n", "\n  ")
+                self._ansi += f"\n\x1b[32m› {shown}\x1b[0m\n"
             self._submissions.put_nowait(text)
 
         @kb.add("escape", "enter", filter=input_active)  # Alt+Enter
@@ -298,19 +321,28 @@ class ChatTUI:
     async def session(self) -> AsyncIterator[ChatTUI]:
         """Run the full-screen app in the background for the whole
         session. The REPL body runs inside this context; the app
-        renders the pane + box the entire time."""
-        task = asyncio.create_task(self._app.run_async())
-        # Give the app a tick to take the screen before the first read.
-        await asyncio.sleep(0)
-        try:
-            yield self
-        finally:
-            if self._app.is_running:
-                self._app.exit()
+        renders the pane + box the entire time.
+
+        ``patch_stdout`` captures raw stdout/stderr writes from
+        libraries (e.g. huggingface's HF_TOKEN notice via graphifyy)
+        that bypass the redirected Rich console — without it those
+        writes corrupt the full-screen layout (the notice showed up
+        INSIDE the input box)."""
+        from prompt_toolkit.patch_stdout import patch_stdout
+
+        with patch_stdout(raw=True):
+            task = asyncio.create_task(self._app.run_async())
+            # Give the app a tick to take the screen before first read.
+            await asyncio.sleep(0)
             try:
-                await task
-            except Exception:  # noqa: BLE001 — teardown must not raise
-                pass
+                yield self
+            finally:
+                if self._app.is_running:
+                    self._app.exit()
+                try:
+                    await task
+                except Exception:  # noqa: BLE001 — teardown safe
+                    pass
 
     async def read_line(self) -> str:
         """Await the next submitted line. Raises EOFError on an empty
