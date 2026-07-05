@@ -195,6 +195,13 @@ class ChatTUI:
         """Move buffered Rich output into the pane + repaint. The REPL
         calls this after prints; the renderer calls it during streaming
         so tokens appear live."""
+        # Keep the Rich console's width in sync with the terminal so a
+        # resize re-wraps future output correctly (already-rendered
+        # ANSI keeps its old width, which is the normal terminal-log
+        # behaviour). Cheap; runs before each paint.
+        w = self._term_width()
+        if self.console.width != w:
+            self.console.width = w
         text = self._sink.getvalue()
         if text:
             self._ansi += text
