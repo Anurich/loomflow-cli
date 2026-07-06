@@ -976,6 +976,67 @@ class Repl:
         )
         return f"[image-{n}] "
 
+    _IMAGE_PATH_RE = re.compile(
+        # quoted path (terminals quote drag-drops with spaces) …
+        r"""(?P<q>['"])(?P<quoted>[^'"\n]+?\.(?:png|jpe?g|gif|webp))(?P=q)"""
+        # … or a bare token, allowing backslash-escaped spaces
+        r"""|(?P<plain>(?:\\ |[^\s'"])+\.(?:png|jpe?g|gif|webp))""",
+        re.IGNORECASE,
+    )
+    _IMAGE_MIME = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+    _IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
+    def _stage_image_paths(self, line: str) -> str:
+        """Drag-and-drop vision: replace existing image-FILE paths in
+        the submitted line with [image-N] placeholders, staging the
+        bytes for the run (``_loom_images``, same as Ctrl-V).
+
+        Dropping a file onto a terminal window types its path —
+        possibly ``'quoted'`` or with ``\\ `` escaped spaces. Only
+        paths that actually exist on disk are swapped; anything else
+        (a mentioned-but-absent filename, prose that happens to end in
+        .png) passes through untouched. Oversized files (>10 MB) are
+        left as text with a hint — provider APIs reject them anyway."""
+        if "." not in line:  # cheap pre-filter
+            return line
+
+        def _swap(m: re.Match[str]) -> str:
+            raw = m.group("quoted") or m.group("plain")
+            try:
+                path = Path(raw.replace("\\ ", " ")).expanduser()
+                if not path.is_file():
+                    return m.group(0)
+                data = path.read_bytes()
+            except OSError:
+                return m.group(0)
+            if len(data) > self._IMAGE_MAX_BYTES:
+                console.print(
+                    f"  [yellow]image too large to attach "
+                    f"({len(data) // (1024 * 1024)} MB > 10 MB): "
+                    f"{path.name}[/yellow]"
+                )
+                return m.group(0)
+            from .clipboard_image import to_loom_image
+
+            mime = self._IMAGE_MIME.get(
+                path.suffix.lower(), "image/png"
+            )
+            self._pending_images.append(to_loom_image(data, mime))
+            n = len(self._pending_images)
+            console.print(
+                f"  [dim]📎 image {n} attached: {path.name} "
+                f"({len(data) // 1024} KB {mime})[/dim]"
+            )
+            return f"[image-{n}]"
+
+        return self._IMAGE_PATH_RE.sub(_swap, line)
+
     async def _aclose_mcp(self) -> None:
         """Best-effort teardown of the MCP registry's sessions. Never
         raises — shutdown must not turn a clean exit into an error."""
@@ -1128,6 +1189,13 @@ class Repl:
             # keeps a single canonical "what the user really said"
             # point of truth and matches how Claude Code does it.
             line = expand_pastes(line)
+
+            # Drag-and-drop vision: dropping a file onto the terminal
+            # types its PATH into the box. Any image-file path in the
+            # line is loaded, staged for the run (same ``_loom_images``
+            # ride as Ctrl-V), and replaced with its [image-N]
+            # placeholder — Claude-Code behavior.
+            line = self._stage_image_paths(line)
 
             if line.startswith("/"):
                 # Only dispatch KNOWN commands. An absolute filesystem

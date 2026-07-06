@@ -105,10 +105,12 @@ turn before the model's next step (tagged `steering ↳` in the
 conversation). Press **Esc** to interrupt the turn entirely; context
 is kept, so you can redirect.
 
-**Paste images** — **Ctrl-V** grabs an image straight off your
-clipboard (screenshots!): an `[image-N]` placeholder lands in the box
-and the image rides along to the model with your next message
-(vision-capable models: Claude, GPT-4.1, …).
+**Paste or drop images** — **Ctrl-V** grabs an image straight off
+your clipboard (screenshots!), and **drag-and-drop** works too: drop
+an image file onto the terminal and its path is auto-attached. Either
+way an `[image-N]` placeholder lands in the box and the image rides
+along to the model with your next message (vision-capable models:
+Claude, GPT-4.1, …).
 
 Prefer a plain inline prompt (or on a terminal the full-screen UI
 doesn't suit)? `loom-code --classic`. Piped/non-TTY use falls back to
