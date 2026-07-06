@@ -139,7 +139,9 @@ def test_macos_hex_parse() -> None:
 
 
 def _paths_stub() -> Any:
-    stub = SimpleNamespace(_pending_images=[])
+    stub = SimpleNamespace(
+        _pending_images=[], _warn_if_model_blind=lambda: None
+    )
     stub._stage_image_paths = Repl._stage_image_paths.__get__(stub)
     stub._IMAGE_PATH_RE = Repl._IMAGE_PATH_RE
     stub._IMAGE_MIME = Repl._IMAGE_MIME
@@ -193,3 +195,20 @@ def test_oversized_image_left_as_text(tmp_path) -> None:
     line = f"see {big}"
     assert stub._stage_image_paths(line) == line
     assert stub._pending_images == []
+
+
+# ---- vision capability guard ----------------------------------------------
+
+
+def test_model_supports_vision_known_models() -> None:
+    from loom_code.clipboard_image import model_supports_vision
+
+    # text-only NVIDIA models must be flagged (the observed
+    # hallucination case: banner "described" as a GitHub diff)
+    assert model_supports_vision(
+        "litellm/nvidia_nim/deepseek-ai/deepseek-v4-pro"
+    ) is False
+    # vision models pass
+    assert model_supports_vision("gpt-4.1") is True
+    # unknown/garbage → None (silent), never an exception
+    assert model_supports_vision("") in (None, False)

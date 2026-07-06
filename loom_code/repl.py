@@ -974,7 +974,23 @@ class Repl:
             f"({size_kb} KB {media_type}) — sends with your next "
             f"message[/dim]"
         )
+        self._warn_if_model_blind()
         return f"[image-{n}] "
+
+    def _warn_if_model_blind(self) -> None:
+        """Honesty guard: if the current model can't see images, say so
+        LOUDLY at attach time — a text-only model behind an OpenAI-
+        compatible endpoint often answers anyway (the server drops the
+        image parts) and confidently describes an image it never saw."""
+        from .clipboard_image import model_supports_vision
+
+        if model_supports_vision(getattr(self, "model", "")) is False:
+            console.print(
+                f"  [yellow]⚠ {self.model} can't see images — any "
+                f"description it gives will be MADE UP. Switch to a "
+                f"vision model (/model claude-…, gpt-4.1) and "
+                f"re-attach.[/yellow]"
+            )
 
     _IMAGE_PATH_RE = re.compile(
         # quoted path (terminals quote drag-drops with spaces) …
@@ -1035,7 +1051,10 @@ class Repl:
             )
             return f"[image-{n}]"
 
-        return self._IMAGE_PATH_RE.sub(_swap, line)
+        out = self._IMAGE_PATH_RE.sub(_swap, line)
+        if out != line:
+            self._warn_if_model_blind()
+        return out
 
     async def _aclose_mcp(self) -> None:
         """Best-effort teardown of the MCP registry's sessions. Never

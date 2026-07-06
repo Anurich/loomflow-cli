@@ -110,3 +110,24 @@ def to_loom_image(data: bytes, media_type: str) -> dict[str, str]:
         "data": base64.b64encode(data).decode("ascii"),
         "media_type": media_type,
     }
+
+
+def model_supports_vision(model: str) -> bool | None:
+    """True/False from litellm's model-capability DB; None = unknown.
+
+    The honesty guard: a text-only model that receives multimodal
+    content via an OpenAI-compatible endpoint often ANSWERS anyway —
+    the server silently drops the image parts and the model
+    confabulates a description from the filename + conversation
+    (observed live: a store banner "described" as a GitHub diff).
+    Unknown (None) stays silent — the DB can lag brand-new models,
+    and a false warning is worse than none."""
+    try:
+        import litellm
+
+        m = str(model)
+        if m.startswith("litellm/"):
+            m = m[len("litellm/") :]
+        return bool(litellm.supports_vision(model=m))
+    except Exception:  # noqa: BLE001 — capability check is advisory
+        return None
