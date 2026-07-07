@@ -146,8 +146,28 @@ def _snapshot_commit(root: Path) -> tuple[str | None, str]:
     # re-hashes every path — the trap can't fire.
     tmp_fd, tmp_index = tempfile.mkstemp(prefix="loom-ckpt-index-")
     os.close(tmp_fd)
+    # mkstemp CREATES the file (0 bytes) — but git treats an existing
+    # empty index as corrupt ("index file smaller than expected") in
+    # the no-parent path, where no read-tree runs to initialize it.
+    # Unlink it: we only need the unique NAME; git add builds a fresh
+    # index at that path.
+    os.unlink(tmp_index)
     try:
-        env = {"GIT_INDEX_FILE": tmp_index}
+        # Fixed identity for the snapshot commit: ``commit-tree``
+        # refuses without one ("Author identity unknown"), and a
+        # machine with no git user.name/email — CI, containers, a
+        # fresh laptop — would otherwise have SILENTLY broken
+        # checkpoints (/undo with nothing to restore; caught by the
+        # slash-command sweep on Linux CI). These are unreferenced
+        # plumbing objects, never on a branch, so a synthetic
+        # identity is correct — user commits are untouched.
+        env = {
+            "GIT_INDEX_FILE": tmp_index,
+            "GIT_AUTHOR_NAME": "loom-code",
+            "GIT_AUTHOR_EMAIL": "checkpoint@loom-code.invalid",
+            "GIT_COMMITTER_NAME": "loom-code",
+            "GIT_COMMITTER_EMAIL": "checkpoint@loom-code.invalid",
+        }
         if parent:
             rc, _o, err = _git(root, ["read-tree", parent], env=env)
             if rc != 0:
