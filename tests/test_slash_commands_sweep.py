@@ -134,11 +134,18 @@ async def test_checkpoint_undo_cycle(
     from loom_code import checkpoint as cp
 
     main = repl.project.root / "main.py"
-    cp.checkpoint(repl.project.root, summary="before test edit")
+    seq, err = cp.checkpoint(
+        repl.project.root, summary="before test edit"
+    )
+    assert seq is not None, f"checkpoint failed: {err}"
     main.write_text("print('MUTATED')\n")
     assert await repl._handle_slash("/checkpoints") is True
     assert await repl._handle_slash("/undo") is True
-    assert main.read_text() == "print('hello')\n"
     out = captured.getvalue()
-    assert "restored" in out
+    # Output FIRST: on failure this shows the actual /undo error
+    # (git stderr etc.) instead of a bare content mismatch.
+    assert "restored" in out, f"/undo did not restore. Output:\n{out}"
     assert "Traceback" not in out
+    assert main.read_text() == "print('hello')\n", (
+        f"content not reverted. Output:\n{out}"
+    )
